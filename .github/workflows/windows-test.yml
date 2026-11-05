@@ -1,0 +1,59 @@
+name: Windows smoke test (fork)
+
+# Runs a published Windows build of this fork on a GitHub Windows runner for a
+# few minutes with the repo's UnitySampleGame.apk, then uploads the log and the
+# compositor's own periodic screenshots. No GPU on the runner: D3D11 lands on
+# Windows' software adapter, so this finds crashes and missing frames, not speed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag of this fork to test
+        required: true
+      seconds:
+        description: How long to let the game run
+        required: false
+        default: "240"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p "*windows*.zip" -D dl
+          Expand-Archive (Get-ChildItem dl\*.zip | Select-Object -First 1).FullName -DestinationPath app
+          Get-ChildItem app
+
+      - name: Run sample game
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem app -Recurse -Filter lunaria.exe | Select-Object -First 1)
+          New-Item -ItemType Directory -Force out\shots, data | Out-Null
+          $env:LUNARIA_COMP_SHOT_S = "15"
+          $env:LUNARIA_DUMP_DIR = (Resolve-Path out\shots).Path -replace '\\','/'
+          $p = Start-Process -FilePath $exe.FullName `
+                 -ArgumentList "--data-root `"$((Resolve-Path data).Path)`" `"$((Resolve-Path UnitySampleGame.apk).Path)`"" `
+                 -WorkingDirectory $exe.DirectoryName `
+                 -RedirectStandardError out\lunaria-stderr.log -RedirectStandardOutput out\lunaria-stdout.log -PassThru
+          $deadline = (Get-Date).AddSeconds([int]"${{ inputs.seconds }}")
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep 5 }
+          if ($p.HasExited) { "lunaria exited early, code $($p.ExitCode)" | Tee-Object out\result.txt }
+          else { "lunaria still running after ${{ inputs.seconds }}s" | Tee-Object out\result.txt; Get-Process lunaria -ErrorAction SilentlyContinue | Stop-Process -Force }
+          Get-ChildItem out\shots | Measure-Object | ForEach-Object { "screenshots: $($_.Count)" } | Tee-Object -Append out\result.txt
+          Select-String -Path out\lunaria-stderr.log -Pattern "init_host_egl|fastmem|fatal|abort|crash|exception|first guest frame" |
+            Select-Object -First 60 | ForEach-Object { $_.Line } | Tee-Object out\highlights.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lunaria-smoke-${{ inputs.tag }}
+          path: out
