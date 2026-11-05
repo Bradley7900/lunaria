@@ -1356,7 +1356,33 @@ static const char pick_css_extra[] =
     "border-top:1px solid #d6e6f2;border-radius:0 0 16px 16px;background:rgba(255,255,255,0.97);}"
     "#launcher-card .bar .note{position:absolute;left:32px;top:25px;font-size:12px;color:#6f8ca2;}"
     "#launcher-card #continue{position:absolute;right:32px;top:13px;width:150px;height:42px;margin:0;"
-    "background:#0b8fe0;color:#ffffff;border:1px solid #0b8fe0;font-weight:700;}";
+    "background:#0b8fe0;color:#ffffff;border:1px solid #0b8fe0;font-weight:700;}"
+    /* Dark theme for the launcher page only (the boot splash keeps its sky).
+     * Later rules of equal specificity win, so this block restyles what is
+     * above without touching the layout. */
+    ":root{--sky-top:#16191e;--sky-bot:#050607;}"
+    "body{background:linear-gradient(to top,#16191e 0%,#050607 100%);}"
+    ".flake{opacity:0.25;}"
+    ".mark{color:#e8ecf0;text-shadow:none;}"
+    "#launcher-card{background:rgba(18,20,24,0.96);box-shadow:0 14px 42px rgba(0,0,0,0.6);}"
+    "#launcher-card .main{color:#e8ecf0;}"
+    "#launcher-card h1{color:#ffffff;}"
+    "#launcher-card h2,#launcher-card .sub{color:#9aa4ae;}"
+    "#launcher-card button.drop{background:#121519;border-color:#3a414a;color:#9fc9ea;}"
+    "#launcher-card button.drop:hover,#launcher-card button.drop:focus{background:#181c21;border-color:#0b8fe0;}"
+    "#launcher-card .row input,#launcher-card .cell input,#launcher-card .cell .select-box"
+    "{background:#0d0f12;color:#e8ecf0;border-color:#2c3239;}"
+    "#launcher-card button{background:#1c2026;color:#e8ecf0;border-color:#2c3239;}"
+    "#launcher-card button:hover,#launcher-card button:focus{background:#252a31;}"
+    "#launcher-card .select-box::after{border-right-color:#9aa4ae;border-bottom-color:#9aa4ae;}"
+    "#launcher-card .select-panel{background:#15181d;border-color:#2c3239;}"
+    "#launcher-card .select_option{color:#e8ecf0;}"
+    "#launcher-card .select_option[aria-selected=true],#launcher-card .select_option:hover,"
+    "#launcher-card .select_option:focus{background:#252a31;}"
+    "#launcher-card .hint,#launcher-card .bar .note{color:#8a949e;}"
+    "#launcher-card #error{color:#ff6b5b;}"
+    "#launcher-card .bar{background:rgba(14,16,19,0.98);border-top-color:#262b31;}"
+    "#launcher-card #continue{background:#0b8fe0;color:#ffffff;border-color:#0b8fe0;}";
 
 static int launcher_form(char *path, size_t capacity,
                          luna_launcher_setting *settings, size_t count,
