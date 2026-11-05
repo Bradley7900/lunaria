@@ -72,16 +72,20 @@ int luna_launcher_choose(const char *package, const char *const *profiles, const
 typedef struct luna_launcher_setting {
    const char *key, *label, *hint;
    int folder;
-   int compact;      /* shares a row with the neighbouring compact settings */
+   int compact;      /* nonzero: shares a row with the neighbouring settings
+                        that carry the same compact value */
    const char *const *choices; /* NULL-terminated values, or NULL for text */
    const char *const *choice_labels; /* optional display names for choices */
+   const char *heading; /* optional section title shown above this setting */
    char value[1024];
 } luna_launcher_setting;
 
 /* Started with no application: asks which to open and how this installation
  * is set up (path field, luna-ui's file dialog for Browse, drag-and-drop).
  * 0 with the application in `path` and `settings` as edited; -1 when
- * cancelled or there is no display to ask on. */
+ * cancelled or there is no display to ask on; LUNA_LAUNCHER_GOOGLE when the
+ * person chose "Install Google services" (settings are read back as for 0). */
+#define LUNA_LAUNCHER_GOOGLE 2
 int luna_launcher_pick(char *path, size_t capacity,
                        luna_launcher_setting *settings, size_t count);
 int luna_launcher_pick_named(char *path, size_t capacity, const char *title,

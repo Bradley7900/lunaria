@@ -1142,6 +1142,8 @@ static void pick_select_option(LunaElement *element)
 }
 
 static void pick_continue(LunaElement *element) { (void)element; pick_chosen = 1; }
+static int pick_google;
+static void pick_google_click(LunaElement *element) { (void)element; pick_google = 1; }
 
 static void pick_dialog_done(const LunaFileDialogResult *result, void *userdata)
 {
@@ -1347,6 +1349,7 @@ static const char pick_css_extra[] =
     "#launcher-card .hint{margin:0 0 2px 0;font-size:12px;color:#6f8ca2;}"
     "#launcher-card #error{color:#c0392b;margin:10px 0 0 0;min-height:18px;font-size:13px;}"
     "#launcher-card .store-result{display:block;width:100%;padding:9px 12px;margin:4px 0;text-align:left;font-size:13px;}"
+    "#launcher-card button.google{display:block;width:100%;height:40px;margin:4px 0 0 0;text-align:center;cursor:pointer;}"
     "#launcher-card .hidden{display:none;}"
     "#launcher-card #store-cancel{padding:6px 12px;margin:4px 0;}"
     "#launcher-card .bar{position:absolute;left:0;right:0;bottom:0;height:68px;"
@@ -1363,13 +1366,14 @@ static int launcher_form(char *path, size_t capacity,
     if (count > PICK_FIELDS) count = PICK_FIELDS;
     pick_settings = settings; pick_count = count;
     if (!use_pbuffer && window) glfwSetWindowTitle(window, "Lunaria");
-    choosing = 1; pick_chosen = 0; dropped[0] = 0; pick_folder[0] = 0; pick_folder_for = -1; pick_select_for = -1;
+    choosing = 1; pick_chosen = 0; pick_google = 0; dropped[0] = 0; pick_folder[0] = 0; pick_folder_for = -1; pick_select_for = -1;
 
     /* luna-ui's file dialog is part of the document, hidden until Browse. */
     const char *dialog_html = luna_file_dialog_overlay_html();
     const char *dialog_css = luna_file_dialog_css();
     size_t html_size = 8192 + count * 768 + strlen(dialog_html);
     for (size_t i = 0; i < count; ++i) {
+        if (settings[i].heading) html_size += 32 + strlen(settings[i].heading);
         if (!settings[i].choices) continue;
         for (size_t k = 0; settings[i].choices[k]; ++k) {
             size_t extra = 160 + strlen(settings[i].choices[k]);
@@ -1405,14 +1409,23 @@ static int launcher_form(char *path, size_t capacity,
         for (int i=0;i<APKPURE_RESULTS;++i)
             at += (size_t)snprintf(html + at, html_size - at,
                 "<button class=\"store-result hidden\" id=\"store-result%d\"></button>",i);
+        /* Play services only installs from a local file, which the in-game
+         * right-click menu used to be the only way to reach. */
+        at += (size_t)snprintf(html + at, html_size - at,
+            "<div class=\"lbl\">Google services</div>"
+            "<button class=\"google\" id=\"google\">Install Google services from a file…</button>"
+            "<div class=\"hint\">Some games need Google Play services. Pick the APK or XAPK once; every app can use it.</div>");
     }
     if (package || count)
         at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", package ? "PROFILE" : "SETTINGS");
     for (size_t i = 0; i < count; ++i) {
+        if (settings[i].heading)
+            at += (size_t)snprintf(html + at, html_size - at, "<h2>%s</h2>", settings[i].heading);
         if (settings[i].compact) {
-            /* a run of compact settings is one row of equal columns */
+            /* a run of settings sharing one compact value is one row of equal columns */
             size_t run = 0;
-            while (i + run < count && settings[i + run].compact) ++run;
+            while (i + run < count && settings[i + run].compact == settings[i].compact &&
+                   (!run || !settings[i + run].heading)) ++run;
             at += (size_t)snprintf(html + at, html_size - at, "<div class=\"trio\">");
             for (size_t k = 0; k < run; ++k) {
                 at += (size_t)snprintf(html + at, html_size - at,
@@ -1470,6 +1483,7 @@ static int launcher_form(char *path, size_t capacity,
         pick_store.count=0;
         luna_set_on_click(luna_get_element_by_id("store-search"),pick_store_search);
         luna_set_on_click(luna_get_element_by_id("store-cancel"),pick_store_cancel);
+        luna_set_on_click(luna_get_element_by_id("google"),pick_google_click);
         for (int i=0;i<APKPURE_RESULTS;++i) {
             char id[32];snprintf(id,sizeof id,"store-result%d",i);
             luna_set_on_click(luna_get_element_by_id(id),pick_store_download);
@@ -1504,6 +1518,13 @@ static int launcher_form(char *path, size_t capacity,
         if (pick_folder[0] && pick_folder_for >= 0) {
             pick_set_field((size_t)pick_folder_for, pick_folder);
             pick_folder[0] = 0; pick_folder_for = -1;
+        }
+        if (pick_google) {
+            pick_google = 0;
+            if (!package && !title && !pick_store.active && !pick_read_fields()) {
+                result = LUNA_LAUNCHER_GOOGLE;
+                break;
+            }
         }
         if (dropped[0]) {
             snprintf(selected_path, sizeof selected_path, "%s", dropped);

@@ -2090,15 +2090,34 @@ done:
  * had been given.  The data folder leads because it is the one choice that
  * cannot be taken back: a later run pointed elsewhere does not find what an
  * earlier one downloaded. */
+static bool g_google_from_launcher;
 static int launcher_ask(int *argc, const char ***argv)
 {
    static const char *const devices[] = {"", "pixel6", "pixel7", "galaxys21", "lunaria", NULL};
-   static const struct { const char *key, *label, *hint; int folder, compact; } fields[] = {
-      {"LUNARIA_DATA_ROOT", "Data folder", "Where the app's files live. Keep it set: a different folder starts from nothing.", 1, 0},
-      {"LUNARIA_CACHE_DIR", "Package cache folder", "Empty: cache/packages inside the data folder.", 1, 0},
-      {"LUNARIA_DEVICE", "Device", "", 0, 1},
-      {"LUNARIA_WIDTH", "Width (px)", "", 0, 1},
-      {"LUNARIA_HEIGHT", "Height (px)", "", 0, 1},
+#ifdef _WIN32
+   /* arm_exec's init_host_egl: anything but "vulkan" is D3D11, falling back
+    * to Vulkan when D3D11 cannot start. */
+   static const char *const graphics[] = {"", "vulkan", NULL};
+   static const char *const graphics_labels[] = {"DirectX 11 (default)", "Vulkan", NULL};
+#endif
+   /* LUNARIA_A64_ENGINES: 64-bit games only; empty picks from the core count. */
+   static const char *const engines[] = {"", "1", "2", "4", NULL};
+   static const char *const engine_labels[] = {"Auto", "1", "2", "4", NULL};
+   static const struct {
+      const char *key, *label, *hint; int folder, compact;
+      const char *const *choices, *const *labels; const char *heading;
+   } fields[] = {
+      {"LUNARIA_DATA_ROOT", "Data folder", "Where the app's files live. Keep it set: a different folder starts from nothing.", 1, 0, NULL, NULL, NULL},
+      {"LUNARIA_CACHE_DIR", "Package cache folder", "Empty: cache/packages inside the data folder.", 1, 0, NULL, NULL, NULL},
+      {"LUNARIA_DEVICE", "Device", "", 0, 1, devices, NULL, NULL},
+      {"LUNARIA_WIDTH", "Width (px)", "", 0, 1, NULL, NULL, NULL},
+      {"LUNARIA_HEIGHT", "Height (px)", "", 0, 1, NULL, NULL, NULL},
+#ifdef _WIN32
+      {"LUNARIA_ANGLE_BACKEND", "Graphics", "", 0, 2, graphics, graphics_labels, "PERFORMANCE"},
+      {"LUNARIA_A64_ENGINES", "Game threads (64-bit games)", "", 0, 2, engines, engine_labels, NULL},
+#else
+      {"LUNARIA_A64_ENGINES", "Game threads (64-bit games)", "", 0, 2, engines, engine_labels, "PERFORMANCE"},
+#endif
    };
    static luna_launcher_setting settings[sizeof fields / sizeof fields[0]];
    static char chosen[APK_PATH], conf[APK_PATH], before[sizeof fields / sizeof fields[0]][1024];
@@ -2111,7 +2130,9 @@ static int launcher_ask(int *argc, const char ***argv)
       settings[i].hint = fields[i].hint;
       settings[i].folder = fields[i].folder;
       settings[i].compact = fields[i].compact;
-      settings[i].choices = !strcmp(fields[i].key, "LUNARIA_DEVICE") ? devices : NULL;
+      settings[i].choices = fields[i].choices;
+      settings[i].choice_labels = fields[i].labels;
+      settings[i].heading = fields[i].heading;
       const char *env = getenv(fields[i].key);
       if (env && *env && strlen(env) < sizeof settings[i].value)
          strcpy(settings[i].value, env);
@@ -2119,7 +2140,8 @@ static int launcher_ask(int *argc, const char ***argv)
          conf_get(conf, fields[i].key, settings[i].value, sizeof settings[i].value);
       strcpy(before[i], settings[i].value);
    }
-   if (luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]) != 0)
+   const int picked = luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]);
+   if (picked != 0 && picked != LUNA_LAUNCHER_GOOGLE)
       return 1;
    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
       if (!strcmp(before[i], settings[i].value))
@@ -2134,7 +2156,10 @@ static int launcher_ask(int *argc, const char ***argv)
    if (env_set("LUNARIA_CONF", conf, true))
       return -1;
    synthesized[0] = *argc > 0 ? (*argv)[0] : "lunaria";
-   synthesized[1] = chosen;
+   /* The Google services button carries on exactly as `--google-services`
+    * would: its own file picker, then the system install. */
+   g_google_from_launcher = picked == LUNA_LAUNCHER_GOOGLE;
+   synthesized[1] = g_google_from_launcher ? "--google-services" : chosen;
    synthesized[2] = NULL;
    *argc = 2;
    *argv = synthesized;
@@ -2924,6 +2949,11 @@ int luna_apk_prepare(int *argc, const char ***argv)
    int result = apk_prepare_inner(argc, argv);
    if (result == 0 && host_driver_defaults()) result = apk_error("cannot configure host driver");
    if (result == 0 && luna_launcher_cancelled()) result = apk_error("installation cancelled");
+   const bool back_to_launcher = g_google_from_launcher && result == 1 && !luna_launcher_cancelled();
    luna_launcher_end(result == 0);
+   /* Installed (or picked nothing) from the launcher's Google services button:
+    * show the launcher again rather than closing on the person. */
+   if (back_to_launcher && luna_apk_restart_launcher())
+      fprintf(stderr, "[apk] cannot return to the launcher after Google services\n");
    return result;
 }
