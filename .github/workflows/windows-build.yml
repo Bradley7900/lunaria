@@ -1,0 +1,105 @@
+name: Windows build (fork)
+
+# Manual Windows-only build for this fork: the same cross-build as
+# release.yml's windows job, published as a prerelease under `tag`.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish the ZIP under
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows (x86_64, cross)
+    # Ubuntu apt MinGW is GCC 13 without -mcrtdll=ucrt. Use llvm-mingw (UCRT).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential nasm cmake ninja-build \
+            python3 curl zip bzip2 zstd unzip xz-utils
+          ver=20261006
+          archive="llvm-mingw-${ver}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          curl -fsSL -o "/tmp/${archive}" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${ver}/${archive}"
+          sudo tar -xJf "/tmp/${archive}" -C /opt
+          sudo ln -sfn "/opt/llvm-mingw-${ver}-ucrt-ubuntu-22.04-x86_64" /opt/llvm-mingw
+          rm -f "/tmp/${archive}"
+          echo /opt/llvm-mingw/bin >> "$GITHUB_PATH"
+          export PATH="/opt/llvm-mingw/bin:$PATH"
+          x86_64-w64-mingw32-gcc --version
+          # Confirm the toolchain links UCRT (api-ms-win-crt-*), not msvcrt.dll.
+          printf 'int main(void){return 0;}\n' > /tmp/ucrt-probe.c
+          x86_64-w64-mingw32-gcc /tmp/ucrt-probe.c -o /tmp/ucrt-probe.exe
+          x86_64-w64-mingw32-objdump -p /tmp/ucrt-probe.exe \
+            | grep -Eiq 'ucrtbase|api-ms-win-crt-'
+
+      # Guest libm/libc come from the SDK build-tools renderscript intermediates.
+      - name: Fetch Android build-tools (guest syslib)
+        run: |
+          sdk="$HOME/Android/Sdk"
+          mkdir -p "$sdk"
+          curl -fsSL -o /tmp/build-tools.zip \
+            https://dl.google.com/android/repository/build-tools_r34-linux.zip
+          unzip -q /tmp/build-tools.zip -d "$sdk"
+          rm -f /tmp/build-tools.zip
+          test -n "$(find "$sdk" -path '*/renderscript/lib/intermediates/arm64-v8a/libm.so' | head -1)"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Export NDK path
+        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/lunaria-windows-deps
+          key: windows-deps-${{ hashFiles('scripts/fetch-windows-deps.py') }}
+
+      - name: Cross-build Windows ZIP
+        run: make -j"$(nproc)" dist-cross-win
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lunaria-windows-x86_64
+          path: lunaria-*windows*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lunaria-windows-x86_64
+          path: out
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Lunaria ${{ inputs.tag }} (Windows test build)
+          prerelease: true
+          files: out/*
+          body: |
+            Unofficial test build of Lunaria with launcher changes (Performance
+            section, Install Google services button, dark launcher theme).
+            Built from ${{ github.sha }}. Not an upstream release.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
