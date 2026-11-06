@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Mesa EGL
-        run: sudo apt-get update -q && sudo apt-get install -y -q libegl1 libegl-mesa0 libgles2 libgl1-mesa-dri libgbm1
+        run: sudo apt-get update -q && sudo apt-get install -y -q libegl1 libegl-mesa0 libgles2 libgl1-mesa-dri libgbm1 libglfw3 libopenal1 libpulse0 libasound2t64 || sudo apt-get install -y -q libglfw3
       - name: Download upstream build
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,13 +35,14 @@ jobs:
         run: |
           exe=$(find app -type f -name lunaria -perm -u+x | head -1)
           echo "exe=$exe"; ldd "$exe" | grep "not found" || true
+          mkdir -p out
           mkdir -p out/shots data
           export LUNARIA_PBUFFER=1 LUNARIA_COMP_SHOT_S=15 LUNARIA_DUMP_DIR="$PWD/out/shots"
           "$exe" --data-root "$PWD/data" "$PWD/UnitySampleGame.apk" >out/lunaria-stdout.log 2>out/lunaria-stderr.log &
           pid=$!
           for i in $(seq 1 $(( ${{ inputs.seconds }} / 5 ))); do kill -0 $pid 2>/dev/null || break; sleep 5; done
           if kill -0 $pid 2>/dev/null; then echo "lunaria still running after ${{ inputs.seconds }}s" | tee out/result.txt; kill -9 $pid
-          else wait $pid; echo "lunaria exited early, code $?" | tee out/result.txt; fi
+          else rc=0; wait $pid || rc=$?; echo "lunaria exited early, code $rc" | tee out/result.txt; fi
           echo "screenshots: $(ls out/shots | wc -l)" | tee -a out/result.txt
           grep -E "\[perf\] t=|swap#[0-9]*00 " out/lunaria-stderr.log | tail -8 | tee out/highlights.txt || true
       - uses: actions/upload-artifact@v4
