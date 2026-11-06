@@ -1279,6 +1279,15 @@ void luna_os_srand48(int32_t seed);
  * Returns NULL on failure. */
 void *luna_os_reserve(void *want, size_t len, int exact);
 
+/* Windows commits a big reservation piece by piece on first touch; the kernel
+ * does not, so a buffer handed to ReadFile/recv must be committed first.  A
+ * no-op everywhere else. */
+#ifdef _WIN32
+void luna_lazy_ensure(const void *addr, size_t len);
+#else
+static inline void luna_lazy_ensure(const void *addr, size_t len) { (void)addr; (void)len; }
+#endif
+
 /* Give a range back.  Safe on a sub-range of an earlier reservation. */
 int luna_os_release(void *addr, size_t len);
 

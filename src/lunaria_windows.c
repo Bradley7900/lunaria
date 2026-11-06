@@ -247,9 +247,113 @@ static DWORD luna_prot_to_host(int prot)
    return PAGE_NOACCESS;
 }
 
+/* ---- lazy commit ---------------------------------------------------------
+ *
+ * A big reservation (the 4 GB guest window) is only reserved; each 64 KB
+ * piece is committed the first time something touches it.  Touches from this
+ * process fault and are committed by lazy_veh.  The kernel does not fault on
+ * our behalf: ReadFile/recv into a reserved page fail with ERROR_NOACCESS, so
+ * every path that hands a buffer to the kernel calls luna_lazy_ensure first,
+ * as do protect/lock (Windows cannot change protection of reserved pages).
+ * LUNARIA_LAZY_COMMIT=0 restores reserve-and-commit. */
+#define LAZY_MIN   ((size_t)256 << 20)
+#define LAZY_CHUNK ((uintptr_t)64 << 10)
+#define LAZY_MAX   8
+static struct { uintptr_t lo, hi; } lazy_ranges[LAZY_MAX];
+static volatile LONG lazy_count;
+static SRWLOCK lazy_lock = SRWLOCK_INIT;
+static int lazy_state;   /* 0 unknown, 1 on, -1 off */
+
+static int lazy_find(uintptr_t a)
+{
+   const LONG n = lazy_count;
+   for (LONG i = 0; i < n; ++i)
+      if (a >= lazy_ranges[i].lo && a < lazy_ranges[i].hi) return (int)i;
+   return -1;
+}
+
+/* Commit the reserved parts of [a, a+len) inside lazy range r.  Pages that
+ * are already committed keep their contents and protection. */
+static int lazy_commit(int r, uintptr_t a, size_t len)
+{
+   uintptr_t lo = a & ~(LAZY_CHUNK - 1);
+   uintptr_t hi = a + len;
+   if (hi < a) return 0;
+   hi = (hi + LAZY_CHUNK - 1) & ~(LAZY_CHUNK - 1);
+   if (lo < lazy_ranges[r].lo) lo = lazy_ranges[r].lo;
+   if (hi > lazy_ranges[r].hi) hi = lazy_ranges[r].hi;
+   int ok = 1;
+   AcquireSRWLockExclusive(&lazy_lock);
+   for (uintptr_t at = lo; at < hi;) {
+      MEMORY_BASIC_INFORMATION mi;
+      if (!VirtualQuery((void *)at, &mi, sizeof mi)) { ok = 0; break; }
+      uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+      if (end > hi) end = hi;
+      if (mi.State == MEM_RESERVE &&
+          !VirtualAlloc((void *)at, end - at, MEM_COMMIT, PAGE_READWRITE))
+         ok = 0;
+      at = end;
+   }
+   ReleaseSRWLockExclusive(&lazy_lock);
+   return ok;
+}
+
+void luna_lazy_ensure(const void *addr, size_t len)
+{
+   if (!lazy_count || !addr || !len) return;
+   uintptr_t a = (uintptr_t)addr, last = a + len - 1;
+   if (last < a) last = UINTPTR_MAX;
+   for (LONG i = 0; i < lazy_count; ++i) {
+      uintptr_t lo = a > lazy_ranges[i].lo ? a : lazy_ranges[i].lo;
+      uintptr_t hi = last < lazy_ranges[i].hi - 1 ? last : lazy_ranges[i].hi - 1;
+      if (lo <= hi) lazy_commit((int)i, lo, hi - lo + 1);
+   }
+}
+
+static LONG CALLBACK lazy_veh(EXCEPTION_POINTERS *e)
+{
+   const EXCEPTION_RECORD *r = e->ExceptionRecord;
+   if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2)
+      return EXCEPTION_CONTINUE_SEARCH;
+   const uintptr_t a = (uintptr_t)r->ExceptionInformation[1];
+   const int i = lazy_find(a);
+   if (i < 0) return EXCEPTION_CONTINUE_SEARCH;
+   MEMORY_BASIC_INFORMATION mi;
+   if (!VirtualQuery((void *)a, &mi, sizeof mi) || mi.State != MEM_RESERVE)
+      return EXCEPTION_CONTINUE_SEARCH;
+   return lazy_commit(i, a, 1) ? EXCEPTION_CONTINUE_EXECUTION
+                               : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void *lazy_reserve(void *want, size_t len, int exact)
+{
+   if (lazy_state == 0) {
+      const char *v = getenv("LUNARIA_LAZY_COMMIT");
+      lazy_state = v && v[0] == '0' ? -1 : 1;
+      if (lazy_state > 0 && !AddVectoredExceptionHandler(1, lazy_veh)) lazy_state = -1;
+      fprintf(stderr, "[mem] lazy commit %s\n", lazy_state > 0 ? "on" : "off");
+   }
+   if (lazy_state < 0 || len < LAZY_MIN || lazy_count >= LAZY_MAX) return NULL;
+   void *p = VirtualAlloc(exact ? want : NULL, len,
+                          MEM_RESERVE | (exact ? 0 : MEM_TOP_DOWN), PAGE_READWRITE);
+   if (!p) return NULL;
+   if (exact && p != want) { VirtualFree(p, 0, MEM_RELEASE); return NULL; }
+   AcquireSRWLockExclusive(&lazy_lock);
+   const LONG n = lazy_count;
+   lazy_ranges[n].lo = (uintptr_t)p;
+   lazy_ranges[n].hi = (uintptr_t)p + len;
+   InterlockedExchange(&lazy_count, n + 1);
+   ReleaseSRWLockExclusive(&lazy_lock);
+   fprintf(stderr, "[mem] reserved %zu MB at %p, committed on first touch\n",
+           len >> 20, p);
+   return p;
+}
+
 void *luna_os_reserve(void *want, size_t len, int exact)
 {
    if (!len || (exact && !want)) { errno = EINVAL; return NULL; }
+   void *lazy = len >= LAZY_MIN ? lazy_reserve(want, len, exact) : NULL;
+   if (lazy) return lazy;
    void *p = VirtualAlloc(exact ? want : NULL, len,
                           MEM_RESERVE | MEM_COMMIT | (exact ? 0 : MEM_TOP_DOWN),
                           PAGE_READWRITE);
@@ -300,7 +404,15 @@ int luna_os_release(void *addr, size_t len)
             }
          }
          ReleaseSRWLockExclusive(&file_view_lock);
-      } else ok = VirtualFree(base, 0, MEM_RELEASE);
+      } else {
+         const int lazy = lazy_find((uintptr_t)base);
+         ok = VirtualFree(base, 0, MEM_RELEASE);
+         if (ok && lazy >= 0) {
+            AcquireSRWLockExclusive(&lazy_lock);
+            lazy_ranges[lazy].lo = lazy_ranges[lazy].hi = 0;
+            ReleaseSRWLockExclusive(&lazy_lock);
+         }
+      }
       if (!ok) errno = EINVAL;
       return ok ? 0 : -1;
    }
@@ -313,13 +425,15 @@ int luna_os_release(void *addr, size_t len)
       if (mi.State == MEM_COMMIT) { committed = 1; break; }
       at += mi.RegionSize;
    }
-   if (!committed) VirtualFree(base, 0, MEM_RELEASE);
+   /* A lazy range is mostly reserved by design: never drop it whole here. */
+   if (!committed && lazy_find((uintptr_t)base) < 0) VirtualFree(base, 0, MEM_RELEASE);
    return 0;
 }
 
 int luna_os_protect(void *addr, size_t len, int prot)
 {
    DWORD old = 0;
+   luna_lazy_ensure(addr, len);
    return VirtualProtect(addr, len, luna_prot_to_host(prot), &old) ? 0 : -1;
 }
 
@@ -425,6 +539,7 @@ size_t luna_os_page_size(void)
 
 int luna_os_memory_advise(void *addr, size_t len, int advice)
 {
+   luna_lazy_ensure(addr, len);
    switch (advice) {
    case 0: case 1: case 2: case 3: case 4: case 8:
    case 9: case 10: case 11: case 12: case 13: case 14: case 15:
@@ -470,6 +585,7 @@ int luna_os_memory_advise(void *addr, size_t len, int advice)
 
 int luna_os_memory_sync(void *addr, size_t len, int flags)
 {
+   luna_lazy_ensure(addr, len);
    uintptr_t first = (uintptr_t)addr;
    if (first % luna_os_page_size() ||
        (flags & ~(LUNA_MS_ASYNC | LUNA_MS_INVALIDATE | LUNA_MS_SYNC)) ||
@@ -531,6 +647,7 @@ int luna_os_memory_sync(void *addr, size_t len, int flags)
 
 int luna_os_memory_lock(void *addr, size_t len, int unlock)
 {
+   luna_lazy_ensure(addr, len);
    uintptr_t cursor = (uintptr_t)addr;
    if (!len) return 0;
    if (len - 1 > UINTPTR_MAX - cursor) { errno = ENOMEM; return -1; }
@@ -558,6 +675,7 @@ int luna_os_memory_lock(void *addr, size_t len, int unlock)
 
 int luna_os_residency(void *addr, size_t len, unsigned char *vector)
 {
+   luna_lazy_ensure(addr, len);
    const size_t page = luna_os_page_size();
    const uintptr_t first = (uintptr_t)addr;
    if (first % page) { errno = EINVAL; return -1; }
@@ -1914,6 +2032,7 @@ static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t
       DWORD error = GetLastError(); CloseHandle(handle); return luna_file_error(error);
    }
    DWORD count = 0, request = length > INT_MAX ? INT_MAX : (DWORD)length;
+   luna_lazy_ensure(buffer, request);
    BOOL ok = writing ? WriteFile(handle, buffer, request, &count, &operation)
                      : ReadFile(handle, buffer, request, &count, &operation);
    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
@@ -2629,6 +2748,7 @@ ptrdiff_t luna_socket_recv(int fd, void *buffer, size_t length, int flags)
    SOCKET socket = (SOCKET)luna_socket_native(fd);
    if (socket == INVALID_SOCKET) return -1;
    int n = length > INT_MAX ? INT_MAX : (int)length;
+   luna_lazy_ensure(buffer, (size_t)n);
    int result = recv(socket,buffer,n,flags);
    return result == SOCKET_ERROR ? failed() : result;
 }
@@ -2645,6 +2765,7 @@ ptrdiff_t luna_socket_recvfrom(int fd, void *buffer, size_t length, int flags, s
    SOCKET socket = (SOCKET)luna_socket_native(fd);
    if (socket == INVALID_SOCKET) return -1;
    int n = length > INT_MAX ? INT_MAX : (int)length;
+   luna_lazy_ensure(buffer, (size_t)n);
    int result = recvfrom(socket,buffer,n,flags,address,address_length);
    return result == SOCKET_ERROR ? failed() : result;
 }
@@ -2672,6 +2793,7 @@ static WSABUF *message_buffers(const struct msghdr *message)
       total += length;
       buffers[i].len = (ULONG)length;
       buffers[i].buf = message->msg_iov[i].iov_base;
+      luna_lazy_ensure(buffers[i].buf, buffers[i].len);
    }
    return buffers;
 }
@@ -2970,6 +3092,7 @@ static ptrdiff_t pipe_io(HANDLE handle, void *buffer, DWORD length, int writing)
       }
    }
    DWORD bytes = 0;
+   luna_lazy_ensure(buffer, length);
    BOOL ok = writing ? WriteFile(handle, buffer, length, &bytes, NULL)
                      : ReadFile(handle, buffer, length, &bytes, NULL);
    if (ok && (!writing || bytes || !length)) return bytes;
@@ -3006,6 +3129,7 @@ static short pipe_poll(HANDLE handle, short events)
 }
 ptrdiff_t luna_fd_read(int fd, void *buffer, size_t length)
 {
+   luna_lazy_ensure(buffer, length > INT_MAX ? INT_MAX : length);
    SOCKET socket = lookup(fd);
    unsigned int n = length > INT_MAX ? INT_MAX : (unsigned int)length;
    if (socket == INVALID_SOCKET) {
@@ -3606,6 +3730,7 @@ ptrdiff_t luna_os_command_pipe_read(intptr_t value, void *buffer, size_t capacit
    }
    DWORD bytes;
    DWORD length = capacity > MAXDWORD ? MAXDWORD : (DWORD)capacity;
+   luna_lazy_ensure(buffer, length);
    if (ReadFile(pipe, buffer, length, &bytes, NULL)) return bytes;
    DWORD error = GetLastError();
    if (error == ERROR_BROKEN_PIPE) { DisconnectNamedPipe(pipe); return 0; }
