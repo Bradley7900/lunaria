@@ -13686,7 +13686,11 @@ static void drive_ndk_choreographer(ArmExecCtx &ctx) {
 }
 
 // glMapBufferRange shadows: host pointers can't be exposed to the guest.
-struct GlMappedBuf { void *host; uint32_t gva, len, access; };
+/* `deferred`: a write-only map that never touched the host buffer.  The guest
+ * writes the shadow; unmap / flush upload it with glBufferData/SubData.  See
+ * SVC_GL3_MapBufferRange. */
+struct GlMappedBuf { void *host; uint32_t gva, len, access, off = 0, size = 0;
+                     GLenum usage = 0; bool deferred = false; };
 static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name */
 static thread_local std::map<uint32_t, uint32_t> g_gl_bound_bufs;   /* target -> buffer name */
 /* With a pixel-unpack buffer bound, GL interprets the pointer argument as a
@@ -37924,6 +37928,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const GuestVA p = argp_n(2);
         GLint v = 0;
         if (f) f((GLenum)r0, (GLenum)r1, &v);
+        /* A deferred map is invisible to the host: answer the map state the
+         * guest would see on a device. */
+        {
+            auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
+            if (it != g_gl_mapped.end() && it->second.deferred) {
+                const GlMappedBuf &m = it->second;
+                if (r1 == 0x88BCu) v = 1;                       /* GL_BUFFER_MAPPED */
+                else if (r1 == 0x911Fu) v = (GLint)m.access;    /* GL_BUFFER_ACCESS_FLAGS */
+                else if (r1 == 0x9120u) v = (GLint)m.len;       /* GL_BUFFER_MAP_LENGTH */
+                else if (r1 == 0x9121u) v = (GLint)m.off;       /* GL_BUFFER_MAP_OFFSET */
+            }
+        }
         if (p) ctx.mem.write32(p, (uint32_t)v);
         break;
     }
@@ -45118,6 +45134,43 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uint32_t off = r1, len = r2, access = r3;
         uint32_t buf = gl_mapping_buffer((GLenum)r0);
         void *host = nullptr;
+        /* A write-only map never needs the host pointer: the guest only ever
+         * sees the shadow, and the bytes reach the buffer at unmap or flush.
+         * So skip the host map entirely and upload then.  Unity maps every
+         * dynamic vertex buffer this way each frame (WRITE|INVALIDATE_BUFFER,
+         * ~20 KB): measured ~0.4 ms a call through ANGLE's map/unmap, most of
+         * it dropping and retaking the execution lock around two host calls.
+         * Anything else (a read, a range past the end, no buffer bound) keeps
+         * the real map so GL raises the same errors.
+         * LUNARIA_GL_MAP_DEFER=0 turns it off. */
+        static const bool defer_on = [] {
+            const char *e = lunaria_env("LUNARIA_GL_MAP_DEFER");
+            return !(e && e[0] == '0');
+        }();
+        static auto gbi = (void (*)(GLenum, GLenum, GLint *))host_gl_proc({ "glGetBufferParameteriv" });
+        if (defer_on && buf && len && gbi && pfn_glBufferSubData && pfn_glBufferData &&
+            !(access & 0x0001u) /* READ */ && (access & 0x0002u) /* WRITE */ &&
+            !g_gl_mapped.count(buf)) {
+            GLint size = 0, usage = 0, mapped = 0;
+            gbi((GLenum)r0, 0x8764u /* GL_BUFFER_SIZE */, &size);
+            gbi((GLenum)r0, 0x8765u /* GL_BUFFER_USAGE */, &usage);
+            gbi((GLenum)r0, 0x88BCu /* GL_BUFFER_MAPPED */, &mapped);
+            if (size > 0 && !mapped && (uint64_t)off + len <= (uint64_t)size) {
+                uint32_t gva = arm_malloc(ctx, len);
+                if (gva) {
+                    GlMappedBuf m{ nullptr, gva, len, access };
+                    m.off = off; m.size = (uint32_t)size; m.usage = (GLenum)usage;
+                    m.deferred = true;
+                    g_gl_mapped[buf] = m;
+                    static int n = 0;
+                    if (n++ < 4)
+                        fprintf(stderr, "[gl] MapBufferRange deferred buf=%u off=%u len=%u "
+                                "access=0x%x size=%d\n", buf, off, len, access, size);
+                    if (ctx.is_arm64) retptr(gva); else ret32(gva);
+                    break;
+                }
+            }
+        }
         if (pfn_glMapBufferRange) {
             ArmLockDropped gl_unlocked;
             host = pfn_glMapBufferRange((GLenum)r0,(intptr_t)off,(intptr_t)len,
@@ -45216,6 +45269,23 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_UnmapBufferOES:
     case SVC_GL3_UnmapBuffer: {
         auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
+        if (it != g_gl_mapped.end() && it->second.deferred) {
+            GlMappedBuf m = it->second;
+            g_gl_mapped.erase(it);
+            if (!(m.access & 0x0010u) /* FLUSH_EXPLICIT: the flushes already uploaded */) {
+                const void *src = ctx.mem.ptr(m.gva);
+                /* Replacing the whole buffer as INVALIDATE_BUFFER asked: one
+                 * glBufferData, which lets the driver orphan instead of wait. */
+                if ((m.access & 0x0008u) && m.off == 0 && m.len == m.size)
+                    pfn_glBufferData((GLenum)r0, (GLsizeiptr)m.len, src,
+                                     m.usage ? m.usage : 0x88E8u /* DYNAMIC_DRAW */);
+                else
+                    pfn_glBufferSubData((GLenum)r0, (GLintptr)m.off, (GLsizeiptr)m.len, src);
+            }
+            arm_free(ctx, m.gva);
+            ret32(1u);
+            break;
+        }
         if (it != g_gl_mapped.end()) {
             auto &m = it->second;
             // GL_MAP_WRITE_BIT without GL_MAP_FLUSH_EXPLICIT_BIT
@@ -45239,6 +45309,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_GL3_FlushMappedBufferRange: {
         auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
+        if (it != g_gl_mapped.end() && it->second.deferred) {
+            const GlMappedBuf &m = it->second;
+            const uint32_t off = r1, len = r2;
+            if ((m.access & 0x0010u) && len && (uint64_t)off + len <= m.len)
+                pfn_glBufferSubData((GLenum)r0, (GLintptr)(m.off + off), (GLsizeiptr)len,
+                                    ctx.mem.ptr(m.gva + off));
+            else if (!(m.access & 0x0010u) || (uint64_t)off + len > m.len)
+                guest_gl_set_error(0x0502u /* GL_INVALID_OPERATION / VALUE, as the host would */);
+            break;
+        }
         if (it != g_gl_mapped.end()) {
             auto &m = it->second;
             uint32_t off = r1, len = r2;
