@@ -14,6 +14,10 @@ on:
         description: How long to let the game run
         required: false
         default: "240"
+      env:
+        description: Extra environment, K=V separated by ';'
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -39,6 +43,7 @@ jobs:
           $exe = (Get-ChildItem app -Recurse -Filter lunaria.exe | Select-Object -First 1)
           New-Item -ItemType Directory -Force out\shots, data | Out-Null
           $env:LUNARIA_COMP_SHOT_S = "15"
+          foreach ($kv in "${{ inputs.env }}".Split(';')) { if ($kv -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2]; "env $($matches[1])=$($matches[2])" } }
           $env:LUNARIA_DUMP_DIR = (Resolve-Path out\shots).Path -replace '\\','/'
           $p = Start-Process -FilePath $exe.FullName `
                  -ArgumentList "--data-root `"$((Resolve-Path data).Path)`" `"$((Resolve-Path UnitySampleGame.apk).Path)`"" `
@@ -55,5 +60,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lunaria-smoke-${{ inputs.tag }}
+          name: lunaria-smoke-${{ inputs.tag }}-${{ github.run_id }}
           path: out
