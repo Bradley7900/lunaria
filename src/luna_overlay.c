@@ -3318,14 +3318,12 @@ static void settings_selftest_tick(void)
          if (!strcmp(g_settings[i].key, "LUNARIA_COMP_SHARE") || !strcmp(g_settings[i].key, "LUNARIA_ASTC")) {
             char id[48]; snprintf(id, sizeof id, "luna-menu-setting-%zu", i);
             menu_clicked(id);
-            fprintf(stderr, "[settings-test] %s -> %s
-", g_settings[i].label, g_settings[i].names[g_settings[i].value]);
+            fprintf(stderr, "[settings-test] %s -> %s\n", g_settings[i].label, g_settings[i].names[g_settings[i].value]);
          }
       stage = 1;
    } else {
       menu_clicked("luna-menu-settings-cancel");
-      fprintf(stderr, "[settings-test] cancelled, settings open=%d
-", (int)g_settings_open);
+      fprintf(stderr, "[settings-test] cancelled, settings open=%d\n", (int)g_settings_open);
       stage = 99;
    }
 }
