@@ -36777,6 +36777,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         // Damage rectangles are a compositor hint; presenting the whole
         // surface satisfies the call (and is what a single-buffered host does).
         ++g_guest_egl_swap_count;
+        frame_time_note();
         /* The guest has a frame of its own now.  Whether the card comes down
          * is decided in luna_boot: the first swap is often blank while JIT is
          * still busy. */
