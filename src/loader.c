@@ -2606,7 +2606,50 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
       RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx,
                        &handler_data, &establisher, NULL);
    }
+   /* JIT frames carry no unwind data, so the walk above stops at the first
+    * one.  The raw stack still holds return addresses into the executable:
+    * list the first few, which name the host code that entered the JIT. */
+   {
+      const DWORD64 *sp = (const DWORD64 *)info->ContextRecord->Rsp;
+      int shown = 0;
+      for (int i = 0; i < 4096 && shown < 16; i++) {
+         MEMORY_BASIC_INFORMATION mi;
+         if ((!i || !((uintptr_t)(sp + i) & 0xfff)) &&
+             (!VirtualQuery(sp + i, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+              (mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))))
+            break;
+         uintptr_t mbase;
+         crash_module((const void *)sp[i], module, sizeof module, &mbase);
+         if (!mbase) continue;
+         MEMORY_BASIC_INFORMATION code;
+         if (!VirtualQuery((const void *)sp[i], &code, sizeof code) ||
+             !(code.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+            continue;
+         fprintf(stderr, "[crash] stack+0x%x %s+0x%llx\n", i * 8, module,
+                 (unsigned long long)(sp[i] - mbase));
+         shown++;
+      }
+   }
    fflush(stderr);
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+/* First chance: a fault inside JIT code has no unwind data, so the OS cannot
+ * find a frame that would reach the unhandled filter and ends the process
+ * without calling it.  Lunaria installs no handler of its own for these
+ * codes, so the first one is the crash; report it and let dispatch go on. */
+static LONG WINAPI crash_veh(EXCEPTION_POINTERS *info)
+{
+   switch (info->ExceptionRecord->ExceptionCode) {
+   case EXCEPTION_ACCESS_VIOLATION:
+   case EXCEPTION_ILLEGAL_INSTRUCTION:
+   case EXCEPTION_PRIV_INSTRUCTION:
+   case EXCEPTION_STACK_OVERFLOW:
+   case EXCEPTION_INT_DIVIDE_BY_ZERO:
+      if (getenv("LUNARIA_NO_CRASH_REPORT")) break;
+      return crash_filter(info);
+   default:
+      break;
+   }
    return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -2614,6 +2657,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
 int wmain(int argc, wchar_t *wide_argv[])
 {
    SetUnhandledExceptionFilter(crash_filter);
+   AddVectoredExceptionHandler(0, crash_veh);
    char **argv = calloc((size_t)argc + 1, sizeof *argv);
    if (!argv) return EXIT_FAILURE;
    for (int i = 0; i < argc; i++) {
