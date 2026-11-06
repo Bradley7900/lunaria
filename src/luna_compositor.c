@@ -367,21 +367,39 @@ static void share_flush_pending(void)
 /* Which path is faster depends on the machine: the shared texture saves a
  * read-back and an upload, but a software device (WARP on a GPU-less box)
  * or a driver that copies shared resources can make it the slower one.  So
- * measure instead of guessing: run each for a few seconds, count the frames
- * the compositor actually received, keep the better one (the shared texture
- * on a near tie, since it spends less CPU), and check again now and then as
- * the game moves between menus and 3D.  LUNARIA_COMP_SHARE=1/0 pins it. */
+ * measure instead of guessing, keep the better one (the shared texture on a
+ * near tie, since it spends less CPU), and look again when it may have
+ * changed.  LUNARIA_COMP_SHARE=1/0 pins it.
+ *
+ * Measured on GitHub's runners the first version picked wrong in four runs
+ * out of five, costing ~15 fps for two minutes at a time, because:
+ *  - it timed shared, then pixels: a scene that got heavier between the two
+ *    windows (menu into gameplay) was charged to the pixel path.  Now the
+ *    windows run shared, pixels, pixels, shared, so a steady change in the
+ *    scene lands on both paths equally;
+ *  - in a menu both paths reach the frame cap, a tie that said nothing about
+ *    the game, and it was then kept for 120 s.  A tie now looks again in
+ *    20 s;
+ *  - nothing noticed a heavier scene after the pick.  Now a frame rate that
+ *    falls below 75% of what the pick measured looks again at once. */
 #define PICK_WARMUP_NS   (20ull * 1000000000ull)
-#define PICK_WINDOW_NS   (3ull * 1000000000ull)
+#define PICK_WINDOW_NS   (2ull * 1000000000ull)
 #define PICK_RECHECK_NS  (120ull * 1000000000ull)
+#define PICK_TIE_NS      (20ull * 1000000000ull)
+#define PICK_LOADING_NS  (15ull * 1000000000ull)
+#define PICK_WATCH_NS    (3ull * 1000000000ull)
+#define PICK_MIN_GAP_NS  (15ull * 1000000000ull)
 static bool share_choose(void)
 {
    static int forced = -2;          /* -1 auto, 0 pixels, 1 shared */
-   static int phase;                /* 0 using the pick, 1 timing shared, 2 timing pixels */
+   static int phase;                /* 0 using the pick, 1..4 timing windows */
    static bool pick = true;
-   static uint64_t t0, next_check;
-   static unsigned f0;
-   static double shared_fps;
+   static uint64_t t0, next_check, last_pick, watch_t0;
+   static unsigned f0, watch_f0;
+   static uint64_t ns[2];           /* [0] pixels, [1] shared */
+   static unsigned fr[2];
+   static double pick_fps;
+   static const bool order[5] = { false, true, false, false, true };   /* S P P S */
    if (forced == -2) {
       const char *env = getenv("LUNARIA_COMP_SHARE");
       forced = !env || !*env ? -1 : env[0] == '0' ? 0 : 1;
@@ -394,40 +412,58 @@ static bool share_choose(void)
    const uint64_t now = now_ns();
    const unsigned frames = atomic_load(&g_comp_frames);
    if (!next_check) next_check = now + PICK_WARMUP_NS;
-   switch (phase) {
-   case 0:
+
+   if (phase == 0) {
+      /* Watch the frame rate the pick is giving. */
+      if (pick_fps > 0.0) {
+         if (!watch_t0) { watch_t0 = now; watch_f0 = frames; }
+         else if (now - watch_t0 >= PICK_WATCH_NS) {
+            const double fps = (frames - watch_f0) * 1e9 / (double)(now - watch_t0);
+            watch_t0 = now; watch_f0 = frames;
+            if (fps >= 10.0 && fps < pick_fps * 0.75 && now - last_pick >= PICK_MIN_GAP_NS &&
+                next_check > now) {
+               fprintf(stderr, "[compositor] frame rate fell to %.1f fps from %.1f, timing both paths again\n",
+                       fps, pick_fps);
+               next_check = now;
+            }
+         }
+      }
       if (now < next_check) return pick;
       phase = 1; t0 = now; f0 = frames;
-      return true;
-   case 1:
-      if (now - t0 < PICK_WINDOW_NS) return true;
-      shared_fps = (frames - f0) * 1e9 / (double)(now - t0);
-      phase = 2; t0 = now; f0 = frames;
-      return false;
-   default: {
-      if (now - t0 < PICK_WINDOW_NS) return false;
-      const double pixel_fps = (frames - f0) * 1e9 / (double)(now - t0);
-      phase = 0;
-      /* A window that caught loading (either side at a few frames a second)
-       * compares a loading screen against gameplay, not two paths.  Keep the
-       * current pick and look again soon. */
-      if (shared_fps < 10.0 || pixel_fps < 10.0) {
-         next_check = now + 15ull * 1000000000ull;
-         return pick;
-      }
-      const bool was = pick;
-      pick = shared_fps >= pixel_fps * 0.95;
-      static bool logged;
-      if (pick != was || !logged) {
-         fprintf(stderr, "[compositor] frame path: %s (shared %.1f fps, pixels %.1f fps)\n",
-                 pick ? "shared textures" : "pixels", shared_fps, pixel_fps);
-         logged = true;
-      }
-      phase = 0;
-      next_check = now + PICK_RECHECK_NS;
+      ns[0] = ns[1] = 0; fr[0] = fr[1] = 0;
+      return order[1];
+   }
+   if (now - t0 < PICK_WINDOW_NS) return order[phase];
+   /* Close this window on the path it timed. */
+   ns[order[phase]] += now - t0;
+   fr[order[phase]] += frames - f0;
+   if (phase < 4) {
+      ++phase; t0 = now; f0 = frames;
+      return order[phase];
+   }
+   phase = 0;
+   watch_t0 = 0;
+   const double shared_fps = fr[1] * 1e9 / (double)ns[1];
+   const double pixel_fps = fr[0] * 1e9 / (double)ns[0];
+   /* A window that caught loading compares a loading screen against
+    * gameplay, not two paths.  Keep the current pick and look again soon. */
+   if (shared_fps < 10.0 || pixel_fps < 10.0) {
+      next_check = now + PICK_LOADING_NS;
       return pick;
    }
+   const bool was = pick;
+   pick = shared_fps >= pixel_fps * 0.95;
+   const bool tie = shared_fps < pixel_fps * 1.05 && pixel_fps < shared_fps * 1.05;
+   pick_fps = pick ? shared_fps : pixel_fps;
+   last_pick = now;
+   static bool logged;
+   if (pick != was || !logged) {
+      fprintf(stderr, "[compositor] frame path: %s (shared %.1f fps, pixels %.1f fps)\n",
+              pick ? "shared textures" : "pixels", shared_fps, pixel_fps);
+      logged = true;
    }
+   next_check = now + (tie ? PICK_TIE_NS : PICK_RECHECK_NS);
+   return pick;
 }
 #endif
 
