@@ -1,0 +1,51 @@
+name: Linux control test (fork)
+
+# Control for windows-test.yml: runs the UPSTREAM Linux x86_64 release headless
+# (Mesa llvmpipe, LUNARIA_PBUFFER=1) on the same UnitySampleGame.apk with the
+# same 15 s compositor shots, so a Windows result can be compared with Linux.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Release tag of yui0/lunaria to run
+        required: false
+        default: "2026.11.4"
+      seconds:
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Mesa EGL
+        run: sudo apt-get update -q && sudo apt-get install -y -q libegl1 libegl-mesa0 libgles2 libgl1-mesa-dri libgbm1
+      - name: Download upstream build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.upstream_tag }}" -R yui0/lunaria -p "*linux-x86_64.tar.gz" -D dl
+          mkdir app && tar -xzf dl/*.tar.gz -C app
+          find app -maxdepth 3 | head -40
+      - name: Run sample game
+        run: |
+          exe=$(find app -type f -name lunaria -perm -u+x | head -1)
+          echo "exe=$exe"; ldd "$exe" | grep "not found" || true
+          mkdir -p out/shots data
+          export LUNARIA_PBUFFER=1 LUNARIA_COMP_SHOT_S=15 LUNARIA_DUMP_DIR="$PWD/out/shots"
+          "$exe" --data-root "$PWD/data" "$PWD/UnitySampleGame.apk" >out/lunaria-stdout.log 2>out/lunaria-stderr.log &
+          pid=$!
+          for i in $(seq 1 $(( ${{ inputs.seconds }} / 5 ))); do kill -0 $pid 2>/dev/null || break; sleep 5; done
+          if kill -0 $pid 2>/dev/null; then echo "lunaria still running after ${{ inputs.seconds }}s" | tee out/result.txt; kill -9 $pid
+          else wait $pid; echo "lunaria exited early, code $?" | tee out/result.txt; fi
+          echo "screenshots: $(ls out/shots | wc -l)" | tee -a out/result.txt
+          grep -E "\[perf\] t=|swap#[0-9]*00 " out/lunaria-stderr.log | tail -8 | tee out/highlights.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lunaria-linux-control
+          path: out
