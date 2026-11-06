@@ -172,67 +172,96 @@ void *luna_os_library_open_local(const char *path)
 /* ANGLE's Vulkan backend crashes on its first eglInitialize.  The ANGLE we
  * ship (MSYS2's angleproject) has the Khronos Vulkan loader compiled INTO
  * libGLESv2.dll.  That loader expects to be vulkan-1.dll: its DllMain is what
- * runs init_global_loader_settings(), which initializes the CRITICAL_SECTION
- * guarding its settings.  Linked into another DLL, that DllMain never runs,
- * so the first vkCreateInstance enters a zeroed critical section, Windows
- * takes the contended path, and dereferences its NULL DebugInfo: access
- * violation writing 0x24 inside ntdll, every PC, any GPU.
+ * creates its locks (loader_lock, the ICD preload lock, the instance list
+ * lock) and runs init_global_loader_settings(), which creates a fourth.
+ * Linked into another DLL that DllMain never runs, and the linker dropped it,
+ * so all four CRITICAL_SECTIONs stay zero.  The first vkCreateInstance enters
+ * one, Windows sees a zeroed section as held, takes the contended path and
+ * dereferences its NULL DebugInfo: access violation writing 0x24 in ntdll,
+ * on every PC and every GPU.  (Measured on test41..43: the crash moved from
+ * the settings lock to loader_lock once the first was fixed.)
  *
- * The fix is to run that one init function ourselves before Vulkan starts.
- * It is not exported, so it is found by its code, which is short and
- * distinctive:
- *     endbr64; sub rsp,28h; lea rcx,[rip+CS]; call [rip+InitializeCriticalSection]
- *     lea rdx,[rip+settings]; xor ecx,ecx; add rsp,28h; jmp update_settings
- * and only called if (a) exactly one such function exists, (b) its call
- * really goes through libGLESv2's InitializeCriticalSection import, and
- * (c) the critical section is still all zeroes, i.e. nobody initialized it.
- * A future ANGLE that fixes this, or changes the code, fails (a) or (c) and
- * is left alone, with a log line saying so. */
-static INIT_ONCE g_angle_vk_once = INIT_ONCE_STATIC_INIT;
+ * The fix is to do what that DllMain would have done, before Vulkan starts.
+ * Nothing here is exported, so both pieces are found by their code:
+ *  - init_global_loader_settings():
+ *      endbr64; sub rsp,28h; lea rcx,[rip+CS]; call [rip+InitializeCriticalSection]
+ *      lea rdx,[rip+settings]; xor ecx,ecx; add rsp,28h; jmp update_settings
+ *  - loader_release(), which survived because DllMain is not its only caller,
+ *    and names the other three locks as it deletes them:
+ *      call teardown; mov rbx,[rip+DeleteCriticalSection]
+ *      lea rcx,[rip+A]; call rbx; lea rcx,[rip+B]; call rbx; lea rcx,[rip+C]; mov rax,rbx
+ * Each import slot is checked against the real kernel32 function, each
+ * pattern must match exactly once, and a section is only touched while it is
+ * still all zeroes.  A future ANGLE that fixes this, or whose code differs,
+ * fails a check and is left alone, with a log line saying which. */
+static bool angle_vk_cs_is_zero(const unsigned char *cs)
+{
+   for (size_t i = 0; i < sizeof(CRITICAL_SECTION); ++i) if (cs[i]) return false;
+   return true;
+}
+static const unsigned char *rip_target(const unsigned char *disp_at)
+{
+   int32_t d; memcpy(&d, disp_at, 4);
+   return disp_at + 4 + d;
+}
 static BOOL CALLBACK angle_vk_prepare_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
    (void)once; (void)param; (void)ctx;
    HMODULE m = GetModuleHandleW(L"libGLESv2.dll");
    if (!m) m = LoadLibraryW(L"libGLESv2.dll");
    if (!m) { fprintf(stderr, "[angle-vk] libGLESv2.dll not loaded; nothing to prepare\n"); return TRUE; }
-   FARPROC ics = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "InitializeCriticalSection");
+   HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+   FARPROC ics = GetProcAddress(k32, "InitializeCriticalSection");
+   FARPROC dcs = GetProcAddress(k32, "DeleteCriticalSection");
    const unsigned char *base = (const unsigned char *)m;
    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
-   const unsigned char *found = NULL; int matches = 0;
+   const unsigned char *settings_init = NULL, *release = NULL;
+   int n_init = 0, n_release = 0;
    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
       if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
       const unsigned char *p = base + sec[i].VirtualAddress;
       const size_t n = sec[i].Misc.VirtualSize;
-      for (size_t k = 0; k + 39 <= n; ++k) {
+      for (size_t k = 0; k + 48 <= n; ++k) {
          const unsigned char *q = p + k;
-         if (q[0] != 0xF3 || q[1] != 0x0F || q[2] != 0x1E || q[3] != 0xFA) continue;
-         if (memcmp(q + 4, "\x48\x83\xEC\x28\x48\x8D\x0D", 7) || q[15] != 0xFF || q[16] != 0x15 ||
-             memcmp(q + 21, "\x48\x8D\x15", 3) || (q[28] != 0x31 && q[28] != 0x33) || q[29] != 0xC9 ||
-             memcmp(q + 30, "\x48\x83\xC4\x28\xE9", 5))
-            continue;
-         int32_t iat_disp; memcpy(&iat_disp, q + 17, 4);
-         const FARPROC *iat = (const FARPROC *)(q + 21 + iat_disp);
-         if (!ics || *iat != ics) continue;
-         ++matches; found = q;
+         if (q[0] == 0xF3 && q[1] == 0x0F && q[2] == 0x1E && q[3] == 0xFA &&
+             !memcmp(q + 4, "\x48\x83\xEC\x28\x48\x8D\x0D", 7) && q[15] == 0xFF && q[16] == 0x15 &&
+             !memcmp(q + 21, "\x48\x8D\x15", 3) && (q[28] == 0x31 || q[28] == 0x33) && q[29] == 0xC9 &&
+             !memcmp(q + 30, "\x48\x83\xC4\x28\xE9", 5) &&
+             ics && *(const FARPROC *)rip_target(q + 17) == ics) {
+            ++n_init; settings_init = q;
+         }
+         if (q[0] == 0xE8 && !memcmp(q + 5, "\x48\x8B\x1D", 3) &&
+             !memcmp(q + 12, "\x48\x8D\x0D", 3) && q[19] == 0xFF && q[20] == 0xD3 &&
+             !memcmp(q + 21, "\x48\x8D\x0D", 3) && q[28] == 0xFF && q[29] == 0xD3 &&
+             !memcmp(q + 30, "\x48\x8D\x0D", 3) && !memcmp(q + 37, "\x48\x89\xD8", 3) &&
+             dcs && *(const FARPROC *)rip_target(q + 8) == dcs) {
+            ++n_release; release = q;
+         }
       }
    }
-   if (matches != 1) {
+   int made = 0;
+   if (n_release == 1) {
+      const unsigned char *locks[3] = { rip_target(release + 15), rip_target(release + 24),
+                                        rip_target(release + 33) };
+      for (int i = 0; i < 3; ++i)
+         if (angle_vk_cs_is_zero(locks[i])) {
+            InitializeCriticalSection((CRITICAL_SECTION *)locks[i]);
+            ++made;
+         }
+   } else
+      fprintf(stderr, "[angle-vk] Vulkan loader locks: %d candidates in libGLESv2.dll; "
+              "leaving them alone\n", n_release);
+   if (n_init == 1) {
+      if (angle_vk_cs_is_zero(rip_target(settings_init + 11))) {
+         ((void (*)(void))settings_init)();
+         ++made;
+      }
+   } else
       fprintf(stderr, "[angle-vk] Vulkan loader settings init: %d candidates in libGLESv2.dll; "
-              "leaving it alone (an ANGLE without the bug, or a changed one)\n", matches);
-      return TRUE;
-   }
-   int32_t cs_disp; memcpy(&cs_disp, found + 11, 4);
-   const unsigned char *cs = found + 15 + cs_disp;
-   for (size_t i = 0; i < sizeof(CRITICAL_SECTION); ++i)
-      if (cs[i]) {
-         fprintf(stderr, "[angle-vk] Vulkan loader settings lock is already initialized; nothing to do\n");
-         return TRUE;
-      }
-   ((void (*)(void))found)();
-   fprintf(stderr, "[angle-vk] initialized the Vulkan loader's settings lock in libGLESv2.dll "
-           "(+0x%llx); MSYS2's static loader never runs its DllMain\n",
-           (unsigned long long)(found - base));
+              "leaving it alone\n", n_init);
+   fprintf(stderr, "[angle-vk] set up %d of the static Vulkan loader's 4 locks in libGLESv2.dll "
+           "(its DllMain never runs; 0 means they were already set up or not found)\n", made);
    return TRUE;
 }
 void luna_os_angle_vulkan_prepare(void)
