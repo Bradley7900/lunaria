@@ -14924,6 +14924,108 @@ static void gldraw_trace_texture(const char *what) {
     }
 }
 
+/* LUNARIA_DBG_DRAW=N: for the first N DrawElements, print what the host GL
+ * actually holds: the program's attribute slots, its uniforms as the host
+ * reads them back, blend/depth/raster state, and the first vertices the
+ * indices pick.  LUNARIA_DBG_NOBLEND / _NODEPTH / _NOCULL force that state
+ * off for every draw, to see which one hides the draws. */
+static void dbg_draw_probe(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    static long lim = -1;
+    static int noblend = 0, nodepth = 0, nocull = 0;
+    if (lim < 0) {
+        const char *e = lunaria_env("LUNARIA_DBG_DRAW");
+        lim = e ? strtol(e, nullptr, 10) : 0;
+        noblend = lunaria_env("LUNARIA_DBG_NOBLEND") != nullptr;
+        nodepth = lunaria_env("LUNARIA_DBG_NODEPTH") != nullptr;
+        nocull  = lunaria_env("LUNARIA_DBG_NOCULL") != nullptr;
+    }
+    if (pfn_glDisable) {
+        if (noblend) pfn_glDisable(0x0BE2);
+        if (nodepth) pfn_glDisable(0x0B71);
+        if (nocull)  pfn_glDisable(0x0B44);
+    }
+    static long n = 0;
+    if (n >= lim || !pfn_glGetIntegerv) return;
+    ++n;
+    typedef void (*PFActive)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, char *);
+    typedef GLint (*PFLoc)(GLuint, const char *);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFGetUf)(GLuint, GLint, GLfloat *);
+    typedef void (*PFGetProgiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFGetFloatv)(GLenum, GLfloat *);
+    static PFActive act = (PFActive)host_gl_proc({"glGetActiveAttrib"});
+    static PFActive actu = (PFActive)host_gl_proc({"glGetActiveUniform"});
+    static PFLoc aloc = (PFLoc)host_gl_proc({"glGetAttribLocation"});
+    static PFLoc uloc = (PFLoc)host_gl_proc({"glGetUniformLocation"});
+    static PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    static PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    static PFGetUf guf = (PFGetUf)host_gl_proc({"glGetUniformfv"});
+    static PFGetProgiv gpi = (PFGetProgiv)host_gl_proc({"glGetProgramiv"});
+    static PFGetFloatv gfv = (PFGetFloatv)host_gl_proc({"glGetFloatv"});
+    GLint prog = 0;
+    pfn_glGetIntegerv(0x8B8D, &prog);
+    GLint linked = -1, nattr = -1, nuni = -1;
+    if (gpi && prog) {
+        gpi((GLuint)prog, 0x8B82, &linked);
+        gpi((GLuint)prog, 0x8B89, &nattr);
+        gpi((GLuint)prog, 0x8B86, &nuni);
+    }
+    fprintf(stderr, "[dbgdraw] #%ld mode=0x%x count=%d type=0x%x prog=%d linked=%d attrs=%d uniforms=%d\n",
+            n, mode, (int)count, type, prog, linked, nattr, nuni);
+    for (GLint i = 0; act && aloc && i < nattr && i < 16; ++i) {
+        char nm[64] = {0}; GLsizei len = 0; GLint sz = 0; GLenum ty = 0;
+        act((GLuint)prog, (GLuint)i, sizeof nm, &len, &sz, &ty, nm);
+        fprintf(stderr, "[dbgdraw]   attr %s loc=%d type=0x%x\n", nm, aloc((GLuint)prog, nm), ty);
+    }
+    for (GLint i = 0; actu && uloc && i < nuni && i < 16; ++i) {
+        char nm[64] = {0}; GLsizei len = 0; GLint sz = 0; GLenum ty = 0;
+        actu((GLuint)prog, (GLuint)i, sizeof nm, &len, &sz, &ty, nm);
+        GLint l = uloc((GLuint)prog, nm);
+        GLfloat v[16] = {0};
+        if (guf && l >= 0 && (ty == 0x8B5C || ty == 0x8B52 || ty == 0x1406))
+            guf((GLuint)prog, l, v);
+        if (ty == 0x8B5C)
+            fprintf(stderr, "[dbgdraw]   uniform %s loc=%d mat4 [%g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g]\n",
+                    nm, l, v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12],v[13],v[14],v[15]);
+        else
+            fprintf(stderr, "[dbgdraw]   uniform %s loc=%d type=0x%x v=[%g %g %g %g]\n",
+                    nm, l, ty, v[0], v[1], v[2], v[3]);
+    }
+    for (GLuint a = 0; gav && gptr && a < 4; ++a) {
+        GLint en = 0, sz = 0, st = 0, ty = 0, buf = 0;
+        gav(a, 0x8622, &en); gav(a, 0x8623, &sz); gav(a, 0x8624, &st);
+        gav(a, 0x8625, &ty); gav(a, 0x889F, &buf);
+        void *ptr = nullptr; gptr(a, 0x8645, &ptr);
+        fprintf(stderr, "[dbgdraw]   va%u en=%d sz=%d stride=%d type=0x%x buf=%d ptr=%p\n",
+                a, en, sz, st, ty, buf, ptr);
+        if (a == 0 && en && !buf && ptr && ty == 0x1406 && idx && type == 0x1403) {
+            const uint16_t *ix = (const uint16_t *)idx;
+            for (int k = 0; k < 4 && k < count; ++k) {
+                const float *v = (const float *)((const char *)ptr + (size_t)ix[k] * (size_t)(st ? st : sz * 4));
+                fprintf(stderr, "[dbgdraw]     idx[%d]=%u pos=(%g, %g, %g)\n", k, ix[k], v[0], v[1], sz > 2 ? v[2] : 0.f);
+            }
+        }
+    }
+    GLint b[8] = {0}, cm[4] = {0}, vp[4] = {0}, sc[4] = {0};
+    GLint blend = 0, depth = 0, cull = 0, scis = 0, sten = 0, dmask = 0, dfunc = 0, ff = 0, cface = 0;
+    pfn_glGetIntegerv(0x0BE2, &blend); pfn_glGetIntegerv(0x0B71, &depth);
+    pfn_glGetIntegerv(0x0B44, &cull);  pfn_glGetIntegerv(0x0C11, &scis);
+    pfn_glGetIntegerv(0x0B90, &sten);  pfn_glGetIntegerv(0x0B72, &dmask);
+    pfn_glGetIntegerv(0x0B74, &dfunc); pfn_glGetIntegerv(0x0B46, &ff);
+    pfn_glGetIntegerv(0x0B45, &cface);
+    pfn_glGetIntegerv(0x80C9, &b[0]); pfn_glGetIntegerv(0x80C8, &b[1]);
+    pfn_glGetIntegerv(0x80CB, &b[2]); pfn_glGetIntegerv(0x80CA, &b[3]);
+    pfn_glGetIntegerv(0x8009, &b[4]); pfn_glGetIntegerv(0x883D, &b[5]);
+    pfn_glGetIntegerv(0x0C23, cm); pfn_glGetIntegerv(0x0BA2, vp); pfn_glGetIntegerv(0x0C10, sc);
+    GLfloat dr[2] = {0, 0};
+    if (gfv) gfv(0x0B70, dr);
+    fprintf(stderr, "[dbgdraw]   blend=%d src=0x%x dst=0x%x srcA=0x%x dstA=0x%x eq=0x%x/0x%x cmask=%d%d%d%d\n",
+            blend, b[0], b[1], b[2], b[3], b[4], b[5], cm[0], cm[1], cm[2], cm[3]);
+    fprintf(stderr, "[dbgdraw]   depth=%d func=0x%x mask=%d range=%g..%g cull=%d face=0x%x front=0x%x stencil=%d scissor=%d [%d %d %d %d] vp=[%d %d %d %d]\n",
+            depth, dfunc, dmask, dr[0], dr[1], cull, cface, ff, sten, scis, sc[0], sc[1], sc[2], sc[3], vp[0], vp[1], vp[2], vp[3]);
+}
+
 static void gldraw_dump_state() {
     if (!pfn_glGetIntegerv) return;
     GLint prog = 0, vbo = 0, ibo = 0, fbo = 0, tex = 0, vp[4] = {0,0,0,0};
@@ -37855,6 +37957,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 const void *idx = gl_index_source(r3);
                 if (pfn_glDrawElements && gl_index_valid)
                     {
+                        dbg_draw_probe((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx);
                         ArmLockDropped gl_unlocked;  /* see SVC_GL_Flush */
                         pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
                                            idx);
