@@ -18,6 +18,10 @@ on:
         description: Extra environment, K=V separated by ';'
         required: false
         default: ""
+      vulkan_sw:
+        description: "1 = install Mesa's software Vulkan driver (lavapipe) so the Vulkan backend runs without a GPU"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -36,6 +40,19 @@ jobs:
           gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p "*windows*.zip" -D dl
           Expand-Archive (Get-ChildItem dl\*.zip | Select-Object -First 1).FullName -DestinationPath app
           Get-ChildItem app
+
+      - name: Software Vulkan (lavapipe)
+        if: inputs.vulkan_sw == '1'
+        shell: pwsh
+        run: |
+          C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-mesa mingw-w64-x86_64-vulkan-loader | Out-Null
+          $icd = Get-ChildItem C:\msys64\mingw64 -Recurse -Filter "lvp_icd*.json" | Select-Object -First 1
+          if (-not $icd) { throw "no lavapipe ICD json in the mesa package" }
+          Get-Content $icd.FullName
+          "VK_DRIVER_FILES=$($icd.FullName)" | Add-Content $env:GITHUB_ENV
+          "VK_ICD_FILENAMES=$($icd.FullName)" | Add-Content $env:GITHUB_ENV
+          # lavapipe needs its mingw64 DLLs on PATH; lunaria.exe still loads its own first (app folder wins).
+          "C:\msys64\mingw64\bin" | Add-Content $env:GITHUB_PATH
 
       - name: Run sample game
         shell: pwsh
