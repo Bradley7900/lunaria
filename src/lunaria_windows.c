@@ -2004,6 +2004,20 @@ char *luna_file_realpath(const char *path, char *result, size_t capacity)
 }
 int luna_file_sync(int fd, int data_only)
 { (void)data_only; return _commit(fd); }
+/* Calls, bytes and time per I/O path, for the sampler's report: kernel time
+ * in ZwWriteFile/ZwReadFile says nothing about which of these issued it.
+ * One QueryPerformanceCounter pair per call. */
+enum { IO_PREAD, IO_PWRITE, IO_PIPE_R, IO_PIPE_W, IO_FD_R, IO_FD_W, IO_KINDS };
+static volatile LONG64 io_calls[IO_KINDS], io_ticks[IO_KINDS], io_bytes[IO_KINDS];
+static LONG64 io_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static ptrdiff_t io_note(int kind, LONG64 t0, ptrdiff_t result)
+{
+   InterlockedIncrement64(&io_calls[kind]);
+   InterlockedAdd64(&io_ticks[kind], io_now() - t0);
+   if (result > 0) InterlockedAdd64(&io_bytes[kind], result);
+   return result;
+}
+
 static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t offset, int writing)
 {
    if (offset < 0) { errno = EINVAL; return -1; }
@@ -2045,9 +2059,9 @@ static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t
    return luna_file_error(error);
 }
 ptrdiff_t luna_file_pread(int fd, void *buffer, size_t length, int64_t offset)
-{ return file_positional_io(fd, buffer, length, offset, 0); }
+{ const LONG64 t0 = io_now(); return io_note(IO_PREAD, t0, file_positional_io(fd, buffer, length, offset, 0)); }
 ptrdiff_t luna_file_pwrite(int fd, const void *buffer, size_t length, int64_t offset)
-{ return file_positional_io(fd, (void *)buffer, length, offset, 1); }
+{ const LONG64 t0 = io_now(); return io_note(IO_PWRITE, t0, file_positional_io(fd, (void *)buffer, length, offset, 1)); }
 
 int luna_file_lock(int fd, int64_t start, int64_t length,
                                  int shared, int nonblocking, int unlock)
@@ -3135,8 +3149,9 @@ ptrdiff_t luna_fd_read(int fd, void *buffer, size_t length)
    if (socket == INVALID_SOCKET) {
       intptr_t handle = file_descriptor_handle(fd);
       if (handle == -1) { errno = EBADF; return -1; }
-      if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return pipe_io((HANDLE)handle, buffer, n, 0);
-      return _read(fd, buffer, n);
+      const LONG64 t0 = io_now();
+      if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return io_note(IO_PIPE_R, t0, pipe_io((HANDLE)handle, buffer, n, 0));
+      return io_note(IO_FD_R, t0, _read(fd, buffer, n));
    }
    int result = recv(socket, buffer, (int)n, 0);
    return result == SOCKET_ERROR ? failed() : result;
@@ -3148,8 +3163,9 @@ ptrdiff_t luna_fd_write(int fd, const void *buffer, size_t length)
    if (socket == INVALID_SOCKET) {
       intptr_t handle = file_descriptor_handle(fd);
       if (handle == -1) { errno = EBADF; return -1; }
-      if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return pipe_io((HANDLE)handle, (void *)buffer, n, 1);
-      return _write(fd, buffer, n);
+      const LONG64 t0 = io_now();
+      if (GetFileType((HANDLE)handle) == FILE_TYPE_PIPE) return io_note(IO_PIPE_W, t0, pipe_io((HANDLE)handle, (void *)buffer, n, 1));
+      return io_note(IO_FD_W, t0, _write(fd, buffer, n));
    }
    int result = send(socket, buffer, (int)n, 0);
    return result == SOCKET_ERROR ? failed() : result;
@@ -3945,6 +3961,19 @@ static void samp_report(int seconds, uintptr_t exe_lo)
       fprintf(stderr, "[sample] t=%ds jit: %llu blocks compiled, %.0f ms total; last window +%llu blocks, +%.0f ms\n",
               seconds, n, ns / 1e6, n - last_n, (ns - last_ns) / 1e6);
       last_n = n; last_ns = ns;
+   }
+   {
+      static const char *const names[IO_KINDS] = { "pread", "pwrite", "pipe read", "pipe write", "file read", "file write" };
+      static LONG64 last_calls[IO_KINDS], last_ticks[IO_KINDS], last_bytes[IO_KINDS];
+      LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+      for (int k = 0; k < IO_KINDS; ++k) {
+         const LONG64 c = io_calls[k], t = io_ticks[k], b = io_bytes[k];
+         if (c != last_calls[k])
+            fprintf(stderr, "[sample] t=%ds io %-10s +%lld calls, +%.1f MB, +%.1f ms (total %lld calls, %.0f ms)\n",
+                    seconds, names[k], (long long)(c - last_calls[k]), (b - last_bytes[k]) / 1048576.0,
+                    (t - last_ticks[k]) * 1000.0 / f.QuadPart, (long long)c, t * 1000.0 / f.QuadPart);
+         last_calls[k] = c; last_ticks[k] = t; last_bytes[k] = b;
+      }
    }
    if (!samp_total) return;
    fprintf(stderr, "[sample] t=%ds %.1f Gcycles of CPU sampled. by module:\n", seconds, samp_total / 1e6);
