@@ -1,0 +1,2 @@
+ARM astc-encoder 5.7.1 (https://github.com/ARM-software/astc-encoder), Apache-2.0, unmodified.
+Only the library sources; built with ASTCENC_DECOMPRESS_ONLY (see Makefile). Used by src/luna_texcache.cpp.

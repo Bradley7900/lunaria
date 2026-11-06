@@ -16,6 +16,7 @@
 
 #include "lunaria_os.h"
 #include "lunaria_file.h"
+#include "luna_texcache.h"
 #include "lib/inc/log_assert.h"
 #include "luna_boot.h"
 #include <algorithm>
@@ -15536,6 +15537,8 @@ static bool etc_lossy_check(GLenum to, const char *what, GLenum from) {
  * known 4x4 ETC2 block (decodes to 255,2,2) through the lossy path and
  * through the plain one, draw each into a 4x4 target and read it back.
  * Proves the remap and the transcode without needing a game that ships ETC. */
+static bool astc_upload(bool sub, GLenum target, GLint level, GLint x, GLint y,
+                        GLsizei w, GLsizei h, GLenum fmt, GLsizei size, const void *data);
 static void dbg_etc_selftest() {
     static int done = 0;
     if (done || !lunaria_env("LUNARIA_DBG_ETC")) return;
@@ -15615,22 +15618,32 @@ static void dbg_etc_selftest() {
     /* ETC2 RGB8 differential block: base 31,0,0 (5-bit), table 0, all indices 0 (+2). */
     static const unsigned char block[8] = { 0xF8, 0x00, 0x00, 0x02, 0, 0, 0, 0 };
     static const GLfloat tri[] = { -1.f, -1.f, 3.f, -1.f, -1.f, 3.f };
-    GLuint fb = 0, target = 0, src[2] = {0, 0};
-    gfb(1, &fb); gt(1, &target); gt(2, src);
+    /* ASTC 4x4 void-extent block: constant colour, RGBA as UNORM16 = 1,0,0,1. */
+    static const unsigned char astc_block[16] = { 0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                                  0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF };
+    GLuint fb = 0, target = 0, src[3] = {0, 0, 0};
+    gfb(1, &fb); gt(1, &target); gt(3, src);
     bt(0x0DE1, target);
     ti(0x0DE1, 0, 0x1908, 4, 4, 0, 0x1908, 0x1401, nullptr);
     bfb(0x8D40, fb);
     fbt(0x8D40, 0x8CE0, 0x0DE1, target, 0);
     while (pfn_glGetError()) {}
-    for (int pass = 0; pass < 2; ++pass) {
-        GLenum fmt = 0x9274;
+    for (int pass = 0; pass < 3; ++pass) {
+        GLenum fmt = pass == 2 ? 0x93B0 : 0x9274;
         if (pass == 0) {
             const GLenum lossy = etc_lossy_format(0x9274);
             if (!lossy) { fprintf(stderr, "[etctest] lossy path not available here\n"); continue; }
             fmt = lossy;
         }
         bt(0x0DE1, src[pass]);
-        pfn_glCompressedTexImage2D(0x0DE1, 0, fmt, 4, 4, 0, 8, block);
+        if (pass == 2) {
+            if (!astc_upload(false, 0x0DE1, 0, 0, 0, 4, 4, fmt, 16, astc_block)) {
+                fprintf(stderr, "[etctest] ASTC path not active here (host has ASTC or LUNARIA_ASTC=0)\n");
+                continue;
+            }
+        } else {
+            pfn_glCompressedTexImage2D(0x0DE1, 0, fmt, 4, 4, 0, 8, block);
+        }
         const GLenum e1 = pfn_glGetError();
         tp(0x0DE1, 0x2801, 0x2600); tp(0x0DE1, 0x2800, 0x2600);
         use(pr);
@@ -15644,7 +15657,7 @@ static void dbg_etc_selftest() {
         pfn_glReadPixels(1, 1, 1, 1, 0x1908, 0x1401, px);
         const GLenum e2 = pfn_glGetError();
         fprintf(stderr, "[etctest] %s (0x%x): upload err=0x%x, drawn %u,%u,%u err=0x%x  (expect ~255,2,2)\n",
-                pass == 0 ? "lossy" : "plain", fmt, e1, px[0], px[1], px[2], e2);
+                pass == 0 ? "lossy" : pass == 1 ? "plain" : "astc", fmt, e1, px[0], px[1], px[2], e2);
     }
     bfb(0x8D40, (GLuint)fb0);
     bt(0x0DE1, (GLuint)tex0);
@@ -15658,6 +15671,151 @@ static void dbg_etc_selftest() {
     if (depth0) pfn_glEnable(0x0B71);
     if (sciss0) pfn_glEnable(0x0C11);
     if (pfn_glViewport) pfn_glViewport(vp[0], vp[1], vp[2], vp[3]);
+}
+
+/* ASTC on a host without it (D3D11 under ANGLE, most desktop GPUs): the
+ * guest is told ASTC works, and each ASTC upload is decoded and repacked here
+ * (luna_texcache.cpp: BC3 where the host has it and the level is a multiple
+ * of 4, else RGBA8), with the result cached on disk by content.
+ * LUNARIA_ASTC=0 turns it off, LUNARIA_ASTC=rgba skips the BC3 repack. */
+static int g_astc_emul = -1;
+static bool g_astc_bc3, g_astc_bc3_srgb;
+static std::unordered_map<GLuint, uint8_t> g_astc_tex_mode;   /* texture -> LUNA_TEX_* */
+static unsigned long long g_astc_n, g_astc_in, g_astc_out;
+
+static bool astc_emulated(void) {
+    if (g_astc_emul >= 0) return g_astc_emul != 0;
+    const char *ext = pfn_glGetString ? (const char *)pfn_glGetString(0x1F03) : nullptr;
+    if (!ext) return false;                      /* no current context yet: ask later */
+    const char *env = lunaria_env("LUNARIA_ASTC");
+    g_astc_emul = !(env && env[0] == '0') && !strstr(ext, "GL_KHR_texture_compression_astc_ldr");
+    g_astc_bc3 = strstr(ext, "GL_ANGLE_texture_compression_dxt5") ||
+                 strstr(ext, "GL_EXT_texture_compression_s3tc");
+    g_astc_bc3_srgb = strstr(ext, "GL_EXT_texture_compression_s3tc_srgb") != nullptr;
+    if (env && !strcmp(env, "rgba")) g_astc_bc3 = g_astc_bc3_srgb = false;
+    if (g_astc_emul)
+        fprintf(stderr, "[gl] ASTC: host has none; decoding to %s (sRGB: %s), cached on disk\n",
+                g_astc_bc3 ? "BC3" : "RGBA8", g_astc_bc3_srgb ? "BC3" : "RGBA8");
+    return g_astc_emul != 0;
+}
+
+static const GLenum kAstcFormats[28] = {
+    0x93B0, 0x93B1, 0x93B2, 0x93B3, 0x93B4, 0x93B5, 0x93B6, 0x93B7, 0x93B8, 0x93B9,
+    0x93BA, 0x93BB, 0x93BC, 0x93BD,
+    0x93D0, 0x93D1, 0x93D2, 0x93D3, 0x93D4, 0x93D5, 0x93D6, 0x93D7, 0x93D8, 0x93D9,
+    0x93DA, 0x93DB, 0x93DC, 0x93DD,
+};
+
+static GLuint astc_bound_texture(GLenum target) {
+    GLint t = 0;
+    const GLenum binding = (target >= 0x8515 && target <= 0x851A) ? 0x8514 /* CUBE_MAP */
+                                                                  : 0x8069 /* TEXTURE_2D */;
+    if (pfn_glGetIntegerv) pfn_glGetIntegerv(binding, &t);
+    return (GLuint)t;
+}
+
+/* The storage an ASTC texture of this size gets on this host. */
+static GLenum astc_storage_format(GLenum fmt, GLsizei w, GLsizei h, int *mode) {
+    int srgb = 0;
+    luna_astc_format(fmt, nullptr, nullptr, &srgb);
+    const bool bc3 = (srgb ? g_astc_bc3_srgb : g_astc_bc3) && w % 4 == 0 && h % 4 == 0;
+    *mode = bc3 ? LUNA_TEX_BC3 : LUNA_TEX_RGBA8;
+    if (bc3) return srgb ? 0x8C4F /* SRGB_ALPHA_S3TC_DXT5 */ : 0x83F3 /* RGBA_S3TC_DXT5 */;
+    return srgb ? 0x8C43 /* SRGB8_ALPHA8 */ : 0x8058 /* RGBA8 */;
+}
+
+/* One ASTC (sub-)image upload.  True when it was an ASTC format this path
+ * owns (handled, or dropped with a log line); false: not ours. */
+static bool astc_upload(bool sub, GLenum target, GLint level, GLint x, GLint y,
+                        GLsizei w, GLsizei h, GLenum fmt, GLsizei size, const void *data) {
+    int srgb = 0;
+    if (!luna_astc_format(fmt, nullptr, nullptr, &srgb) || !astc_emulated()) return false;
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void *(*PFMap)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+    typedef GLboolean (*PFUnmap)(GLenum);
+    typedef void (*PFStore)(GLenum, GLint);
+    typedef void (*PFTexImage)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    typedef void (*PFTexSub)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
+    static PFBind bind = (PFBind)host_gl_proc({"glBindBuffer"});
+    static PFMap map = (PFMap)host_gl_proc({"glMapBufferRange"});
+    static PFUnmap unmap = (PFUnmap)host_gl_proc({"glUnmapBuffer"});
+    static PFStore store = (PFStore)host_gl_proc({"glPixelStorei"});
+    static PFTexImage teximage = (PFTexImage)host_gl_proc({"glTexImage2D"});
+    static PFTexSub texsub = (PFTexSub)host_gl_proc({"glTexSubImage2D"});
+    if (size <= 0) return true;
+
+    /* With a pixel-unpack buffer bound, `data` is an offset into it. */
+    GLuint pbo = 0;
+    auto it = g_gl_bound_bufs.find(0x88ECu);
+    if (it != g_gl_bound_bufs.end()) pbo = it->second;
+    std::vector<uint8_t> copy;
+    const void *src = data;
+    if (pbo) {
+        if (!bind || !map || !unmap) return true;
+        void *m = map(0x88EC, (GLintptr)(uintptr_t)data, size, 0x0001 /* MAP_READ_BIT */);
+        if (!m) {
+            fprintf(stderr, "[gl] ASTC: could not read pixel-unpack buffer %u\n", pbo);
+            return true;
+        }
+        copy.assign((const uint8_t *)m, (const uint8_t *)m + size);
+        unmap(0x88EC);
+        src = copy.data();
+    }
+    if (!src) return true;
+
+    const GLuint tex = astc_bound_texture(target);
+    int mode = LUNA_TEX_RGBA8;
+    auto known = g_astc_tex_mode.find(tex);
+    if (known != g_astc_tex_mode.end() && (sub || level > 0)) {
+        mode = known->second;
+    } else if (sub) {
+        mode = LUNA_TEX_RGBA8;                  /* storage this path never saw */
+    } else {
+        astc_storage_format(fmt, w, h, &mode);
+        if (level == 0) g_astc_tex_mode[tex] = (uint8_t)mode;
+    }
+    if (mode == LUNA_TEX_BC3 && sub && (x % 4 || y % 4)) {
+        static int n = 0;
+        if (n++ < 4)
+            fprintf(stderr, "[gl] ASTC: sub-image at %d,%d is not 4-aligned for BC3; dropped\n", x, y);
+        return true;
+    }
+
+    int got = 0; void *out = nullptr; size_t out_size = 0;
+    if (luna_astc_transcode(fmt, w, h, src, (size_t)size, mode == LUNA_TEX_BC3, &got, &out, &out_size)) {
+        static int n = 0;
+        if (n++ < 8)
+            fprintf(stderr, "[gl] ASTC: 0x%x %dx%d (%d bytes) could not be decoded; dropped\n",
+                    fmt, w, h, size);
+        return true;
+    }
+    if (pbo) bind(0x88EC, 0);
+    if (got == LUNA_TEX_BC3) {
+        const GLenum f = srgb ? 0x8C4F : 0x83F3;
+        if (sub) pfn_glCompressedTexSubImage2D(target, level, x, y, w, h, f, (GLsizei)out_size, out);
+        else pfn_glCompressedTexImage2D(target, level, f, w, h, 0, (GLsizei)out_size, out);
+    } else if (teximage && texsub && store && pfn_glGetIntegerv) {
+        GLint row = 0, skr = 0, skp = 0, al = 4;
+        pfn_glGetIntegerv(0x0CF2, &row); pfn_glGetIntegerv(0x0CF3, &skr);
+        pfn_glGetIntegerv(0x0CF4, &skp); pfn_glGetIntegerv(0x0CF5, &al);
+        store(0x0CF2, 0); store(0x0CF3, 0); store(0x0CF4, 0); store(0x0CF5, 4);
+        if (sub) texsub(target, level, x, y, w, h, 0x1908, 0x1401, out);
+        else teximage(target, level, srgb ? 0x8C43 : 0x8058, w, h, 0, 0x1908, 0x1401, out);
+        store(0x0CF2, row); store(0x0CF3, skr); store(0x0CF4, skp); store(0x0CF5, al);
+    }
+    if (pbo) bind(0x88EC, pbo);
+    free(out);
+    g_astc_in += (unsigned long long)size;
+    g_astc_out += out_size;
+    if (g_astc_n++ < 3 || (g_astc_n & 255) == 0) {
+        unsigned long long hits = 0, misses = 0;
+        luna_texcache_stats(&hits, &misses);
+        fprintf(stderr, "[gl] ASTC: %llu uploads (%llu from disk cache, %llu converted), "
+                "%llu KB ASTC -> %llu KB %s (last 0x%x %dx%d)\n", g_astc_n, hits, misses,
+                g_astc_in >> 10, g_astc_out >> 10, got == LUNA_TEX_BC3 ? "BC3" : "RGBA8",
+                fmt, w, h);
+    }
+    return true;
 }
 
 /* LUNARIA_TRACE_TEX: what actually reaches a texture, and where it came from.
@@ -17803,6 +17961,9 @@ static const std::vector<std::string> &guest_gl_extension_list(void)
                 i = j + 1;
             }
             built = true;   /* only cache once a context answered */
+            if (astc_emulated() &&
+                std::find(list.begin(), list.end(), "GL_KHR_texture_compression_astc_ldr") == list.end())
+                list.push_back("GL_KHR_texture_compression_astc_ldr");
         }
     }
     return list;
@@ -37246,6 +37407,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ctx.mem.write32(r1, (uint32_t)guest_gl_extension_list().size());
             break;
         }
+        /* The ASTC this bridge decodes counts as a supported format. */
+        if ((r0 == 0x86A2 || r0 == 0x86A3) && r1 && pfn_glGetIntegerv && astc_emulated()) {
+            GLint n = 0;
+            pfn_glGetIntegerv(0x86A2, &n);
+            if (r0 == 0x86A2) {
+                ctx.mem.write32(r1, (uint32_t)(n + 28));
+            } else {
+                std::vector<GLint> host((size_t)(n > 0 ? n : 0) + 1);
+                if (n > 0) pfn_glGetIntegerv(0x86A3, host.data());
+                for (GLint i = 0; i < n; ++i) ctx.mem.write32(r1 + 4u * (uint32_t)i, (uint32_t)host[(size_t)i]);
+                for (int i = 0; i < 28; ++i)
+                    ctx.mem.write32(r1 + 4u * (uint32_t)(n + i), kAstcFormats[i]);
+            }
+            break;
+        }
         if (pfn_glGetIntegerv && r1) {
             GLint *out = (GLint *)ctx.mem.ptr(r1);
             pfn_glGetIntegerv((GLenum)r0, out);
@@ -37761,6 +37937,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             gl_trace_upload("CompressedImage", r0, r1, (int)r3, (int)h, 0, 0, r2,
                             0, data, (size_t)(sz > 0 ? sz : 0));
             ArmLockDropped unlocked; /* see the sub-image case */
+            if (astc_upload(false, (GLenum)r0, (GLint)r1, 0, 0, (GLsizei)r3, h, (GLenum)r2, sz, data))
+                break;
             const GLenum lossy = etc_lossy_format((GLenum)r2);
             if (lossy) {
                 etc_lossy_pre(lossy);
@@ -37808,6 +37986,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * sleeper, so guest sleeps overshot by as much as 38 ms against a 37.9 ms
              * worst-case lock wait. Those are the same milliseconds. */
             ArmLockDropped unlocked;
+            if (astc_upload(true, (GLenum)r0, (GLint)r1, (GLint)r2, (GLint)r3, w, h, fmt, sz, data))
+                break;
             /* Only into a level this path created: the format must match. */
             const GLenum lossy = etc_lossy_format(fmt);
             if (lossy && g_etc_lossy_tex.count(etc_bound_texture((GLenum)r0))) {
@@ -45021,7 +45201,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     "%" PRIu64 "x%u\n", bound_tex, r0, r1, r2, r3, h);
         if (pfn_glTexStorage2D) {
             ArmLockDropped gl_unlocked;
-            pfn_glTexStorage2D((GLenum)r0,(GLsizei)r1,(GLenum)r2,(GLsizei)r3,
+            GLenum ifmt = (GLenum)r2;
+            if (luna_astc_format(ifmt, nullptr, nullptr, nullptr) && astc_emulated()) {
+                int mode = LUNA_TEX_RGBA8;
+                ifmt = astc_storage_format(ifmt, (GLsizei)r3, (GLsizei)h, &mode);
+                g_astc_tex_mode[astc_bound_texture((GLenum)r0)] = (uint8_t)mode;
+            }
+            pfn_glTexStorage2D((GLenum)r0,(GLsizei)r1,ifmt,(GLsizei)r3,
                                (GLsizei)h);
         }
         break;

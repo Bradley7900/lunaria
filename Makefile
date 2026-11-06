@@ -570,6 +570,20 @@ libpthread.so: runtime/libpthread.so
 $(BUILD_DIR)/luna_fnmatch.o: src/lib/musl/fnmatch.c src/lunaria_os.h src/luna_unicode.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c $< -o $@
 
+# ASTC for hosts without it (luna_texcache.cpp): ARM's astc-encoder, vendored
+# unmodified under src/third_party/astcenc (Apache-2.0), built decode-only,
+# plus stb_dxt (public domain) for the BC3 repack.
+ASTCENC_SRC := $(wildcard src/third_party/astcenc/*.cpp)
+ASTCENC_OBJ := $(patsubst src/third_party/astcenc/%.cpp,$(BUILD_DIR)/astcenc/%.o,$(ASTCENC_SRC))
+$(BUILD_DIR)/astcenc/%.o: src/third_party/astcenc/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(BUILD_DIR)/astcenc
+	$(CXX) -std=c++17 $(OPTFLAGS) -fPIC -DASTCENC_DECOMPRESS_ONLY -w -c $< -o $@
+$(BUILD_DIR)/luna_texcache.o: | $(BUILD_DIR)
+$(BUILD_DIR)/luna_texcache.o: src/luna_texcache.cpp src/luna_texcache.h src/lib/stb_dxt.h
+	$(CXX) -std=c++17 $(OPTFLAGS) -fPIC -Isrc -DASTCENC_DECOMPRESS_ONLY \
+	    -Wno-unused-function -c src/luna_texcache.cpp -o $@
+TEXCACHE_OBJS := $(BUILD_DIR)/luna_texcache.o $(ASTCENC_OBJ)
+
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
 $(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/lunaria_os.h src/luna_boot.h      src/luna_input.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
@@ -752,7 +766,7 @@ symlink-file-test: test/symlink_file_test.c src/lunaria_file.c src/lunaria_file.
 
 $(BUILD_DIR)/arm_exec.o: src/lunaria_file.h src/lib/inc/log_assert.h
 
-LUNARIA_OBJECTS = $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ)
+LUNARIA_OBJECTS = $(TEXCACHE_OBJS) $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ)
 ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
 WINDOWS_STUBS = ANDROID LOG OPENSLES MEDIANDK
 WINDOWS_STUB_OBJECTS = $(addprefix $(BUILD_DIR)/stub_,$(addsuffix .o,$(WINDOWS_STUBS)))
@@ -790,7 +804,7 @@ $(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs)
 	$(CXX) -std=c++20 $(WINDOWS_CRT_FLAGS) $(WINDOWS_ENTRY_FLAGS) $(OPTFLAGS) $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
+	    $(TEXCACHE_OBJS) $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
 	    $(DYNARMIC_LIBS) \
 	    $(WINDOWS_STUB_OBJECTS) \
 	    $(HOST_DL_LIBS) -lpthread $(HOST_JVM_LIB) \
@@ -3386,6 +3400,7 @@ $(BUILD_DIR)/aaudio-contract32.so: test/aaudio_contract_test.c | $(BUILD_DIR)
 $(BUILD_DIR)/test_aaudio_stream: test/aaudio_stream_core_test.cpp src/aaudio_stream.h | $(BUILD_DIR)
 	$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -Isrc $< -o $@
 $(BUILD_DIR)/arm_exec.o: src/aaudio_stream.h
+$(BUILD_DIR)/arm_exec.o: src/luna_texcache.h
 .PHONY: aaudio-contract-test aaudio-core-test
 aaudio-core-test: $(BUILD_DIR)/test_aaudio_stream
 	$(BUILD_DIR)/test_aaudio_stream
