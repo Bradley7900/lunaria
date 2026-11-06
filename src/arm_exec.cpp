@@ -15532,6 +15532,134 @@ static bool etc_lossy_check(GLenum to, const char *what, GLenum from) {
     return false;
 }
 
+/* LUNARIA_DBG_ETC=1: once, at the guest's first DrawElements, upload one
+ * known 4x4 ETC2 block (decodes to 255,2,2) through the lossy path and
+ * through the plain one, draw each into a 4x4 target and read it back.
+ * Proves the remap and the transcode without needing a game that ships ETC. */
+static void dbg_etc_selftest() {
+    static int done = 0;
+    if (done || !lunaria_env("LUNARIA_DBG_ETC")) return;
+    done = 1;
+    typedef GLuint (*PFCreateShader)(GLenum);
+    typedef void (*PFShaderSource)(GLuint, GLsizei, const char *const *, const GLint *);
+    typedef void (*PFU1)(GLuint);
+    typedef GLuint (*PFCreateProgram)(void);
+    typedef void (*PFAttach)(GLuint, GLuint);
+    typedef void (*PFBindAttrib)(GLuint, GLuint, const char *);
+    typedef void (*PFGetiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFGen)(GLsizei, GLuint *);
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void (*PFFBTex)(GLenum, GLenum, GLenum, GLuint, GLint);
+    typedef void (*PFTexImage)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    typedef void (*PFTexParam)(GLenum, GLenum, GLint);
+    typedef void (*PFDrawArrays)(GLenum, GLint, GLsizei);
+    typedef void (*PFActive)(GLenum);
+    typedef void (*PFAttribPtr)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
+    PFCreateShader cs = (PFCreateShader)host_gl_proc({"glCreateShader"});
+    PFShaderSource ss = (PFShaderSource)host_gl_proc({"glShaderSource"});
+    PFU1 comp = (PFU1)host_gl_proc({"glCompileShader"});
+    PFCreateProgram cp = (PFCreateProgram)host_gl_proc({"glCreateProgram"});
+    PFAttach at = (PFAttach)host_gl_proc({"glAttachShader"});
+    PFBindAttrib ba = (PFBindAttrib)host_gl_proc({"glBindAttribLocation"});
+    PFU1 link = (PFU1)host_gl_proc({"glLinkProgram"});
+    PFU1 use = (PFU1)host_gl_proc({"glUseProgram"});
+    PFGetiv gpi = (PFGetiv)host_gl_proc({"glGetProgramiv"});
+    PFGen gfb = (PFGen)host_gl_proc({"glGenFramebuffers"});
+    PFBind bfb = (PFBind)host_gl_proc({"glBindFramebuffer"});
+    PFFBTex fbt = (PFFBTex)host_gl_proc({"glFramebufferTexture2D"});
+    PFGen gt = (PFGen)host_gl_proc({"glGenTextures"});
+    PFBind bt = (PFBind)host_gl_proc({"glBindTexture"});
+    PFTexImage ti = (PFTexImage)host_gl_proc({"glTexImage2D"});
+    PFTexParam tp = (PFTexParam)host_gl_proc({"glTexParameteri"});
+    PFDrawArrays da = (PFDrawArrays)host_gl_proc({"glDrawArrays"});
+    PFActive act = (PFActive)host_gl_proc({"glActiveTexture"});
+    PFBind bbuf = (PFBind)host_gl_proc({"glBindBuffer"});
+    PFAttribPtr ap = (PFAttribPtr)host_gl_proc({"glVertexAttribPointer"});
+    PFU1 ena = (PFU1)host_gl_proc({"glEnableVertexAttribArray"});
+    if (!cs || !ss || !comp || !cp || !at || !ba || !link || !use || !gpi || !gfb || !bfb ||
+        !fbt || !gt || !bt || !ti || !tp || !da || !act || !bbuf || !ap || !ena ||
+        !pfn_glCompressedTexImage2D || !pfn_glReadPixels || !pfn_glGetIntegerv || !pfn_glGetError) {
+        fprintf(stderr, "[etctest] missing GL entry points\n");
+        return;
+    }
+    GLint prog0 = 0, fb0 = 0, tex0 = 0, abuf0 = 0, active0 = 0, vp[4] = {0};
+    pfn_glGetIntegerv(0x8B8D, &prog0);
+    pfn_glGetIntegerv(0x8CA6, &fb0);
+    pfn_glGetIntegerv(0x84E0, &active0);
+    pfn_glGetIntegerv(0x8894, &abuf0);
+    pfn_glGetIntegerv(0x0BA2, vp);
+    act(0x84C0);
+    pfn_glGetIntegerv(0x8069, &tex0);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    GLint a0sz = 4, a0ty = 0x1406, a0norm = 0, a0st = 0, a0en = 0, a0buf = 0; void *a0ptr = nullptr;
+    if (gav && gptr) {
+        gav(0, 0x8623, &a0sz); gav(0, 0x8625, &a0ty); gav(0, 0x886A, &a0norm);
+        gav(0, 0x8624, &a0st); gav(0, 0x8622, &a0en); gav(0, 0x889F, &a0buf); gptr(0, 0x8645, &a0ptr);
+    }
+    const GLboolean blend0 = pfn_glIsEnabled ? pfn_glIsEnabled(0x0BE2) : 0;
+    const GLboolean depth0 = pfn_glIsEnabled ? pfn_glIsEnabled(0x0B71) : 0;
+    const GLboolean sciss0 = pfn_glIsEnabled ? pfn_glIsEnabled(0x0C11) : 0;
+    static const char *vs = "attribute vec2 p;\nvarying vec2 uv;\n"
+        "void main(){ uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }\n";
+    static const char *fs = "precision mediump float;\nvarying vec2 uv;\nuniform sampler2D t;\n"
+        "void main(){ gl_FragColor = texture2D(t, uv); }\n";
+    GLuint v = cs(0x8B31), f = cs(0x8B30);
+    ss(v, 1, &vs, nullptr); comp(v);
+    ss(f, 1, &fs, nullptr); comp(f);
+    GLuint pr = cp(); at(pr, v); at(pr, f); ba(pr, 0, "p"); link(pr);
+    GLint ok = 0; gpi(pr, 0x8B82, &ok);
+    if (!ok) { fprintf(stderr, "[etctest] program did not link\n"); return; }
+    /* ETC2 RGB8 differential block: base 31,0,0 (5-bit), table 0, all indices 0 (+2). */
+    static const unsigned char block[8] = { 0xF8, 0x00, 0x00, 0x02, 0, 0, 0, 0 };
+    static const GLfloat tri[] = { -1.f, -1.f, 3.f, -1.f, -1.f, 3.f };
+    GLuint fb = 0, target = 0, src[2] = {0, 0};
+    gfb(1, &fb); gt(1, &target); gt(2, src);
+    bt(0x0DE1, target);
+    ti(0x0DE1, 0, 0x1908, 4, 4, 0, 0x1908, 0x1401, nullptr);
+    bfb(0x8D40, fb);
+    fbt(0x8D40, 0x8CE0, 0x0DE1, target, 0);
+    while (pfn_glGetError()) {}
+    for (int pass = 0; pass < 2; ++pass) {
+        GLenum fmt = 0x9274;
+        if (pass == 0) {
+            const GLenum lossy = etc_lossy_format(0x9274);
+            if (!lossy) { fprintf(stderr, "[etctest] lossy path not available here\n"); continue; }
+            fmt = lossy;
+        }
+        bt(0x0DE1, src[pass]);
+        pfn_glCompressedTexImage2D(0x0DE1, 0, fmt, 4, 4, 0, 8, block);
+        const GLenum e1 = pfn_glGetError();
+        tp(0x0DE1, 0x2801, 0x2600); tp(0x0DE1, 0x2800, 0x2600);
+        use(pr);
+        bbuf(0x8892, 0);
+        ap(0, 2, 0x1406, 0, 0, tri);
+        ena(0);
+        if (pfn_glViewport) pfn_glViewport(0, 0, 4, 4);
+        pfn_glDisable(0x0BE2); pfn_glDisable(0x0B71); pfn_glDisable(0x0C11);
+        da(0x0004, 0, 3);
+        unsigned char px[4] = {0};
+        pfn_glReadPixels(1, 1, 1, 1, 0x1908, 0x1401, px);
+        const GLenum e2 = pfn_glGetError();
+        fprintf(stderr, "[etctest] %s (0x%x): upload err=0x%x, drawn %u,%u,%u err=0x%x  (expect ~255,2,2)\n",
+                pass == 0 ? "lossy" : "plain", fmt, e1, px[0], px[1], px[2], e2);
+    }
+    bfb(0x8D40, (GLuint)fb0);
+    bt(0x0DE1, (GLuint)tex0);
+    act((GLenum)active0);
+    use((GLuint)prog0);
+    bbuf(0x8892, (GLuint)a0buf);
+    ap(0, a0sz, (GLenum)a0ty, (GLboolean)a0norm, a0st, a0ptr);
+    if (!a0en && pfn_glDisableVertexAttribArray) pfn_glDisableVertexAttribArray(0);
+    bbuf(0x8892, (GLuint)abuf0);
+    if (blend0) pfn_glEnable(0x0BE2);
+    if (depth0) pfn_glEnable(0x0B71);
+    if (sciss0) pfn_glEnable(0x0C11);
+    if (pfn_glViewport) pfn_glViewport(vp[0], vp[1], vp[2], vp[3]);
+}
+
 /* LUNARIA_TRACE_TEX: what actually reaches a texture, and where it came from.
  *
  * A glyph atlas that samples as full coverage, one that was never written, and
@@ -38354,6 +38482,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (pfn_glDrawElements && gl_index_valid)
                     {
                         dbg_selftest();
+                        dbg_etc_selftest();
                         dbg_draw_probe((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx);
                         ArmLockDropped gl_unlocked;  /* see SVC_GL_Flush */
                         if (!dbg_vbo_draw((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx))
