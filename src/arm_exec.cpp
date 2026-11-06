@@ -15030,6 +15030,44 @@ static void dbg_selftest() {
     static const GLfloat tri_ndc[] = { -0.5f,-0.5f,0.f,1.f,  0.5f,-0.5f,0.f,1.f,  0.f,0.5f,0.f,1.f };
     static const GLfloat tri_px[]  = { 256.f,144.f,0.f,1.f,  768.f,144.f,0.f,1.f, 512.f,432.f,0.f,1.f };
     static const GLfloat mvp[16] = { 0.001953125f,0,0,0, 0,0.003472222f,0,0, 0,0,-0.019802f,0, -1,-1,-0.980198f,1 };
+    {
+        GLint v[24] = {0};
+        const GLenum q[] = { 0x80A0 /*SAMPLE_COVERAGE*/, 0x809E /*SAMPLE_ALPHA_TO_COVERAGE*/,
+                             0x8E51 /*SAMPLE_MASK*/, 0x80A8 /*SAMPLE_BUFFERS*/, 0x80A9 /*SAMPLES*/,
+                             0x0D52, 0x0D53, 0x0D54, 0x0D55, 0x0D56, 0x0D57 /*R G B A D S bits*/,
+                             0x8CA6 /*DRAW_FB*/, 0x8CAA /*READ_FB*/, 0x8825 /*DRAW_BUFFER0*/,
+                             0x0C02 /*READ_BUFFER*/, 0x8C89 /*RASTERIZER_DISCARD*/,
+                             0x8037 /*POLYGON_OFFSET_FILL*/, 0x0B90 /*STENCIL_TEST*/,
+                             0x0C11 /*SCISSOR_TEST*/, 0x8E24 /*TF_ACTIVE*/, 0x0BD0 /*DITHER*/ };
+        const char *qn[] = { "sample_coverage", "a2c", "sample_mask", "sample_buffers", "samples",
+                             "rbits", "gbits", "bbits", "abits", "dbits", "sbits",
+                             "draw_fb", "read_fb", "draw_buffer0", "read_buffer", "rast_discard",
+                             "poly_offset", "stencil", "scissor", "tf_active", "dither" };
+        for (size_t i = 0; i < sizeof q / sizeof q[0]; ++i) {
+            if (q[i] == 0x80A0 || q[i] == 0x809E || q[i] == 0x8E51 || q[i] == 0x8C89 ||
+                q[i] == 0x8037 || q[i] == 0x0B90 || q[i] == 0x0C11 || q[i] == 0x0BD0)
+                v[i] = pfn_glIsEnabled ? pfn_glIsEnabled(q[i]) : -1;
+            else
+                pfn_glGetIntegerv(q[i], &v[i]);
+            GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+            fprintf(stderr, "[selftest] state %s=%d%s\n", qn[i], v[i], e ? " (query error)" : "");
+        }
+        typedef void (*PFGetIntegeri)(GLenum, GLuint, GLint *);
+        PFGetIntegeri gii = (PFGetIntegeri)host_gl_proc({"glGetIntegeri_v"});
+        if (gii) {
+            GLint m = -1; gii(0x8E52 /*SAMPLE_MASK_VALUE*/, 0, &m);
+            GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+            fprintf(stderr, "[selftest] state sample_mask_value0=0x%x%s\n", (unsigned)m, e ? " (query error)" : "");
+        }
+        GLfloat cv = -1; GLboolean ci = 0;
+        typedef void (*PFGetFloatv)(GLenum, GLfloat *);
+        typedef void (*PFGetBooleanv)(GLenum, GLboolean *);
+        PFGetFloatv gf = (PFGetFloatv)host_gl_proc({"glGetFloatv"});
+        PFGetBooleanv gb = (PFGetBooleanv)host_gl_proc({"glGetBooleanv"});
+        if (gf) gf(0x80AA /*SAMPLE_COVERAGE_VALUE*/, &cv);
+        if (gb) gb(0x80AB /*SAMPLE_COVERAGE_INVERT*/, &ci);
+        fprintf(stderr, "[selftest] state coverage_value=%g invert=%d\n", cv, (int)ci);
+    }
     GLuint vb[2]; gen(2, vb);
     bind(0x8892, vb[0]); data(0x8892, sizeof tri_ndc, tri_ndc, 0x88E4);
     bind(0x8892, vb[1]); data(0x8892, sizeof tri_px, tri_px, 0x88E4);
@@ -15050,6 +15088,63 @@ static void dbg_selftest() {
         GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
         fprintf(stderr, "[selftest] %s: before=%u,%u,%u after=%u,%u,%u err=0x%x  (red = drew)\n",
                 t.tag, before[0], before[1], before[2], after[0], after[1], after[2], e);
+    }
+    {
+        GLuint pr = make(vs_plain, fs_color, "E plain, all raster state off");
+        if (pr) {
+            use(pr);
+            const GLenum off[] = { 0x80A0, 0x809E, 0x8E51, 0x8C89, 0x8037, 0x0B90, 0x0C11, 0x0B44 };
+            for (GLenum c : off) pfn_glDisable(c);
+            if (pfn_glGetError) while (pfn_glGetError()) {}
+            if (pfn_glViewport) pfn_glViewport(0, 0, 1024, 576);
+            typedef void (*PFColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
+            PFColorMask cm = (PFColorMask)host_gl_proc({"glColorMask"});
+            if (cm) cm(1, 1, 1, 1);
+            bind(0x8892, vb[0]);
+            pfn_glVertexAttribPointer(0, 4, 0x1406, 0, 0, nullptr);
+            cc(0.f, 1.f, 0.f, 1.f); pfn_glClear(0x4000);
+            da(0x0004, 0, 3);
+            unsigned char px[4] = {0};
+            pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, px);
+            GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+            fprintf(stderr, "[selftest] E all-off: after=%u,%u,%u err=0x%x\n", px[0], px[1], px[2], e);
+
+            typedef void (*PFGenFB)(GLsizei, GLuint *);
+            typedef void (*PFBindFB)(GLenum, GLuint);
+            typedef void (*PFFBTex)(GLenum, GLenum, GLenum, GLuint, GLint);
+            typedef GLenum (*PFCheckFB)(GLenum);
+            typedef void (*PFGenTex)(GLsizei, GLuint *);
+            typedef void (*PFBindTex)(GLenum, GLuint);
+            typedef void (*PFTexImage)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+            PFGenFB gfb = (PFGenFB)host_gl_proc({"glGenFramebuffers"});
+            PFBindFB bfb = (PFBindFB)host_gl_proc({"glBindFramebuffer"});
+            PFFBTex fbt = (PFFBTex)host_gl_proc({"glFramebufferTexture2D"});
+            PFCheckFB chk = (PFCheckFB)host_gl_proc({"glCheckFramebufferStatus"});
+            PFGenTex gt = (PFGenTex)host_gl_proc({"glGenTextures"});
+            PFBindTex bt = (PFBindTex)host_gl_proc({"glBindTexture"});
+            PFTexImage ti = (PFTexImage)host_gl_proc({"glTexImage2D"});
+            if (gfb && bfb && fbt && chk && gt && bt && ti) {
+                GLint fb0 = 0, tex0 = 0;
+                pfn_glGetIntegerv(0x8CA6, &fb0);
+                pfn_glGetIntegerv(0x8069 /*TEXTURE_BINDING_2D*/, &tex0);
+                GLuint fb = 0, tx = 0;
+                gfb(1, &fb); gt(1, &tx);
+                bt(0x0DE1, tx);
+                ti(0x0DE1, 0, 0x1908, 1024, 576, 0, 0x1908, 0x1401, nullptr);
+                bfb(0x8D40, fb);
+                fbt(0x8D40, 0x8CE0, 0x0DE1, tx, 0);
+                GLenum st = chk(0x8D40);
+                cc(0.f, 1.f, 0.f, 1.f); pfn_glClear(0x4000);
+                da(0x0004, 0, 3);
+                unsigned char q2[4] = {0};
+                pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, q2);
+                GLenum e2 = pfn_glGetError ? pfn_glGetError() : 0;
+                fprintf(stderr, "[selftest] F own FBO status=0x%x: after=%u,%u,%u err=0x%x\n",
+                        st, q2[0], q2[1], q2[2], e2);
+                bfb(0x8D40, (GLuint)fb0);
+                bt(0x0DE1, (GLuint)tex0);
+            }
+        }
     }
     use((GLuint)prog0);
     bind(0x8892, 0);
