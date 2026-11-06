@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,6 +33,11 @@
 namespace Dynarmic::A32 {
 
 using namespace Backend::X64;
+
+/* Blocks compiled and wall time spent compiling them, across every A32 JIT
+ * (the A64 side keeps the same pair); read by the emulator's sampler. */
+static std::atomic<uint64_t> g_a32_compiles{0};
+static std::atomic<uint64_t> g_a32_compile_ns{0};
 
 static RunCodeCallbacks GenRunCodeCallbacks(A32::UserCallbacks* cb, CodePtr (*LookupBlock)(void* lookup_block_arg), void* arg, const A32::UserConfig& conf) {
     return RunCodeCallbacks{
@@ -213,6 +220,12 @@ private:
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
+        const auto compile_t0 = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            g_a32_compile_ns.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - compile_t0).count(), std::memory_order_relaxed);
+            g_a32_compiles.fetch_add(1, std::memory_order_relaxed);
+        };
         IR::Block ir_block = A32::Translate(A32::LocationDescriptor{descriptor}, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions});
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::NamingPass(ir_block);
@@ -338,6 +351,11 @@ void Jit::ClearExclusiveState() {
 
 void Jit::DumpDisassembly() const {
     impl->DumpDisassembly();
+}
+
+extern "C" {
+uint64_t dynarmic_a32_compile_count(void) { return g_a32_compiles.load(std::memory_order_relaxed); }
+uint64_t dynarmic_a32_compile_ns(void) { return g_a32_compile_ns.load(std::memory_order_relaxed); }
 }
 
 }  // namespace Dynarmic::A32

@@ -2653,17 +2653,26 @@ static LONG WINAPI crash_veh(EXCEPTION_POINTERS *info)
    return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Translated-code compiles and time, both ARM front ends together. */
+extern uint64_t dynarmic_a64_compile_count(void);
+extern uint64_t dynarmic_a64_compile_ns(void);
+extern uint64_t dynarmic_a32_compile_count(void);
+extern uint64_t dynarmic_a32_compile_ns(void);
+static unsigned long long jit_compiles_total(void)
+{
+   return dynarmic_a64_compile_count() + dynarmic_a32_compile_count();
+}
+static unsigned long long jit_compile_ns_total(void)
+{
+   return dynarmic_a64_compile_ns() + dynarmic_a32_compile_ns();
+}
+
 /* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
 int wmain(int argc, wchar_t *wide_argv[])
 {
    SetUnhandledExceptionFilter(crash_filter);
    AddVectoredExceptionHandler(0, crash_veh);
-   {
-      extern uint64_t dynarmic_a64_compile_count(void);
-      extern uint64_t dynarmic_a64_compile_ns(void);
-      luna_os_sampler_start((unsigned long long (*)(void))dynarmic_a64_compile_count,
-                            (unsigned long long (*)(void))dynarmic_a64_compile_ns);
-   }
+   luna_os_sampler_start(jit_compiles_total, jit_compile_ns_total);
    char **argv = calloc((size_t)argc + 1, sizeof *argv);
    if (!argv) return EXIT_FAILURE;
    for (int i = 0; i < argc; i++) {
