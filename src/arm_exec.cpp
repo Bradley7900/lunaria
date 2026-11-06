@@ -17657,6 +17657,45 @@ static bool anw_post_locked_buffer(ArmExecCtx &ctx) {
     return ok == EGL_TRUE;
 }
 
+#ifdef _WIN32
+/* Does this PC have a working Vulkan driver at all?  ANGLE's Vulkan backend
+ * does not fail cleanly without one: on a machine with no Vulkan driver it
+ * crashed inside eglInitialize (an access violation in a lock in ntdll),
+ * where D3D11 would simply have worked.  So ask the Vulkan loader first:
+ * load vulkan-1.dll, create a bare instance, count the GPUs.  Anything short
+ * of one GPU means Vulkan is not usable and Lunaria stays on D3D11. */
+static bool host_vulkan_usable(char *why, size_t cap) {
+    struct VkAppInfo { int sType; const void *pNext; const char *app; uint32_t appv;
+                       const char *eng; uint32_t engv; uint32_t api; };
+    struct VkInstInfo { int sType; const void *pNext; uint32_t flags; const VkAppInfo *app;
+                        uint32_t nl; const char *const *l; uint32_t ne; const char *const *e; };
+    typedef void *(*GIPA)(void *, const char *);
+    typedef int (*CreateI)(const VkInstInfo *, const void *, void **);
+    typedef int (*EnumPD)(void *, uint32_t *, void **);
+    typedef void (*DestroyI)(void *, const void *);
+    void *lib = luna_os_library_open_local("vulkan-1.dll");
+    if (!lib) { snprintf(why, cap, "no vulkan-1.dll"); return false; }
+    GIPA gipa = (GIPA)luna_os_library_symbol(lib, "vkGetInstanceProcAddr");
+    CreateI create = gipa ? (CreateI)gipa(nullptr, "vkCreateInstance") : nullptr;
+    if (!create) { snprintf(why, cap, "vulkan-1.dll has no vkCreateInstance"); return false; }
+    VkAppInfo app = { 0 /* APPLICATION_INFO */, nullptr, "lunaria-probe", 1, "lunaria", 1,
+                      (1u << 22) | (1u << 12) /* 1.1 */ };
+    VkInstInfo ci = { 1 /* INSTANCE_CREATE_INFO */, nullptr, 0, &app, 0, nullptr, 0, nullptr };
+    void *inst = nullptr;
+    const int r = create(&ci, nullptr, &inst);
+    if (r != 0 || !inst) { snprintf(why, cap, "vkCreateInstance failed (%d): no Vulkan driver", r); return false; }
+    EnumPD enumpd = (EnumPD)gipa(inst, "vkEnumeratePhysicalDevices");
+    DestroyI destroy = (DestroyI)gipa(inst, "vkDestroyInstance");
+    uint32_t n = 0;
+    const int e = enumpd ? enumpd(inst, &n, nullptr) : -1;
+    if (destroy) destroy(inst, nullptr);
+    /* The loader stays loaded: ANGLE is about to load it again anyway. */
+    if (e != 0 || n == 0) { snprintf(why, cap, "Vulkan has no GPU (%d, %u devices)", e, n); return false; }
+    snprintf(why, cap, "%u Vulkan GPU%s", n, n == 1 ? "" : "s");
+    return true;
+}
+#endif
+
 // Initialize host-side EGL + GLES2 context and make it current.
 static bool init_host_egl() {
     if (g_egl_ctx == EGL_NO_CONTEXT) g_host_ui_thread = std::this_thread::get_id();
@@ -17706,11 +17745,28 @@ static bool init_host_egl() {
             const char *backend = lunaria_env("LUNARIA_ANGLE_BACKEND");
 #ifdef _WIN32
             if (backend && !strcmp(backend, "vulkan")) {
+                char why[96];
+                if (!host_vulkan_usable(why, sizeof why)) {
+                    fprintf(stderr, "[arm_exec] init_host_egl: Vulkan was chosen but is not "
+                            "usable on this PC (%s); using DirectX 11 instead\n", why);
+                    /* The compositor's display reads the same key: keep it on D3D11 too. */
+                    luna_os_setenv("LUNARIA_ANGLE_BACKEND", "d3d11", 1);
+                    lunaria_env_invalidate();
+                    backend = nullptr;
+                } else
+                    fprintf(stderr, "[arm_exec] init_host_egl: Vulkan check: %s\n", why);
+            }
+            if (backend && !strcmp(backend, "vulkan")) {
                 if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan"))
                     g_egl_dpy = EGL_NO_DISPLAY;
-            } else if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, "D3D11") &&
-                       !initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan")) {
-                g_egl_dpy = EGL_NO_DISPLAY;
+            } else if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, "D3D11")) {
+                /* D3D11's own fallback must not take the same crash. */
+                char why[96];
+                if (!host_vulkan_usable(why, sizeof why) ||
+                    !initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan")) {
+                    fprintf(stderr, "[arm_exec] init_host_egl: no usable backend (Vulkan: %s)\n", why);
+                    g_egl_dpy = EGL_NO_DISPLAY;
+                }
             }
 #else
             if (backend && !strcmp(backend, "metal")) {
