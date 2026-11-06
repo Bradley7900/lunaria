@@ -79,6 +79,7 @@ static EGLSync  g_ready_fence[SLOTS];  /* the copy into the slot is done */
 static EGLSync  g_release_fence[SLOTS];/* the compositor is done reading it */
 static int      g_queued = -1, g_shown = -1;
 static int      g_frame_w[SLOTS], g_frame_h[SLOTS];
+static atomic_uint g_comp_frames;     /* distinct guest frames the compositor got */
 static bool     g_wake;
 
 /* Guest side: per guest share group (keyed by the presenting context), the
@@ -344,6 +345,82 @@ static bool share_submit(EGLContext ctx, int w, int h, int swap_interval)
    pthread_mutex_unlock(&g_mu);
    return true;
 }
+
+/* Hand over a fenced frame now: the pixel path is about to take over. */
+static void share_flush_pending(void)
+{
+   if (g_gs.pending < 0) return;
+   eglClientWaitSync(g_guest_dpy, g_gs.fence, EGL_SYNC_FLUSH_COMMANDS_BIT, EGL_FOREVER);
+   eglDestroySync(g_guest_dpy, g_gs.fence);
+   g_gs.fence = EGL_NO_SYNC;
+   pthread_mutex_lock(&g_mu);
+   const int p = g_gs.pending;
+   g_slot_handle[p] = g_gs.handle[p];
+   g_frame_w[p] = g_gs.w;
+   g_frame_h[p] = g_gs.h;
+   g_queued = p;
+   g_gs.pending = -1;
+   pthread_cond_signal(&g_cv_comp);
+   pthread_mutex_unlock(&g_mu);
+}
+
+/* Which path is faster depends on the machine: the shared texture saves a
+ * read-back and an upload, but a software device (WARP on a GPU-less box)
+ * or a driver that copies shared resources can make it the slower one.  So
+ * measure instead of guessing: run each for a few seconds, count the frames
+ * the compositor actually received, keep the better one (the shared texture
+ * on a near tie, since it spends less CPU), and check again now and then as
+ * the game moves between menus and 3D.  LUNARIA_COMP_SHARE=1/0 pins it. */
+#define PICK_WARMUP_NS   (20ull * 1000000000ull)
+#define PICK_WINDOW_NS   (3ull * 1000000000ull)
+#define PICK_RECHECK_NS  (120ull * 1000000000ull)
+static bool share_choose(void)
+{
+   static int forced = -2;          /* -1 auto, 0 pixels, 1 shared */
+   static int phase;                /* 0 using the pick, 1 timing shared, 2 timing pixels */
+   static bool pick = true;
+   static uint64_t t0, next_check;
+   static unsigned f0;
+   static double shared_fps;
+   if (forced == -2) {
+      const char *env = getenv("LUNARIA_COMP_SHARE");
+      forced = !env || !*env ? -1 : env[0] == '0' ? 0 : 1;
+      if (forced >= 0)
+         fprintf(stderr, "[compositor] frame path pinned to %s (LUNARIA_COMP_SHARE)\n",
+                 forced ? "shared textures" : "pixels");
+   }
+   if (forced >= 0) return forced;
+   if (g_share_state < 0) return false;
+   const uint64_t now = now_ns();
+   const unsigned frames = atomic_load(&g_comp_frames);
+   if (!next_check) next_check = now + PICK_WARMUP_NS;
+   switch (phase) {
+   case 0:
+      if (now < next_check) return pick;
+      phase = 1; t0 = now; f0 = frames;
+      return true;
+   case 1:
+      if (now - t0 < PICK_WINDOW_NS) return true;
+      shared_fps = (frames - f0) * 1e9 / (double)(now - t0);
+      phase = 2; t0 = now; f0 = frames;
+      return false;
+   default: {
+      if (now - t0 < PICK_WINDOW_NS) return false;
+      const double pixel_fps = (frames - f0) * 1e9 / (double)(now - t0);
+      const bool was = pick;
+      pick = shared_fps >= pixel_fps * 0.95;
+      static bool logged;
+      if (pick != was || !logged) {
+         fprintf(stderr, "[compositor] frame path: %s (shared %.1f fps, pixels %.1f fps)\n",
+                 pick ? "shared textures" : "pixels", shared_fps, pixel_fps);
+         logged = true;
+      }
+      phase = 0;
+      next_check = now + PICK_RECHECK_NS;
+      return pick;
+   }
+   }
+}
 #endif
 
 void luna_comp_submit(int w, int h, int swap_interval)
@@ -354,7 +431,13 @@ void luna_comp_submit(int w, int h, int swap_interval)
    if (ctx == EGL_NO_CONTEXT) return;
 
 #ifdef _WIN32
-   if (g_own_display && share_submit(ctx, w, h, swap_interval)) return;
+   if (g_own_display) {
+      if (share_choose()) {
+         if (share_submit(ctx, w, h, swap_interval)) return;
+      } else {
+         share_flush_pending();
+      }
+   }
 #endif
    if (g_own_display) {
       /* The compositor is on another display: read the default framebuffer
@@ -812,6 +895,7 @@ static void *comp_main(void *arg)
                             GL_UNSIGNED_BYTE, g_px_buf);
          }
          g_px_pending = false;
+         atomic_fetch_add(&g_comp_frames, 1);
          g_px_shown = true;
          have_frame = true;
          pthread_cond_signal(&g_cv_guest);
@@ -839,6 +923,7 @@ static void *comp_main(void *arg)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             g_comp_img[take] = take_img;
          }
+         atomic_fetch_add(&g_comp_frames, 1);
          have_frame = true;
       }
       /* Images a resize or an evicted context left behind, once none of
