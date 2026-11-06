@@ -13,6 +13,10 @@ on:
       seconds:
         required: false
         default: "60"
+      env:
+        description: Extra environment, K=V separated by ';'
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -38,6 +42,7 @@ jobs:
           mkdir -p out
           mkdir -p out/shots data
           export LUNARIA_PBUFFER=1 LUNARIA_COMP_SHOT_S=15 LUNARIA_DUMP_FRAME=300,800,2000,5000 LUNARIA_DUMP_DIR="$PWD/out/shots"
+          IFS=';' read -ra kvs <<< "${{ inputs.env }}"; for kv in "${kvs[@]}"; do [ -n "$kv" ] && export "$kv" && echo "env $kv"; done
           "$exe" --data-root "$PWD/data" "$PWD/UnitySampleGame.apk" >out/lunaria-stdout.log 2>out/lunaria-stderr.log &
           pid=$!
           for i in $(seq 1 $(( ${{ inputs.seconds }} / 5 ))); do kill -0 $pid 2>/dev/null || break; sleep 5; done
@@ -48,5 +53,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lunaria-linux-control
+          name: lunaria-linux-control-${{ github.run_id }}
           path: out
