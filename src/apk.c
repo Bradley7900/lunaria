@@ -1725,6 +1725,28 @@ static int font_defaults(const char *exedir)
    for (size_t i = 0; i < sizeof faces / sizeof faces[0]; i++)
       if (!path_join(path, sizeof path, fonts, faces[i].file) && exists(path))
          env_default(faces[i].key, path);
+#ifdef _WIN32
+   /* make-dist.sh copies Inter from a sibling luna-shell checkout, which a CI
+    * build does not have, so a Windows ZIP can ship an empty fonts/ and every
+    * label in the launcher and menus renders blank.  Every Windows install
+    * has Segoe UI: use it for any face still unset. */
+   {
+      static const struct { const char *key, *file; } system_faces[] = {
+         {"LUNA_FONT_REGULAR", "segoeui.ttf"}, {"LUNA_FONT_BOLD", "segoeuib.ttf"},
+         {"LUNA_FONT_REGULAR", "arial.ttf"}, {"LUNA_FONT_BOLD", "arialbd.ttf"},
+      };
+      const char *windir = getenv("WINDIR");
+      char dir[APK_PATH];
+      snprintf(dir, sizeof dir, "%s/Fonts", windir && *windir ? windir : "C:/Windows");
+      for (char *c = dir; *c; c++)
+         if (*c == '\\') *c = '/';
+      for (size_t i = 0; i < sizeof system_faces / sizeof system_faces[0]; i++) {
+         const char *have = getenv(system_faces[i].key);
+         if ((!have || !*have) && !path_join(path, sizeof path, dir, system_faces[i].file) && exists(path))
+            env_default(system_faces[i].key, path);
+      }
+   }
+#endif
    static const char *cjk[] = {"NotoSansCJKjp-Regular.otf", "NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Regular.ttc"};
    for (size_t i = 0; i < sizeof cjk / sizeof cjk[0]; i++)
       if (!path_join(path, sizeof path, fonts, cjk[i]) && exists(path)) {
@@ -2178,7 +2200,17 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    if (restart_environment_remember()) return apk_error("cannot retain the launch environment");
    if (*argc < 2) {
       /* Started with nothing to run (a double-clicked app, a launcher icon).
-       * Without a display there is nobody to ask. */
+       * Without a display there is nobody to ask.  The launcher draws text
+       * too, so its fonts are set up before it opens, not only once an app
+       * has been chosen. */
+      char launcher_exe[APK_PATH];
+      if (!luna_os_executable_path(launcher_exe, sizeof launcher_exe)) {
+         char *cut = strrchr(launcher_exe, '/');
+         if (cut) {
+            *cut = 0;
+            font_defaults(launcher_exe);
+         }
+      }
       const int asked = launcher_ask(argc, argv);
       if (asked) {
          luna_launcher_end(0);
