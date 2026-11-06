@@ -137,6 +137,7 @@ static const uint32_t cxa_guard_abort_code64[] = {
 #include <memory>
 #include <deque>
 #include <mutex>
+#include <tuple>
 #include <condition_variable>
 #include <exception>
 #include <typeinfo>
@@ -18684,9 +18685,47 @@ extern "C" int arm_exec_egl_query_context(uint32_t ctx, int attr, int32_t *value
     return (int)ok;
 }
 
+/* A config's attributes never change while its display lives, and Unity asks
+ * for the same few every other frame: measured 2,233 calls in a 150 s run at
+ * ~0.6 ms each on ANGLE (the call waits on ANGLE's display lock while the
+ * compositor presents), each followed by an eglGetError that waited the same
+ * way.  Successful answers are kept per display/config/attribute; a hit also
+ * leaves EGL_SUCCESS as the guest's pending error, which is what the host call
+ * would have left, so the eglGetError after it is answered without ANGLE.
+ * LUNARIA_EGL_CFG_CACHE=0 turns it off. */
+static std::mutex g_egl_cfg_attr_mu;
+static std::map<std::tuple<EGLDisplay, EGLConfig, int>, EGLint> g_egl_cfg_attr;
+static int arm_exec_egl_get_config_attrib_host(EGLConfig hc, int attr, int32_t *value);
+
 extern "C" int arm_exec_egl_get_config_attrib(uint32_t cfg, int attr,
                                               int32_t *value) {
+    static const bool cache_on = [] {
+        const char *e = lunaria_env("LUNARIA_EGL_CFG_CACHE");
+        return !(e && e[0] == '0');
+    }();
     EGLConfig hc = resolve_egl_config(cfg);
+    if (!cache_on) return arm_exec_egl_get_config_attrib_host(hc, attr, value);
+    const auto key = std::make_tuple(g_egl_dpy, hc, attr);
+    {
+        std::lock_guard<std::mutex> lock(g_egl_cfg_attr_mu);
+        auto it = g_egl_cfg_attr.find(key);
+        if (it != g_egl_cfg_attr.end()) {
+            if (value) *value = it->second;
+            egl_set_guest_error(EGL_SUCCESS);
+            return (int)EGL_TRUE;
+        }
+    }
+    int32_t v = 0;
+    const int ok = arm_exec_egl_get_config_attrib_host(hc, attr, &v);
+    if (ok == (int)EGL_TRUE && g_egl_dpy != EGL_NO_DISPLAY && hc) {
+        std::lock_guard<std::mutex> lock(g_egl_cfg_attr_mu);
+        g_egl_cfg_attr.emplace(key, v);
+    }
+    if (value) *value = v;
+    return ok;
+}
+
+static int arm_exec_egl_get_config_attrib_host(EGLConfig hc, int attr, int32_t *value) {
     EGLint v = 0;
     EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY && hc)
         ? eglGetConfigAttrib(g_egl_dpy, hc, (EGLint)attr, &v) : EGL_FALSE;
