@@ -14983,13 +14983,29 @@ static bool dbg_vbo_draw(GLenum mode, GLsizei count, GLenum type, const void *id
     static int nlog = 0;
     if (nlog++ < 4)
         fprintf(stderr, "[dbgvbo] draw count=%d maxidx=%u attrs=%d\n", (int)count, maxi, ns);
+    if (nlog <= 4 && pfn_glReadPixels) {
+        unsigned char px[4] = {0, 0, 0, 0};
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, px);
+        fprintf(stderr, "[dbgvbo] before center=%u,%u,%u,%u\n", px[0], px[1], px[2], px[3]);
+    }
     pfn_glDrawElements(mode, count, type, nullptr);
+    if (nlog <= 4 && pfn_glReadPixels) {
+        unsigned char px[4] = {0, 0, 0, 0};
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, px);
+        GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+        fprintf(stderr, "[dbgvbo] after  center=%u,%u,%u,%u err=0x%x\n", px[0], px[1], px[2], px[3], e);
+    }
     bind(0x8893, 0);
     bind(0x8892, 0);
     for (int i = 0; i < ns; ++i)
         pfn_glVertexAttribPointer(saved[i].a, saved[i].sz, (GLenum)saved[i].ty,
                                   (GLboolean)saved[i].norm, saved[i].st, saved[i].ptr);
     bind(0x8892, (GLuint)abuf);
+    if (nlog <= 4)
+        for (int i = 0; i < ns; ++i) {
+            void *q = nullptr; gptr(saved[i].a, 0x8645, &q);
+            fprintf(stderr, "[dbgvbo] restored a%u ptr=%p (want %p)\n", saved[i].a, q, saved[i].ptr);
+        }
     return true;
 }
 
