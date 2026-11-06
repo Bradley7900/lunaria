@@ -2134,27 +2134,27 @@ static void keyfiles_read(void)
 }
 
 
-/* macOS context-menu look: a translucent vibrancy panel, 13px system text,
+/* Context-menu look, dark: a translucent near-black panel, 13px system text,
  * rounded selection in the accent blue, hairline separators. */
 static const char g_menu_style[] =
    "#luna-menu-backdrop{position:absolute;left:0;top:0;right:0;bottom:0;"
    "background:transparent;}"
    ".lm{position:absolute;width:" "248" "px;padding:5px;border-radius:10px;"
-   "background:rgba(242,242,246,0.80);backdrop-filter:blur(24px) saturate(1.8);"
-   "border:1px solid rgba(0,0,0,0.14);box-shadow:0 12px 36px rgba(0,0,0,0.30);"
-   "font-size:13px;color:#1d1d1f;}"
+   "background:rgba(28,28,30,0.88);backdrop-filter:blur(24px) saturate(1.8);"
+   "border:1px solid rgba(255,255,255,0.12);box-shadow:0 12px 36px rgba(0,0,0,0.45);"
+   "font-size:13px;color:#f2f2f7;}"
    ".li{position:relative;height:24px;line-height:24px;padding:0 12px 0 24px;"
    "border-radius:5px;white-space:nowrap;overflow:hidden;cursor:pointer;}"
    ".li:hover{background:#0a64d8;color:#ffffff;}"
-   ".li.dis{color:#a1a1a6;cursor:default;}"
-   ".li.dis:hover{background:transparent;color:#a1a1a6;}"
+   ".li.dis{color:#77777c;cursor:default;}"
+   ".li.dis:hover{background:transparent;color:#77777c;}"
    /* the checkmark is drawn, not a glyph: every font has a box */
    ".ck{display:block;position:absolute;left:10px;top:6px;width:4px;height:9px;"
-   "border-right:2px solid #1d1d1f;border-bottom:2px solid #1d1d1f;transform:rotate(45deg);}"
+   "border-right:2px solid #f2f2f7;border-bottom:2px solid #f2f2f7;transform:rotate(45deg);}"
    ".li:hover .ck{border-right:2px solid #ffffff;border-bottom:2px solid #ffffff;}"
    ".kb{position:absolute;right:12px;top:0;color:#8e8e93;font-size:12px;}"
    ".li:hover .kb{color:#ffffff;}"
-   ".sep{height:1px;margin:5px 10px;background:rgba(0,0,0,0.13);}"
+   ".sep{height:1px;margin:5px 10px;background:rgba(255,255,255,0.12);}"
    ".hd{height:22px;line-height:22px;padding:0 12px;font-size:11px;"
    "font-weight:bold;color:#8e8e93;}"
    ".hud{position:absolute;left:50%;top:18px;transform:translate(-50%,0);"
