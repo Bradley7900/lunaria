@@ -14929,6 +14929,70 @@ static void gldraw_trace_texture(const char *what) {
  * reads them back, blend/depth/raster state, and the first vertices the
  * indices pick.  LUNARIA_DBG_NOBLEND / _NODEPTH / _NOCULL force that state
  * off for every draw, to see which one hides the draws. */
+/* LUNARIA_DBG_VBO=1: draw client-array DrawElements from temporary buffer
+ * objects instead (vertices and indices copied out of guest memory), then put
+ * the client pointers back.  An A/B for "the host drops client-array draws". */
+static bool dbg_vbo_draw(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    static int on = -1;
+    if (on < 0) on = lunaria_env("LUNARIA_DBG_VBO") != nullptr;
+    if (!on || !idx || count <= 0 || !pfn_glVertexAttribPointer || !pfn_glDrawElements) return false;
+    typedef void (*PFGen)(GLsizei, GLuint *);
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void (*PFData)(GLenum, GLsizeiptr, const void *, GLenum);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    static PFGen gen = (PFGen)host_gl_proc({"glGenBuffers"});
+    static PFBind bind = (PFBind)host_gl_proc({"glBindBuffer"});
+    static PFData data = (PFData)host_gl_proc({"glBufferData"});
+    static PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    static PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    if (!gen || !bind || !data || !gptr || !gav || !pfn_glGetIntegerv) return false;
+    GLint abuf = 0, ebuf = 0;
+    pfn_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &abuf);
+    pfn_glGetIntegerv(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &ebuf);
+    if (ebuf) return false;
+    uint32_t maxi = 0;
+    size_t isz = type == 0x1401 ? 1 : type == 0x1403 ? 2 : 4;
+    for (GLsizei i = 0; i < count; ++i) {
+        uint32_t v = isz == 1 ? ((const uint8_t *)idx)[i]
+                   : isz == 2 ? ((const uint16_t *)idx)[i] : ((const uint32_t *)idx)[i];
+        if (v > maxi) maxi = v;
+    }
+    static GLuint bufs[17] = {0};
+    if (!bufs[0]) gen(17, bufs);
+    struct Saved { GLuint a; GLint sz, ty, norm, st; void *ptr; };
+    Saved saved[16]; int ns = 0;
+    for (GLuint a = 0; a < 16; ++a) {
+        GLint en = 0, buf = 0;
+        gav(a, 0x8622, &en); gav(a, 0x889F, &buf);
+        if (!en || buf) continue;
+        Saved sv{}; sv.a = a;
+        gav(a, 0x8623, &sv.sz); gav(a, 0x8625, &sv.ty); gav(a, 0x886A, &sv.norm); gav(a, 0x8624, &sv.st);
+        gptr(a, 0x8645, &sv.ptr);
+        if (!sv.ptr) continue;
+        size_t esz = (size_t)sv.sz * (sv.ty == 0x1406 || sv.ty == 0x1404 || sv.ty == 0x1405 ? 4 : sv.ty == 0x1402 || sv.ty == 0x1403 ? 2 : 1);
+        size_t stride = sv.st ? (size_t)sv.st : esz;
+        size_t bytes = (size_t)maxi * stride + esz;
+        bind(0x8892, bufs[1 + a]);
+        data(0x8892, (GLsizeiptr)bytes, sv.ptr, 0x88E0 /* STREAM_DRAW */);
+        pfn_glVertexAttribPointer(a, sv.sz, (GLenum)sv.ty, (GLboolean)sv.norm, sv.st, nullptr);
+        saved[ns++] = sv;
+    }
+    bind(0x8893, bufs[0]);
+    data(0x8893, (GLsizeiptr)(isz * (size_t)count), idx, 0x88E0);
+    static int nlog = 0;
+    if (nlog++ < 4)
+        fprintf(stderr, "[dbgvbo] draw count=%d maxidx=%u attrs=%d\n", (int)count, maxi, ns);
+    pfn_glDrawElements(mode, count, type, nullptr);
+    bind(0x8893, 0);
+    bind(0x8892, 0);
+    for (int i = 0; i < ns; ++i)
+        pfn_glVertexAttribPointer(saved[i].a, saved[i].sz, (GLenum)saved[i].ty,
+                                  (GLboolean)saved[i].norm, saved[i].st, saved[i].ptr);
+    bind(0x8892, (GLuint)abuf);
+    return true;
+}
+
 static void dbg_draw_probe(GLenum mode, GLsizei count, GLenum type, const void *idx) {
     static long lim = -1;
     static int noblend = 0, nodepth = 0, nocull = 0;
@@ -37959,8 +38023,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     {
                         dbg_draw_probe((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx);
                         ArmLockDropped gl_unlocked;  /* see SVC_GL_Flush */
-                        pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
-                                           idx);
+                        if (!dbg_vbo_draw((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx))
+                            pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
+                                               idx);
                     }
             }
             if (g_guest_egl_swap_count <= 3) {
