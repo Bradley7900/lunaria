@@ -14932,6 +14932,134 @@ static void gldraw_trace_texture(const char *what) {
 /* LUNARIA_DBG_VBO=1: draw client-array DrawElements from temporary buffer
  * objects instead (vertices and indices copied out of guest memory), then put
  * the client pointers back.  An A/B for "the host drops client-array draws". */
+/* LUNARIA_DBG_SELFTEST=1: once, at the guest's first DrawElements, draw a
+ * centred triangle in the guest's own context with a few tiny programs and
+ * read the centre pixel back after each.  Tells "this context draws nothing"
+ * apart from "this kind of shader draws nothing". */
+static void dbg_selftest() {
+    static int done = 0;
+    if (done || !lunaria_env("LUNARIA_DBG_SELFTEST")) return;
+    done = 1;
+    typedef GLuint (*PFCreateShader)(GLenum);
+    typedef void (*PFShaderSource)(GLuint, GLsizei, const char *const *, const GLint *);
+    typedef void (*PFU1)(GLuint);
+    typedef GLuint (*PFCreateProgram)(void);
+    typedef void (*PFAttach)(GLuint, GLuint);
+    typedef void (*PFBindAttrib)(GLuint, GLuint, const char *);
+    typedef void (*PFGetiv)(GLuint, GLenum, GLint *);
+    typedef void (*PFLog)(GLuint, GLsizei, GLsizei *, char *);
+    typedef void (*PFGen)(GLsizei, GLuint *);
+    typedef void (*PFBind)(GLenum, GLuint);
+    typedef void (*PFData)(GLenum, GLsizeiptr, const void *, GLenum);
+    typedef void (*PFDrawArrays)(GLenum, GLint, GLsizei);
+    typedef void (*PFUM4)(GLint, GLsizei, GLboolean, const GLfloat *);
+    typedef GLint (*PFLoc)(GLuint, const char *);
+    typedef void (*PFClearColor)(GLfloat, GLfloat, GLfloat, GLfloat);
+    typedef void (*PFGetPtr)(GLuint, GLenum, void **);
+    typedef void (*PFGetAttribiv)(GLuint, GLenum, GLint *);
+    PFCreateShader cs = (PFCreateShader)host_gl_proc({"glCreateShader"});
+    PFShaderSource ss = (PFShaderSource)host_gl_proc({"glShaderSource"});
+    PFU1 comp = (PFU1)host_gl_proc({"glCompileShader"});
+    PFCreateProgram cp = (PFCreateProgram)host_gl_proc({"glCreateProgram"});
+    PFAttach at = (PFAttach)host_gl_proc({"glAttachShader"});
+    PFBindAttrib ba = (PFBindAttrib)host_gl_proc({"glBindAttribLocation"});
+    PFU1 link = (PFU1)host_gl_proc({"glLinkProgram"});
+    PFU1 use = (PFU1)host_gl_proc({"glUseProgram"});
+    PFGetiv gpi = (PFGetiv)host_gl_proc({"glGetProgramiv"});
+    PFGetiv gsi = (PFGetiv)host_gl_proc({"glGetShaderiv"});
+    PFLog plog = (PFLog)host_gl_proc({"glGetProgramInfoLog"});
+    PFLog slog = (PFLog)host_gl_proc({"glGetShaderInfoLog"});
+    PFGen gen = (PFGen)host_gl_proc({"glGenBuffers"});
+    PFBind bind = (PFBind)host_gl_proc({"glBindBuffer"});
+    PFData data = (PFData)host_gl_proc({"glBufferData"});
+    PFDrawArrays da = (PFDrawArrays)host_gl_proc({"glDrawArrays"});
+    PFUM4 um4 = (PFUM4)host_gl_proc({"glUniformMatrix4fv"});
+    PFLoc uloc = (PFLoc)host_gl_proc({"glGetUniformLocation"});
+    PFClearColor cc = (PFClearColor)host_gl_proc({"glClearColor"});
+    PFGetPtr gptr = (PFGetPtr)host_gl_proc({"glGetVertexAttribPointerv"});
+    PFGetAttribiv gav = (PFGetAttribiv)host_gl_proc({"glGetVertexAttribiv"});
+    if (!cs || !ss || !comp || !cp || !at || !ba || !link || !use || !gpi || !gsi || !gen ||
+        !bind || !data || !da || !cc || !pfn_glReadPixels || !pfn_glVertexAttribPointer ||
+        !pfn_glGetIntegerv || !pfn_glClear || !pfn_glDisable || !pfn_glEnable) {
+        fprintf(stderr, "[selftest] missing GL entry points\n");
+        return;
+    }
+    GLint prog0 = 0, abuf0 = 0, blend0 = 0, depth0 = 0;
+    pfn_glGetIntegerv(0x8B8D, &prog0);
+    pfn_glGetIntegerv(0x8894, &abuf0);
+    pfn_glGetIntegerv(0x0BE2, &blend0);
+    pfn_glGetIntegerv(0x0B71, &depth0);
+    GLint a0sz = 4, a0ty = 0x1406, a0norm = 0, a0st = 0, a0en = 0; void *a0ptr = nullptr;
+    if (gav && gptr) {
+        gav(0, 0x8623, &a0sz); gav(0, 0x8625, &a0ty); gav(0, 0x886A, &a0norm);
+        gav(0, 0x8624, &a0st); gav(0, 0x8622, &a0en); gptr(0, 0x8645, &a0ptr);
+    }
+    auto make = [&](const char *vs, const char *fs, const char *tag) -> GLuint {
+        GLuint v = cs(0x8B31), f = cs(0x8B30);
+        ss(v, 1, &vs, nullptr); comp(v);
+        ss(f, 1, &fs, nullptr); comp(f);
+        GLint okv = 0, okf = 0; gsi(v, 0x8B81, &okv); gsi(f, 0x8B81, &okf);
+        GLuint pr = cp(); at(pr, v); at(pr, f);
+        ba(pr, 0, "_glesVertex");
+        link(pr);
+        GLint okp = 0; gpi(pr, 0x8B82, &okp);
+        char lg[512] = {0};
+        if (!okp && plog) plog(pr, sizeof lg, nullptr, lg);
+        if (!okv && slog) slog(v, sizeof lg, nullptr, lg);
+        if (!okf && slog) slog(f, sizeof lg, nullptr, lg);
+        fprintf(stderr, "[selftest] %s compile vs=%d fs=%d link=%d %s\n", tag, okv, okf, okp, lg);
+        return okp ? pr : 0;
+    };
+    static const char *vs_plain =
+        "attribute vec4 _glesVertex;\nvoid main(){ gl_Position = _glesVertex; }\n";
+    static const char *vs_unity =
+        "uniform highp mat4 glstate_matrix_mvp;\nattribute vec4 _glesVertex;\n"
+        "void main(){ gl_Position = (glstate_matrix_mvp * _glesVertex); }\n";
+    static const char *fs_color =
+        "precision mediump float;\nvoid main(){ gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    static const char *fs_data =
+        "precision mediump float;\nvoid main(){ gl_FragData[0] = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+    struct T { const char *tag, *vs, *fs; int mvp; } tests[] = {
+        {"A plain+FragColor", vs_plain, fs_color, 0},
+        {"B plain+FragData0", vs_plain, fs_data, 0},
+        {"C unityVS+FragColor", vs_unity, fs_color, 1},
+        {"D unityVS+FragData0", vs_unity, fs_data, 1},
+    };
+    /* NDC triangle around the centre, and the same in Unity's pixel space for
+     * the mvp the splash uses (x*2/1024-1, y*2/576-1, z*-0.0198-0.98). */
+    static const GLfloat tri_ndc[] = { -0.5f,-0.5f,0.f,1.f,  0.5f,-0.5f,0.f,1.f,  0.f,0.5f,0.f,1.f };
+    static const GLfloat tri_px[]  = { 256.f,144.f,0.f,1.f,  768.f,144.f,0.f,1.f, 512.f,432.f,0.f,1.f };
+    static const GLfloat mvp[16] = { 0.001953125f,0,0,0, 0,0.003472222f,0,0, 0,0,-0.019802f,0, -1,-1,-0.980198f,1 };
+    GLuint vb[2]; gen(2, vb);
+    bind(0x8892, vb[0]); data(0x8892, sizeof tri_ndc, tri_ndc, 0x88E4);
+    bind(0x8892, vb[1]); data(0x8892, sizeof tri_px, tri_px, 0x88E4);
+    pfn_glDisable(0x0BE2); pfn_glDisable(0x0B71);
+    for (const T &t : tests) {
+        GLuint pr = make(t.vs, t.fs, t.tag);
+        if (!pr) continue;
+        use(pr);
+        if (t.mvp && um4 && uloc) um4(uloc(pr, "glstate_matrix_mvp"), 1, 0, mvp);
+        bind(0x8892, t.mvp ? vb[1] : vb[0]);
+        pfn_glVertexAttribPointer(0, 4, 0x1406, 0, 0, nullptr);
+        if (pfn_glEnableVertexAttribArray) pfn_glEnableVertexAttribArray(0);
+        cc(0.f, 1.f, 0.f, 1.f); pfn_glClear(0x4000);
+        unsigned char before[4] = {0}, after[4] = {0};
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, before);
+        da(0x0004, 0, 3);
+        pfn_glReadPixels(512, 288, 1, 1, 0x1908, 0x1401, after);
+        GLenum e = pfn_glGetError ? pfn_glGetError() : 0;
+        fprintf(stderr, "[selftest] %s: before=%u,%u,%u after=%u,%u,%u err=0x%x  (red = drew)\n",
+                t.tag, before[0], before[1], before[2], after[0], after[1], after[2], e);
+    }
+    use((GLuint)prog0);
+    bind(0x8892, 0);
+    pfn_glVertexAttribPointer(0, a0sz, (GLenum)a0ty, (GLboolean)a0norm, a0st, a0ptr);
+    if (!a0en && pfn_glDisableVertexAttribArray) pfn_glDisableVertexAttribArray(0);
+    bind(0x8892, (GLuint)abuf0);
+    if (blend0) pfn_glEnable(0x0BE2);
+    if (depth0) pfn_glEnable(0x0B71);
+}
+
 static bool dbg_vbo_draw(GLenum mode, GLsizei count, GLenum type, const void *idx) {
     static int on = -1;
     if (on < 0) on = lunaria_env("LUNARIA_DBG_VBO") != nullptr;
@@ -38037,6 +38165,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 const void *idx = gl_index_source(r3);
                 if (pfn_glDrawElements && gl_index_valid)
                     {
+                        dbg_selftest();
                         dbg_draw_probe((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx);
                         ArmLockDropped gl_unlocked;  /* see SVC_GL_Flush */
                         if (!dbg_vbo_draw((GLenum)r0, (GLsizei)r1, (GLenum)r2, idx))
