@@ -2675,11 +2675,47 @@ static unsigned long long jit_compile_ns_total(void)
    return dynarmic_a64_compile_ns() + dynarmic_a32_compile_ns();
 }
 
+/* Average length of a 1 ms sleep, in ms. */
+static double host_sleep1_ms(void)
+{
+   LARGE_INTEGER f, a, b;
+   QueryPerformanceFrequency(&f);
+   QueryPerformanceCounter(&a);
+   for (int i = 0; i < 20; ++i) Sleep(1);
+   QueryPerformanceCounter(&b);
+   return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart / 20.0;
+}
+
+/* Windows wakes a sleeping thread on its timer tick, 15.6 ms by default, so
+ * usleep(1000) and Sleep(1) take ~15.6 ms unless the process asks for a finer
+ * tick.  Every wait in Lunaria is built from those: the frame pump's idle
+ * steps, the audio pump that runs between them, guest nanosleep, condition
+ * timeouts.  On GitHub's runners a frame was ~24 ms with ~21 ms of it in
+ * those idle steps.  Ask for 1 ms, as games and emulators do while they run;
+ * Windows drops the request when the process exits.
+ * LUNARIA_TIMER_RES=0 leaves the system default (for A/B runs). */
+static void host_timer_resolution(void)
+{
+   const char *e = getenv("LUNARIA_TIMER_RES");
+   const double before = host_sleep1_ms();
+   if (e && e[0] == '0') {
+      fprintf(stderr, "[timer] left at the system default (LUNARIA_TIMER_RES=0): Sleep(1) = %.2f ms\n", before);
+      return;
+   }
+   typedef unsigned (WINAPI *period_fn)(unsigned);
+   HMODULE mm = LoadLibraryA("winmm.dll");
+   period_fn begin = mm ? (period_fn)(void *)GetProcAddress(mm, "timeBeginPeriod") : NULL;
+   const unsigned rc = begin ? begin(1) : 1u;
+   fprintf(stderr, "[timer] 1 ms timer %s: Sleep(1) = %.2f ms before, %.2f ms after\n",
+           rc == 0 ? "on" : "refused", before, host_sleep1_ms());
+}
+
 /* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
 int wmain(int argc, wchar_t *wide_argv[])
 {
    SetUnhandledExceptionFilter(crash_filter);
    AddVectoredExceptionHandler(0, crash_veh);
+   host_timer_resolution();
    luna_os_sampler_start(jit_compiles_total, jit_compile_ns_total);
    char **argv = calloc((size_t)argc + 1, sizeof *argv);
    if (!argv) return EXIT_FAILURE;
