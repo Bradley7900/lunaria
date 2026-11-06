@@ -184,6 +184,8 @@ static struct {
    EGLSurface pb[SLOTS];
    void *handle[SLOTS];
    GLuint tex[SLOTS], fbo;
+   int pending;      /* slot copied but not yet handed over, or -1 */
+   EGLSync fence;    /* signals when that copy is done */
 } g_gs;
 
 static void share_off(const char *why)
@@ -220,7 +222,9 @@ static bool share_submit(EGLContext ctx, int w, int h, int swap_interval)
          if (g_gs.ctx == ctx && g_gs.tex[i]) glDeleteTextures(1, &g_gs.tex[i]);
       }
       if (g_gs.ctx == ctx && g_gs.fbo) glDeleteFramebuffers(1, &g_gs.fbo);
+      if (g_gs.fence != EGL_NO_SYNC) eglDestroySync(g_guest_dpy, g_gs.fence);
       memset(&g_gs, 0, sizeof g_gs);
+      g_gs.pending = -1;
       const EGLint ca[] = {
          EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
          EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_BIND_TO_TEXTURE_RGBA, EGL_TRUE,
@@ -265,6 +269,15 @@ static bool share_submit(EGLContext ctx, int w, int h, int swap_interval)
               w, h, SLOTS);
    }
 
+   /* The previous frame was copied and fenced, not waited for: by now the
+    * GPU has normally finished it, so this wait is free and the guest never
+    * stalls on its own frame.  It reaches the compositor one submit late. */
+   if (g_gs.pending >= 0) {
+      eglClientWaitSync(g_guest_dpy, g_gs.fence, EGL_SYNC_FLUSH_COMMANDS_BIT, EGL_FOREVER);
+      eglDestroySync(g_guest_dpy, g_gs.fence);
+      g_gs.fence = EGL_NO_SYNC;
+   }
+
    pthread_mutex_lock(&g_mu);
    if (swap_interval > 0 && g_queued >= 0) {
       struct timespec until;
@@ -274,6 +287,15 @@ static bool share_submit(EGLContext ctx, int w, int h, int swap_interval)
       while (g_queued >= 0 &&
              pthread_cond_timedwait(&g_cv_guest, &g_mu, &until) != ETIMEDOUT) {
       }
+   }
+   if (g_gs.pending >= 0) {
+      const int p = g_gs.pending;
+      g_slot_handle[p] = g_gs.handle[p];
+      g_frame_w[p] = g_gs.w;
+      g_frame_h[p] = g_gs.h;
+      g_queued = p;
+      g_gs.pending = -1;
+      pthread_cond_signal(&g_cv_comp);
    }
    int slot = 0;
    while (slot == g_shown || slot == g_queued) ++slot;
@@ -296,9 +318,6 @@ static bool share_submit(EGLContext ctx, int w, int h, int swap_interval)
    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw);
    if (scissor) glEnable(GL_SCISSOR_TEST);
-   /* Another device reads the texture: the copy must be finished, not just
-    * queued, before the compositor is told about it. */
-   glFinish();
    const GLenum err = glGetError();
    if (err != GL_NO_ERROR) {
       char why[64];
@@ -306,6 +325,15 @@ static bool share_submit(EGLContext ctx, int w, int h, int swap_interval)
       share_off(why);
       return false;
    }
+   /* Another device reads the texture, so the copy must be finished before
+    * the compositor is told about it.  Fence it and publish next time. */
+   g_gs.fence = eglCreateSync(g_guest_dpy, EGL_SYNC_FENCE, NULL);
+   if (g_gs.fence != EGL_NO_SYNC) {
+      glFlush();
+      g_gs.pending = slot;
+      return true;
+   }
+   glFinish();
 
    pthread_mutex_lock(&g_mu);
    g_slot_handle[slot] = g_gs.handle[slot];
