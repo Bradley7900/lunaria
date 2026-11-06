@@ -319,10 +319,41 @@ static LONG CALLBACK lazy_veh(EXCEPTION_POINTERS *e)
    const int i = lazy_find(a);
    if (i < 0) return EXCEPTION_CONTINUE_SEARCH;
    MEMORY_BASIC_INFORMATION mi;
-   if (!VirtualQuery((void *)a, &mi, sizeof mi) || mi.State != MEM_RESERVE)
-      return EXCEPTION_CONTINUE_SEARCH;
-   return lazy_commit(i, a, 1) ? EXCEPTION_CONTINUE_EXECUTION
-                               : EXCEPTION_CONTINUE_SEARCH;
+   if (!VirtualQuery((void *)a, &mi, sizeof mi)) return EXCEPTION_CONTINUE_SEARCH;
+   if (mi.State == MEM_RESERVE)
+      return lazy_commit(i, a, 1) ? EXCEPTION_CONTINUE_EXECUTION
+                                  : EXCEPTION_CONTINUE_SEARCH;
+   /* Two threads can fault on the same reserved chunk: one commits it while
+    * the other's fault is still being dispatched, and the second then finds
+    * the page committed.  Its access was valid, so retry it.  Wait for any
+    * commit still in progress first, and retry only when the page's
+    * protection really allows this access, so a genuine protection fault
+    * still reaches the crash report instead of looping. */
+   AcquireSRWLockShared(&lazy_lock);
+   const BOOL q = VirtualQuery((void *)a, &mi, sizeof mi);
+   ReleaseSRWLockShared(&lazy_lock);
+   if (q && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+      const ULONG_PTR kind = r->ExceptionInformation[0];   /* 0 read, 1 write, 8 execute */
+      const DWORD pr = mi.Protect & 0xff;
+      const int can_write = pr == PAGE_READWRITE || pr == PAGE_WRITECOPY ||
+                            pr == PAGE_EXECUTE_READWRITE || pr == PAGE_EXECUTE_WRITECOPY;
+      const int can_exec = pr == PAGE_EXECUTE || pr == PAGE_EXECUTE_READ ||
+                           pr == PAGE_EXECUTE_READWRITE || pr == PAGE_EXECUTE_WRITECOPY;
+      if ((kind == 0 && pr != PAGE_EXECUTE) || (kind == 1 && can_write) ||
+          (kind == 8 && can_exec)) {
+         static volatile LONG raced;
+         if (InterlockedIncrement(&raced) <= 3)
+            fprintf(stderr, "[mem] lazy commit race at %p: committed by another thread, retrying\n",
+                    (void *)a);
+         return EXCEPTION_CONTINUE_EXECUTION;
+      }
+   }
+   static volatile LONG declined;
+   if (InterlockedIncrement(&declined) <= 3)
+      fprintf(stderr, "[mem] lazy range fault at %p not handled: state=0x%lx protect=0x%lx access=%llu\n",
+              (void *)a, q ? (unsigned long)mi.State : 0ul, q ? (unsigned long)mi.Protect : 0ul,
+              (unsigned long long)r->ExceptionInformation[0]);
+   return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static void *lazy_reserve(void *want, size_t len, int exact)
