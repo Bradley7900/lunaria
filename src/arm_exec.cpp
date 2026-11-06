@@ -57003,7 +57003,37 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
         now % 1'000'000'000ull * rate / 1'000'000'000ull;
     static uint64_t silent_end = 0;
     if (silent_end < silent_played) silent_end = silent_played;
-    const unsigned target = rate / 10u; // bound output latency to 100 ms
+    /* How much to keep queued.  The pump runs from the frame loop and the
+     * scheduler, not from a timer, so the queue must outlast the longest gap
+     * between two pumps or the device runs dry.  It used to be a flat 100 ms,
+     * which is also 100 ms between a sound starting in the game and the
+     * speaker.  Now it follows the recent worst gap: 1.5x that plus 10 ms,
+     * kept between 40 and 100 ms.  The peak halves every 5 s of wall time,
+     * so one hitch raises the queue at once and it comes back down over
+     * several seconds.  LUNARIA_AUDIO_MS pins it. */
+    static int fixed_ms = -1;
+    static uint64_t last_pump_ns;
+    static double gap_peak_ms = 100.0;
+    static uint64_t next_log_ns;
+    if (fixed_ms < 0) {
+        const char *e = lunaria_env("LUNARIA_AUDIO_MS");
+        fixed_ms = e && *e ? atoi(e) : 0;
+        if (fixed_ms < 0 || fixed_ms > 500) fixed_ms = 0;
+    }
+    if (last_pump_ns) {
+        const double gap_ms = (double)(now - last_pump_ns) / 1e6;
+        gap_peak_ms *= std::exp2(-gap_ms / 5000.0);
+        if (gap_ms < 1000.0 && gap_ms > gap_peak_ms) gap_peak_ms = gap_ms;
+    }
+    last_pump_ns = now;
+    double target_ms = fixed_ms ? (double)fixed_ms : gap_peak_ms * 1.5 + 10.0;
+    if (!fixed_ms) target_ms = target_ms < 40.0 ? 40.0 : target_ms > 100.0 ? 100.0 : target_ms;
+    const unsigned target = (unsigned)((double)rate * target_ms / 1000.0);
+    if (now >= next_log_ns) {
+        next_log_ns = now + 10'000'000'000ull;
+        fprintf(stderr, "[audio] queue target %.0f ms (pump gap peak %.1f ms)%s\n",
+                target_ms, gap_peak_ms, fixed_ms ? " pinned by LUNARIA_AUDIO_MS" : "");
+    }
     unsigned callbacks = 0;
     for (unsigned pass = 0; pass < 64u; ++pass) {
         /* Restart the scan after guest code: a callback can destroy a player,

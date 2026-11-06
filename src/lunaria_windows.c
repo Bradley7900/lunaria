@@ -1194,7 +1194,7 @@ static void win_audio_reap(void)
    }
 }
 
-int luna_os_audio_open(unsigned rate, unsigned channels)
+static int wo_audio_open(unsigned rate, unsigned channels)
 {
    AcquireSRWLockExclusive(&win_audio_lock);
    audio_saved_prefs();
@@ -1223,7 +1223,7 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
    return 0;
 }
 
-int luna_os_audio_write(const void *pcm16, unsigned frames)
+static int wo_audio_write(const void *pcm16, unsigned frames)
 {
    if (!pcm16 || !frames) return 0;
    AcquireSRWLockExclusive(&win_audio_lock);
@@ -1255,7 +1255,7 @@ int luna_os_audio_write(const void *pcm16, unsigned frames)
    return (int)accepted;
 }
 
-unsigned luna_os_audio_queued_frames(void)
+static unsigned wo_audio_queued_frames(void)
 {
    AcquireSRWLockExclusive(&win_audio_lock);
    win_audio_reap();
@@ -1267,7 +1267,7 @@ unsigned luna_os_audio_queued_frames(void)
    return frames;
 }
 
-uint64_t luna_os_audio_played_frames(void)
+static uint64_t wo_audio_played_frames(void)
 {
    AcquireSRWLockExclusive(&win_audio_lock);
    win_audio_reap();
@@ -1276,7 +1276,7 @@ uint64_t luna_os_audio_played_frames(void)
    return frames;
 }
 
-void luna_os_audio_close(void)
+static void wo_audio_close(void)
 {
    AcquireSRWLockExclusive(&win_audio_lock);
    if (win_audio) {
@@ -1290,6 +1290,225 @@ void luna_os_audio_close(void)
    memset(win_audio_headers, 0, sizeof win_audio_headers);
    win_audio_played = 0;
    ReleaseSRWLockExclusive(&win_audio_lock);
+}
+
+/* ---- WASAPI output ------------------------------------------------------
+ * waveOut goes through Windows' legacy mixer, which keeps its own buffers on
+ * top of the ones handed to it.  WASAPI shared mode writes straight into the
+ * audio engine's buffer and reports exactly how much is still queued, so the
+ * mixer's latency target is the real latency.  waveOut stays as the fallback
+ * (no endpoint, COM unavailable, LUNARIA_AUDIO_API=waveout).
+ *
+ * COM is loaded at run time so the link line does not change, and every call
+ * is non-blocking: GetCurrentPadding / GetBuffer / ReleaseBuffer only touch
+ * the shared buffer, which matters because the guest's execution lock is held
+ * while the pump writes.  A lost device (headphones unplugged) closes the
+ * stream; the next write after a second reopens it on the new default. */
+#define COBJMACROS
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
+#endif
+#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+#endif
+static const GUID luna_clsid_mmde = { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+static const GUID luna_iid_mmde   = { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+static const GUID luna_iid_client = { 0x1CB9AD4C, 0xDBFA, 0x4C32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
+static const GUID luna_iid_render = { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
+
+static IAudioClient *was_client;
+static IAudioRenderClient *was_render;
+static UINT32 was_capacity;              /* frames */
+static unsigned was_rate, was_channels;
+static uint64_t was_written, was_played_base;
+static int was_started;
+static uint64_t was_retry_ms;
+static unsigned long was_underruns;
+static int g_audio_backend;              /* 0 none, 1 WASAPI, 2 waveOut */
+
+static void was_release(void)
+{
+   if (was_client) IAudioClient_Stop(was_client);
+   if (was_render) IAudioRenderClient_Release(was_render);
+   if (was_client) IAudioClient_Release(was_client);
+   was_render = NULL;
+   was_client = NULL;
+   was_started = 0;
+}
+
+/* Called with win_audio_lock held. */
+static int was_open_locked(unsigned rate, unsigned channels)
+{
+   typedef HRESULT (WINAPI *init_fn)(LPVOID, DWORD);
+   typedef HRESULT (WINAPI *create_fn)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
+   static init_fn co_init;
+   static create_fn co_create;
+   static int loaded;
+   if (!loaded) {
+      loaded = 1;
+      HMODULE ole = LoadLibraryA("ole32.dll");
+      if (ole) {
+         co_init = (init_fn)(void *)GetProcAddress(ole, "CoInitializeEx");
+         co_create = (create_fn)(void *)GetProcAddress(ole, "CoCreateInstance");
+      }
+   }
+   if (!co_init || !co_create) return -1;
+   co_init(NULL, COINIT_MULTITHREADED);   /* S_FALSE / RPC_E_CHANGED_MODE are fine */
+
+   IMMDeviceEnumerator *en = NULL;
+   IMMDevice *dev = NULL;
+   HRESULT hr = co_create(&luna_clsid_mmde, NULL, CLSCTX_ALL, &luna_iid_mmde, (void **)&en);
+   if (SUCCEEDED(hr)) hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev);
+   if (SUCCEEDED(hr)) hr = IMMDevice_Activate(dev, &luna_iid_client, CLSCTX_ALL, NULL, (void **)&was_client);
+   if (dev) IMMDevice_Release(dev);
+   if (en) IMMDeviceEnumerator_Release(en);
+   if (FAILED(hr)) {
+      static int logged;
+      if (!logged++) fprintf(stderr, "[audio] WASAPI unavailable (0x%08lx), using waveOut\n", (unsigned long)hr);
+      was_release();
+      return -1;
+   }
+   WAVEFORMATEX f = { 0 };
+   f.wFormatTag = WAVE_FORMAT_PCM;
+   f.nChannels = (WORD)channels;
+   f.nSamplesPerSec = rate;
+   f.wBitsPerSample = 16;
+   f.nBlockAlign = (WORD)(channels * sizeof(int16_t));
+   f.nAvgBytesPerSec = rate * f.nBlockAlign;
+   /* Room for the mixer's largest target (100 ms) plus a margin; the mixer,
+    * not this size, decides how much is actually queued. */
+   const REFERENCE_TIME span = 150 * 10000;
+   hr = IAudioClient_Initialize(was_client, AUDCLNT_SHAREMODE_SHARED,
+                                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                span, 0, &f, NULL);
+   if (SUCCEEDED(hr)) hr = IAudioClient_GetBufferSize(was_client, &was_capacity);
+   if (SUCCEEDED(hr)) hr = IAudioClient_GetService(was_client, &luna_iid_render, (void **)&was_render);
+   if (FAILED(hr)) {
+      fprintf(stderr, "[audio] WASAPI stream setup failed (0x%08lx), using waveOut\n", (unsigned long)hr);
+      was_release();
+      return -1;
+   }
+   REFERENCE_TIME engine = 0;
+   IAudioClient_GetStreamLatency(was_client, &engine);
+   was_rate = rate;
+   was_channels = channels;
+   was_played_base = was_written;
+   fprintf(stderr, "[audio] WASAPI shared: %u Hz, %u ch, buffer %u frames (%.1f ms), engine latency %.1f ms\n",
+           rate, channels, (unsigned)was_capacity, was_capacity * 1000.0 / rate, engine / 10000.0);
+   return 0;
+}
+
+static int was_reopen_locked(void)
+{
+   const uint64_t now = GetTickCount64();
+   if (now < was_retry_ms) return -1;
+   was_retry_ms = now + 1000;
+   return was_open_locked(was_rate, was_channels);
+}
+
+static unsigned was_padding_locked(void)
+{
+   if (!was_client && was_reopen_locked() != 0) return 0;
+   UINT32 pad = 0;
+   const HRESULT hr = IAudioClient_GetCurrentPadding(was_client, &pad);
+   if (FAILED(hr)) {
+      fprintf(stderr, "[audio] WASAPI device lost (0x%08lx), reopening\n", (unsigned long)hr);
+      /* Whatever was queued on the lost device is gone. */
+      was_played_base = was_written;
+      was_release();
+      return 0;
+   }
+   return pad;
+}
+
+static int was_write_locked(const int16_t *src, unsigned frames, int gain)
+{
+   const unsigned pad = was_padding_locked();
+   if (!was_client) return 0;
+   if (was_started && pad == 0) {
+      ++was_underruns;
+      if (was_underruns <= 3 || !(was_underruns & (was_underruns - 1)))
+         fprintf(stderr, "[audio] underrun #%lu (the buffer ran dry before the next mix)\n", was_underruns);
+   }
+   unsigned n = was_capacity - pad;
+   if (n > frames) n = frames;
+   if (!n) return 0;
+   BYTE *dst = NULL;
+   if (FAILED(IAudioRenderClient_GetBuffer(was_render, n, &dst)) || !dst) return 0;
+   int16_t *out = (int16_t *)dst;
+   for (unsigned i = 0; i < n * was_channels; ++i)
+      out[i] = (int16_t)((int32_t)src[i] * gain / 32768);
+   IAudioRenderClient_ReleaseBuffer(was_render, n, 0);
+   was_written += n;
+   if (!was_started && SUCCEEDED(IAudioClient_Start(was_client))) was_started = 1;
+   return (int)n;
+}
+
+int luna_os_audio_open(unsigned rate, unsigned channels)
+{
+   if (!rate) rate = 48000;
+   if (channels < 1 || channels > 8) channels = 2;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   audio_saved_prefs();
+   if (g_audio_backend) { ReleaseSRWLockExclusive(&win_audio_lock); return 0; }
+   const char *api = getenv("LUNARIA_AUDIO_API");
+   const int want_waveout = api && (!_stricmp(api, "waveout") || !_stricmp(api, "winmm"));
+   if (!want_waveout && was_open_locked(rate, channels) == 0) {
+      g_audio_backend = 1;
+      ReleaseSRWLockExclusive(&win_audio_lock);
+      return 0;
+   }
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   if (wo_audio_open(rate, channels) != 0) return -1;
+   g_audio_backend = 2;
+   fprintf(stderr, "[audio] waveOut: %u Hz, %u ch\n", rate, channels);
+   return 0;
+}
+
+int luna_os_audio_write(const void *pcm16, unsigned frames)
+{
+   if (g_audio_backend != 1) return g_audio_backend == 2 ? wo_audio_write(pcm16, frames) : 0;
+   if (!pcm16 || !frames) return 0;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   const int gain = g_win_muted || !strcmp(g_win_audio_dev, "off") ? 0 : (int)(g_win_gain * 32768.0f);
+   const int n = was_write_locked((const int16_t *)pcm16, frames, gain);
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   return n;
+}
+
+unsigned luna_os_audio_queued_frames(void)
+{
+   if (g_audio_backend != 1) return g_audio_backend == 2 ? wo_audio_queued_frames() : 0;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   const unsigned pad = was_padding_locked();
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   return pad;
+}
+
+uint64_t luna_os_audio_played_frames(void)
+{
+   if (g_audio_backend != 1) return g_audio_backend == 2 ? wo_audio_played_frames() : 0;
+   AcquireSRWLockExclusive(&win_audio_lock);
+   const unsigned pad = was_padding_locked();
+   const uint64_t queued_total = was_written - was_played_base;
+   const uint64_t played = was_played_base + (queued_total > pad ? queued_total - pad : 0);
+   ReleaseSRWLockExclusive(&win_audio_lock);
+   return played;
+}
+
+void luna_os_audio_close(void)
+{
+   if (g_audio_backend == 2) wo_audio_close();
+   if (g_audio_backend == 1) {
+      AcquireSRWLockExclusive(&win_audio_lock);
+      was_release();
+      was_written = was_played_base = 0;
+      ReleaseSRWLockExclusive(&win_audio_lock);
+   }
+   g_audio_backend = 0;
 }
 
 /* Windows file operations. */
