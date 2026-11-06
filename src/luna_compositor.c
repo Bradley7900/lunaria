@@ -407,6 +407,13 @@ static bool share_choose(void)
    default: {
       if (now - t0 < PICK_WINDOW_NS) return false;
       const double pixel_fps = (frames - f0) * 1e9 / (double)(now - t0);
+      phase = 0;
+      /* Still loading (a few frames a second on both): says nothing about
+       * either path.  Keep the current pick and look again soon. */
+      if (shared_fps < 10.0 && pixel_fps < 10.0) {
+         next_check = now + 15ull * 1000000000ull;
+         return pick;
+      }
       const bool was = pick;
       pick = shared_fps >= pixel_fps * 0.95;
       static bool logged;

@@ -3759,12 +3759,12 @@ void *luna_os_library_loaded_symbol(const char *module, const char *name)
 #define SAMP_THREADS 256
 #define SAMP_MODS    48
 #define SAMP_RVAS    (1u << 16)
-static struct { DWORD tid; HANDLE h; ULONG64 cycles; char name[48]; unsigned long n; } samp_t[SAMP_THREADS];
+static struct { DWORD tid; HANDLE h; ULONG64 cycles; char name[48]; unsigned long long n; } samp_t[SAMP_THREADS];
 static int samp_nt;
-static struct { uintptr_t lo, hi; char name[48]; unsigned long n; } samp_m[SAMP_MODS];
+static struct { uintptr_t lo, hi; char name[48]; unsigned long long n; } samp_m[SAMP_MODS];
 static int samp_nm;
-static struct { uint32_t rva, n; } samp_rva[SAMP_RVAS];
-static unsigned long samp_total, samp_anon;
+static struct { uint32_t rva; unsigned long long n; } samp_rva[SAMP_RVAS];
+static unsigned long long samp_total, samp_anon;
 
 static void samp_threads_refresh(DWORD self)
 {
@@ -3803,19 +3803,21 @@ static void samp_threads_refresh(DWORD self)
    CloseHandle(snap);
 }
 
-static void samp_note(uintptr_t pc, uintptr_t exe_lo, uintptr_t exe_hi)
+/* w: the thread's CPU kilocycles since the last look, so a thread that
+ * barely ran (a wake-up to check a timer) weighs next to nothing. */
+static void samp_note(uintptr_t pc, unsigned long long w, uintptr_t exe_lo, uintptr_t exe_hi)
 {
-   ++samp_total;
+   samp_total += w;
    if (pc >= exe_lo && pc < exe_hi) {
       uint32_t rva = (uint32_t)(pc - exe_lo);
       uint32_t k = (rva * 2654435761u) >> 16;
       for (uint32_t probe = 0; probe < SAMP_RVAS; ++probe, k = (k + 1) & (SAMP_RVAS - 1)) {
-         if (samp_rva[k].n == 0) { samp_rva[k].rva = rva; samp_rva[k].n = 1; break; }
-         if (samp_rva[k].rva == rva) { ++samp_rva[k].n; break; }
+         if (samp_rva[k].n == 0) { samp_rva[k].rva = rva; samp_rva[k].n = w; break; }
+         if (samp_rva[k].rva == rva) { samp_rva[k].n += w; break; }
       }
    }
    for (int i = 0; i < samp_nm; ++i)
-      if (pc >= samp_m[i].lo && pc < samp_m[i].hi) { ++samp_m[i].n; return; }
+      if (pc >= samp_m[i].lo && pc < samp_m[i].hi) { samp_m[i].n += w; return; }
    HMODULE m = NULL;
    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -3829,25 +3831,25 @@ static void samp_note(uintptr_t pc, uintptr_t exe_lo, uintptr_t exe_hi)
          samp_m[samp_nm].lo = (uintptr_t)mi.lpBaseOfDll;
          samp_m[samp_nm].hi = (uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage;
          snprintf(samp_m[samp_nm].name, sizeof samp_m[samp_nm].name, "%s", base);
-         samp_m[samp_nm].n = 1;
+         samp_m[samp_nm].n = w;
          ++samp_nm;
          return;
       }
    }
-   ++samp_anon;
+   samp_anon += w;
 }
 
 static int samp_cmp_desc(const void *a, const void *b)
 {
-   const unsigned long x = *(const unsigned long *)a, y = *(const unsigned long *)b;
+   const unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
    return x < y ? 1 : x > y ? -1 : 0;
 }
 
 static void samp_report(int seconds, uintptr_t exe_lo)
 {
    if (!samp_total) return;
-   fprintf(stderr, "[sample] t=%ds %lu samples. by module:\n", seconds, samp_total);
-   struct { unsigned long n; int i; } order[SAMP_MODS + 1];
+   fprintf(stderr, "[sample] t=%ds %.1f Gcycles of CPU sampled. by module:\n", seconds, samp_total / 1e6);
+   struct { unsigned long long n; int i; } order[SAMP_MODS + 1];
    int k = 0;
    for (int i = 0; i < samp_nm; ++i) { order[k].n = samp_m[i].n; order[k].i = i; ++k; }
    order[k].n = samp_anon; order[k].i = -1; ++k;
@@ -3857,7 +3859,7 @@ static void samp_report(int seconds, uintptr_t exe_lo)
       fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * order[j].n / samp_total,
               order[j].i < 0 ? "(no module: translated guest code)" : samp_m[order[j].i].name);
    }
-   struct { unsigned long n; int i; } tord[SAMP_THREADS];
+   struct { unsigned long long n; int i; } tord[SAMP_THREADS];
    for (int i = 0; i < samp_nt; ++i) { tord[i].n = samp_t[i].n; tord[i].i = i; }
    qsort(tord, (size_t)samp_nt, sizeof tord[0], samp_cmp_desc);
    fprintf(stderr, "[sample] by thread:\n");
@@ -3872,9 +3874,9 @@ static void samp_report(int seconds, uintptr_t exe_lo)
       snprintf(path, sizeof path, "%s/sample-exe.txt", dir);
       FILE *f = fopen(path, "w");
       if (f) {
-         fprintf(f, "# lunaria.exe base %p, samples %lu, rva count\n", (void *)exe_lo, samp_total);
+         fprintf(f, "# lunaria.exe base %p, kcycles %llu, rva kcycles\n", (void *)exe_lo, samp_total);
          for (uint32_t i = 0; i < SAMP_RVAS; ++i)
-            if (samp_rva[i].n) fprintf(f, "%x %u\n", samp_rva[i].rva, samp_rva[i].n);
+            if (samp_rva[i].n) fprintf(f, "%x %llu\n", samp_rva[i].rva, samp_rva[i].n);
          fclose(f);
       }
    }
@@ -3896,7 +3898,9 @@ static DWORD WINAPI samp_thread(void *arg)
       for (int i = 0; i < samp_nt; ++i) {
          ULONG64 cycles = 0;
          if (!QueryThreadCycleTime(samp_t[i].h, &cycles) || cycles == samp_t[i].cycles) continue;
+         const unsigned long long w = (cycles - samp_t[i].cycles) / 1000;
          samp_t[i].cycles = cycles;
+         if (!w) continue;
          if (SuspendThread(samp_t[i].h) == (DWORD)-1) continue;
          CONTEXT c;
          memset(&c, 0, sizeof c);
@@ -3906,13 +3910,13 @@ static DWORD WINAPI samp_thread(void *arg)
          /* Resolved after the resume: naming a module takes the loader lock,
           * which the stopped thread may hold. */
          if (!got) continue;
-         ++samp_t[i].n;
+         samp_t[i].n += w;
 #if defined(_M_X64) || defined(__x86_64__)
-         samp_note((uintptr_t)c.Rip, exe_lo, exe_hi);
+         samp_note((uintptr_t)c.Rip, w, exe_lo, exe_hi);
 #elif defined(_M_ARM64) || defined(__aarch64__)
-         samp_note((uintptr_t)c.Pc, exe_lo, exe_hi);
+         samp_note((uintptr_t)c.Pc, w, exe_lo, exe_hi);
 #else
-         samp_note((uintptr_t)c.Eip, exe_lo, exe_hi);
+         samp_note((uintptr_t)c.Eip, w, exe_lo, exe_hi);
 #endif
       }
       if (now >= next_report) {
