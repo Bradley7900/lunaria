@@ -13,6 +13,7 @@
  */
 #include "luna_texcache.h"
 #include "third_party/astcenc/astcenc.h"
+#include <string.h>                    /* stb_dxt uses memcpy without including it */
 #define STB_DXT_IMPLEMENTATION
 #include "lib/stb_dxt.h"
 
