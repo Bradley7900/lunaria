@@ -3379,6 +3379,8 @@ static const char *guest_pc_lr_str(void) {
              g_current_tid);
     return buf;
 }
+/* The crashing thread's guest position, for the Windows crash filter. */
+extern "C" const char *arm_exec_guest_state(void) { return guest_pc_lr_str(); }
 // Dump the A64 register file of the running JIT.
 static void (*g_a64_regdump)(const char *why) = nullptr;
 /* The faulting thread's guest call chain, for the same reason: a bad pointer

@@ -2537,9 +2537,83 @@ main(int argc, const char *argv[])
 }
 
 #ifdef _WIN32
+/* A host crash on Windows otherwise ends the process with no word at all:
+ * there is no SIGSEGV report here and stderr is the only log a person has.
+ * This is the last-chance filter, so faults the JIT or the OS handle first
+ * never reach it.  It names the faulting module+offset (resolvable against a
+ * map file or an unstripped build), the guest pc/lr of the crashing thread,
+ * and walks a few host frames. */
+const char *arm_exec_guest_state(void);
+static void crash_module(const void *addr, char *name, size_t cap, uintptr_t *base)
+{
+   HMODULE module = NULL;
+   name[0] = 0; *base = 0;
+   if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &module) || !module) {
+      snprintf(name, cap, "?");
+      return;
+   }
+   char path[MAX_PATH];
+   DWORD n = GetModuleFileNameA(module, path, sizeof path);
+   const char *slash = n ? strrchr(path, '\\') : NULL;
+   snprintf(name, cap, "%s", n ? (slash ? slash + 1 : path) : "?");
+   *base = (uintptr_t)module;
+}
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
+{
+   static volatile LONG once;
+   if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+   EXCEPTION_RECORD *rec = info->ExceptionRecord;
+   CONTEXT ctx = *info->ContextRecord;
+   char module[128];
+   uintptr_t base;
+   crash_module(rec->ExceptionAddress, module, sizeof module, &base);
+   fprintf(stderr, "[crash] exception 0x%08lx at %p (%s+0x%llx) thread %lu\n",
+           (unsigned long)rec->ExceptionCode, rec->ExceptionAddress, module,
+           (unsigned long long)((uintptr_t)rec->ExceptionAddress - base),
+           (unsigned long)GetCurrentThreadId());
+   if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
+      fprintf(stderr, "[crash] %s of address 0x%llx\n",
+              rec->ExceptionInformation[0] == 0 ? "read" :
+              rec->ExceptionInformation[0] == 1 ? "write" : "execute",
+              (unsigned long long)rec->ExceptionInformation[1]);
+   fprintf(stderr, "[crash] guest %s\n", arm_exec_guest_state());
+   fprintf(stderr, "[crash] rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx\n"
+                   "[crash] rsp=%llx rbp=%llx r8=%llx r9=%llx r12=%llx r13=%llx\n",
+           (unsigned long long)ctx.Rax, (unsigned long long)ctx.Rbx,
+           (unsigned long long)ctx.Rcx, (unsigned long long)ctx.Rdx,
+           (unsigned long long)ctx.Rsi, (unsigned long long)ctx.Rdi,
+           (unsigned long long)ctx.Rsp, (unsigned long long)ctx.Rbp,
+           (unsigned long long)ctx.R8, (unsigned long long)ctx.R9,
+           (unsigned long long)ctx.R12, (unsigned long long)ctx.R13);
+   for (int frame = 0; frame < 24 && ctx.Rip; frame++) {
+      crash_module((void *)ctx.Rip, module, sizeof module, &base);
+      fprintf(stderr, "[crash] #%d %s+0x%llx\n", frame, module,
+              (unsigned long long)(ctx.Rip - base));
+      DWORD64 image = 0;
+      RUNTIME_FUNCTION *fn = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
+      if (!fn) {
+         /* A leaf, or JIT code with no unwind data: take the return address
+          * off the stack once, then stop if that does not land in a module. */
+         if (!base) break;
+         ctx.Rip = *(DWORD64 *)ctx.Rsp;
+         ctx.Rsp += 8;
+         continue;
+      }
+      void *handler_data = NULL;
+      DWORD64 establisher = 0;
+      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx,
+                       &handler_data, &establisher, NULL);
+   }
+   fflush(stderr);
+   return EXCEPTION_CONTINUE_SEARCH;
+}
+
 /* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
 int wmain(int argc, wchar_t *wide_argv[])
 {
+   SetUnhandledExceptionFilter(crash_filter);
    char **argv = calloc((size_t)argc + 1, sizeof *argv);
    if (!argv) return EXIT_FAILURE;
    for (int i = 0; i < argc; i++) {
