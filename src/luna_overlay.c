@@ -2042,6 +2042,12 @@ static const char *const astc_names[] = {"Convert to BC3", "Convert, uncompresse
 static const char *const astc_envs[] = {NULL, "rgba", "0"};
 static const char *const cache_names[] = {"On", "Off"};
 static const char *const cache_envs[] = {NULL, "0"};
+#ifdef _WIN32
+/* The same choice as the launcher's "Graphics" field: what ANGLE draws with.
+ * DirectX 11 stays the default (ES 3.1); Vulkan gives ES 3.2. Restart. */
+static const char *const backend_names[] = {"DirectX 11", "Vulkan"};
+static const char *const backend_envs[] = {NULL, "vulkan"};
+#endif
 static struct menu_setting g_settings[] = {
    SETTING("LUNARIA_MEM_TOTAL_MB", "Memory reported to Android (MiB)", ram_choices),
    SETTING("LUNARIA_CPU_COUNT", "CPU cores reported to Android", cpu_choices),
@@ -2051,6 +2057,9 @@ static struct menu_setting g_settings[] = {
    SETTING_NAMED("LUNARIA_ETC_LOSSY", "ETC textures", etc_names, etc_envs),
    SETTING_NAMED("LUNARIA_ASTC", "ASTC textures", astc_names, astc_envs),
    SETTING_NAMED("LUNARIA_TEXCACHE", "Converted texture cache", cache_names, cache_envs),
+#ifdef _WIN32
+   SETTING_NAMED("LUNARIA_ANGLE_BACKEND", "Graphics backend", backend_names, backend_envs),
+#endif
 };
 #undef SETTING
 static void settings_load(void)
