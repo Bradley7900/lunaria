@@ -2018,11 +2018,19 @@ static ptrdiff_t io_note(int kind, LONG64 t0, ptrdiff_t result)
    return result;
 }
 
+#define PIO_FALLBACK PTRDIFF_MIN
+static int pio_cache_on(void);
+static ptrdiff_t pio_cached(int fd, HANDLE native, void *buffer, size_t length, int64_t offset, int writing);
+
 static ptrdiff_t file_positional_io(int fd, void *buffer, size_t length, int64_t offset, int writing)
 {
    if (offset < 0) { errno = EINVAL; return -1; }
    intptr_t native = file_descriptor_handle(fd);
    if (native == -1) { errno = EBADF; return -1; }
+   if (pio_cache_on()) {
+      const ptrdiff_t r = pio_cached(fd, (HANDLE)native, buffer, length, offset, writing);
+      if (r != PIO_FALLBACK) return r;
+   }
    if (GetFileType((HANDLE)native) != FILE_TYPE_DISK) { errno = ESPIPE; return -1; }
    typedef NTSTATUS (NTAPI *query_file_fn)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
                                           FILE_INFORMATION_CLASS);
@@ -2101,6 +2109,12 @@ struct file_description_state {
    HANDLE handle;
    SRWLOCK operation_lock;
    int kind, status, status_known;
+   /* pread/pwrite: an overlapped handle per direction, opened on first use
+    * and closed with the description, plus the two facts every call used to
+    * ask the kernel for again (file type + 1, and the access mask). */
+   HANDLE positional[2];
+   DWORD file_type1, access;
+   int access_known;
 };
 static struct {
    HANDLE handle;
@@ -2115,6 +2129,8 @@ static void file_description_release_locked(struct file_description_state *state
          OVERLAPPED region = { 0 }; region.OffsetHigh = 0x80000000;
          UnlockFileEx(state->handle, 0, 1, 0, &region);
       }
+      if (state->positional[0]) CloseHandle(state->positional[0]);
+      if (state->positional[1]) CloseHandle(state->positional[1]);
       CloseHandle(state->handle); free(state);
    }
 }
@@ -2172,6 +2188,102 @@ static void file_description_duplicate(int target, HANDLE handle, struct file_de
    if (state) ++state->references;
    ReleaseSRWLockExclusive(&file_description_lock);
 }
+/* Positional I/O through a handle kept with the open file description.  The
+ * uncached path in file_positional_io reopens the file, creates an event and closes both on
+ * every call - eight kernel calls for one read, paid thousands of times a
+ * second by a game that streams assets or keeps an SQLite database.  Here the
+ * overlapped handle, the file type and the access mask are looked up once per
+ * description and the event once per thread.  LUNARIA_PIO_CACHE=0 restores
+ * the old path; anything unexpected falls back to it. */
+static int pio_cache_state = -1;
+static int pio_cache_on(void)
+{
+   if (pio_cache_state < 0) {
+      const char *e = getenv("LUNARIA_PIO_CACHE");
+      pio_cache_state = !(e && e[0] == '0');
+   }
+   return pio_cache_state;
+}
+static DWORD pio_fls = FLS_OUT_OF_INDEXES;
+static INIT_ONCE pio_fls_once = INIT_ONCE_STATIC_INIT;
+static void WINAPI pio_fls_free(void *event) { if (event) CloseHandle((HANDLE)event); }
+static BOOL CALLBACK pio_fls_init(PINIT_ONCE once, void *param, void **context)
+{
+   (void)once; (void)param; (void)context;
+   pio_fls = FlsAlloc(pio_fls_free);
+   return TRUE;
+}
+static HANDLE pio_event(void)
+{
+   InitOnceExecuteOnce(&pio_fls_once, pio_fls_init, NULL, NULL);
+   if (pio_fls == FLS_OUT_OF_INDEXES) return NULL;
+   HANDLE event = (HANDLE)FlsGetValue(pio_fls);
+   if (!event) {
+      event = CreateEventW(NULL, TRUE, FALSE, NULL);
+      if (event && !FlsSetValue(pio_fls, event)) { CloseHandle(event); event = NULL; }
+   }
+   return event;
+}
+static ptrdiff_t pio_cached(int fd, HANDLE native, void *buffer, size_t length, int64_t offset, int writing)
+{
+   struct file_description_state *state = file_description_acquire(fd, native);
+   if (!state) return PIO_FALLBACK;
+   ptrdiff_t result = PIO_FALLBACK;
+   AcquireSRWLockExclusive(&file_description_lock);
+   DWORD type1 = state->file_type1, access = state->access;
+   int access_known = state->access_known;
+   HANDLE handle = state->positional[writing];
+   ReleaseSRWLockExclusive(&file_description_lock);
+   if (!type1) type1 = GetFileType(native) + 1;
+   if (type1 != FILE_TYPE_DISK + 1) { errno = ESPIPE; result = -1; goto done; }
+   if (!access_known) {
+      typedef NTSTATUS (NTAPI *query_file_fn)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                             FILE_INFORMATION_CLASS);
+      static query_file_fn query;
+      if (!query) query = (query_file_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                                                "NtQueryInformationFile");
+      FILE_ACCESS_INFORMATION info;
+      IO_STATUS_BLOCK status;
+      if (!query || query(native, &status, &info, sizeof info, FileAccessInformation) < 0) goto done;
+      access = info.AccessFlags;
+      access_known = 1;
+   }
+   if (!(access & (writing ? FILE_WRITE_DATA : FILE_READ_DATA))) { errno = EBADF; result = -1; goto done; }
+   if (!handle) {
+      HANDLE fresh = ReOpenFile(native, writing ? GENERIC_WRITE : GENERIC_READ,
+         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OVERLAPPED);
+      if (fresh == INVALID_HANDLE_VALUE) goto done;
+      AcquireSRWLockExclusive(&file_description_lock);
+      if (state->positional[writing]) { handle = state->positional[writing]; CloseHandle(fresh); }
+      else handle = state->positional[writing] = fresh;
+      ReleaseSRWLockExclusive(&file_description_lock);
+   }
+   AcquireSRWLockExclusive(&file_description_lock);
+   state->file_type1 = type1; state->access = access; state->access_known = access_known;
+   ReleaseSRWLockExclusive(&file_description_lock);
+   {
+      OVERLAPPED operation = { 0 };
+      operation.Offset = (DWORD)offset;
+      operation.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+      operation.hEvent = pio_event();
+      if (!operation.hEvent) goto done;
+      DWORD count = 0, request = length > INT_MAX ? INT_MAX : (DWORD)length;
+      luna_lazy_ensure(buffer, request);
+      BOOL ok = writing ? WriteFile(handle, buffer, request, &count, &operation)
+                        : ReadFile(handle, buffer, request, &count, &operation);
+      DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+      if (!ok && error == ERROR_IO_PENDING) {
+         ok = GetOverlappedResult(handle, &operation, &count, TRUE);
+         error = ok ? ERROR_SUCCESS : GetLastError();
+      }
+      if (ok || (!writing && error == ERROR_HANDLE_EOF)) result = count;
+      else result = luna_file_error(error);
+   }
+done:
+   file_description_release(state);
+   return result;
+}
+
 static int file_status_register(int fd, int flags)
 {
    HANDLE handle = (HANDLE)file_descriptor_handle(fd);
@@ -4056,10 +4168,56 @@ static DWORD WINAPI samp_thread(void *arg)
    return 0;
 }
 
+/* LUNARIA_DBG_IOBENCH=1: at start, time random 4 KB pread/pwrite on an 8 MB
+ * temp file through luna_file_pread/pwrite, with the per-description handle
+ * cache off and on, twice each, then carry on. */
+static void pio_bench(void)
+{
+   char dir[MAX_PATH], path[MAX_PATH + 32];
+   if (!GetTempPathA(sizeof dir, dir)) return;
+   snprintf(path, sizeof path, "%slunaria-iobench-%lu.bin", dir, (unsigned long)GetCurrentProcessId());
+   for (char *c = path; *c; ++c) if (*c == '\\') *c = '/';
+   int fd = luna_file_open(path, _O_RDWR | _O_CREAT | _O_TRUNC, 0644);
+   if (fd < 0) { fprintf(stderr, "[iobench] cannot create %s\n", path); return; }
+   static char block[4096];
+   memset(block, 0x5a, sizeof block);
+   for (int i = 0; i < 2048; ++i) luna_fd_write(fd, block, sizeof block);
+   LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+   const int saved = pio_cache_on();
+   for (int round = 0; round < 4; ++round) {
+      pio_cache_state = round & 1;
+      unsigned x = 12345u + (unsigned)round;
+      int bad = 0;
+      LONG64 t0 = io_now();
+      for (int i = 0; i < 3000; ++i) {
+         x = x * 1103515245u + 12345u;
+         if (luna_file_pread(fd, block, sizeof block, (int64_t)((x >> 8) % 2048) * 4096) != 4096) ++bad;
+      }
+      LONG64 t1 = io_now();
+      for (int i = 0; i < 1000; ++i) {
+         x = x * 1103515245u + 12345u;
+         if (luna_file_pwrite(fd, block, sizeof block, (int64_t)((x >> 8) % 2048) * 4096) != 4096) ++bad;
+      }
+      LONG64 t2 = io_now();
+      fprintf(stderr, "[iobench] %-16s pread %.2f us/call, pwrite %.2f us/call%s\n",
+              round & 1 ? "cached handle" : "reopen per call",
+              (t1 - t0) * 1e6 / f.QuadPart / 3000, (t2 - t1) * 1e6 / f.QuadPart / 1000,
+              bad ? " (SOME CALLS FAILED)" : "");
+   }
+   pio_cache_state = saved;
+   {   /* the position read()/write() see must not have moved */
+      const long long pos = _lseeki64(fd, 0, SEEK_CUR);
+      fprintf(stderr, "[iobench] file position after positional I/O: %lld (expect %d)\n", pos, 2048 * 4096);
+   }
+   luna_fd_close(fd);
+   DeleteFileA(path);
+}
+
 void luna_os_sampler_start(unsigned long long (*jit_count)(void), unsigned long long (*jit_ns)(void))
 {
    samp_jit_count = jit_count;
    samp_jit_ns = jit_ns;
+   if (getenv("LUNARIA_DBG_IOBENCH")) pio_bench();
    const char *v = getenv("LUNARIA_SAMPLE");
    const int ms = v ? atoi(v) : 0;
    if (ms <= 0) return;
