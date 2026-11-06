@@ -3747,3 +3747,191 @@ void *luna_os_library_loaded_symbol(const char *module, const char *name)
    free(wide);
    return handle ? (void *)GetProcAddress(handle, name) : NULL;
 }
+
+/* ---- LUNARIA_SAMPLE=MS: where the CPU time goes ---------------------------
+ *
+ * Every MS milliseconds, stop each thread of this process for a moment and
+ * note where it was.  A thread that did not run since the last look (its
+ * cycle counter did not move) is skipped, so blocked threads do not count.
+ * Every 30 s the totals go to stderr by module (no module = translated guest
+ * code) and by thread, and every lunaria.exe hit, by RVA, goes to
+ * $LUNARIA_DUMP_DIR/sample-exe.txt for symbolising offline.  Debug only. */
+#define SAMP_THREADS 256
+#define SAMP_MODS    48
+#define SAMP_RVAS    (1u << 16)
+static struct { DWORD tid; HANDLE h; ULONG64 cycles; char name[48]; unsigned long n; } samp_t[SAMP_THREADS];
+static int samp_nt;
+static struct { uintptr_t lo, hi; char name[48]; unsigned long n; } samp_m[SAMP_MODS];
+static int samp_nm;
+static struct { uint32_t rva, n; } samp_rva[SAMP_RVAS];
+static unsigned long samp_total, samp_anon;
+
+static void samp_threads_refresh(DWORD self)
+{
+   typedef HRESULT (WINAPI *desc_fn)(HANDLE, PWSTR *);
+   static desc_fn get_desc;
+   if (!get_desc)
+      get_desc = (desc_fn)(uintptr_t)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"),
+                                                    "GetThreadDescription");
+   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+   if (snap == INVALID_HANDLE_VALUE) return;
+   THREADENTRY32 te;
+   te.dwSize = sizeof te;
+   const DWORD pid = GetCurrentProcessId();
+   for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+      if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+      int known = 0;
+      for (int i = 0; i < samp_nt; ++i) known |= samp_t[i].tid == te.th32ThreadID;
+      if (known || samp_nt >= SAMP_THREADS) continue;
+      HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                            THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+      if (!h) continue;
+      samp_t[samp_nt].tid = te.th32ThreadID;
+      samp_t[samp_nt].h = h;
+      QueryThreadCycleTime(h, &samp_t[samp_nt].cycles);
+      snprintf(samp_t[samp_nt].name, sizeof samp_t[samp_nt].name, "tid%lu",
+               (unsigned long)te.th32ThreadID);
+      PWSTR wide = NULL;
+      if (get_desc && SUCCEEDED(get_desc(h, &wide)) && wide) {
+         if (wide[0])
+            WideCharToMultiByte(CP_UTF8, 0, wide, -1, samp_t[samp_nt].name,
+                                sizeof samp_t[samp_nt].name - 1, NULL, NULL);
+         LocalFree(wide);
+      }
+      ++samp_nt;
+   }
+   CloseHandle(snap);
+}
+
+static void samp_note(uintptr_t pc, uintptr_t exe_lo, uintptr_t exe_hi)
+{
+   ++samp_total;
+   if (pc >= exe_lo && pc < exe_hi) {
+      uint32_t rva = (uint32_t)(pc - exe_lo);
+      uint32_t k = (rva * 2654435761u) >> 16;
+      for (uint32_t probe = 0; probe < SAMP_RVAS; ++probe, k = (k + 1) & (SAMP_RVAS - 1)) {
+         if (samp_rva[k].n == 0) { samp_rva[k].rva = rva; samp_rva[k].n = 1; break; }
+         if (samp_rva[k].rva == rva) { ++samp_rva[k].n; break; }
+      }
+   }
+   for (int i = 0; i < samp_nm; ++i)
+      if (pc >= samp_m[i].lo && pc < samp_m[i].hi) { ++samp_m[i].n; return; }
+   HMODULE m = NULL;
+   if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          (LPCWSTR)pc, &m) && m && samp_nm < SAMP_MODS) {
+      MODULEINFO mi;
+      char path[MAX_PATH];
+      if (GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof mi) &&
+          GetModuleFileNameA(m, path, sizeof path)) {
+         const char *base = strrchr(path, '\\');
+         base = base ? base + 1 : path;
+         samp_m[samp_nm].lo = (uintptr_t)mi.lpBaseOfDll;
+         samp_m[samp_nm].hi = (uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage;
+         snprintf(samp_m[samp_nm].name, sizeof samp_m[samp_nm].name, "%s", base);
+         samp_m[samp_nm].n = 1;
+         ++samp_nm;
+         return;
+      }
+   }
+   ++samp_anon;
+}
+
+static int samp_cmp_desc(const void *a, const void *b)
+{
+   const unsigned long x = *(const unsigned long *)a, y = *(const unsigned long *)b;
+   return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void samp_report(int seconds, uintptr_t exe_lo)
+{
+   if (!samp_total) return;
+   fprintf(stderr, "[sample] t=%ds %lu samples. by module:\n", seconds, samp_total);
+   struct { unsigned long n; int i; } order[SAMP_MODS + 1];
+   int k = 0;
+   for (int i = 0; i < samp_nm; ++i) { order[k].n = samp_m[i].n; order[k].i = i; ++k; }
+   order[k].n = samp_anon; order[k].i = -1; ++k;
+   qsort(order, (size_t)k, sizeof order[0], samp_cmp_desc);
+   for (int j = 0; j < k && j < 14; ++j) {
+      if (!order[j].n) break;
+      fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * order[j].n / samp_total,
+              order[j].i < 0 ? "(no module: translated guest code)" : samp_m[order[j].i].name);
+   }
+   struct { unsigned long n; int i; } tord[SAMP_THREADS];
+   for (int i = 0; i < samp_nt; ++i) { tord[i].n = samp_t[i].n; tord[i].i = i; }
+   qsort(tord, (size_t)samp_nt, sizeof tord[0], samp_cmp_desc);
+   fprintf(stderr, "[sample] by thread:\n");
+   for (int j = 0; j < samp_nt && j < 10; ++j) {
+      if (!tord[j].n) break;
+      fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * tord[j].n / samp_total,
+              samp_t[tord[j].i].name);
+   }
+   const char *dir = getenv("LUNARIA_DUMP_DIR");
+   if (dir && *dir) {
+      char path[1024];
+      snprintf(path, sizeof path, "%s/sample-exe.txt", dir);
+      FILE *f = fopen(path, "w");
+      if (f) {
+         fprintf(f, "# lunaria.exe base %p, samples %lu, rva count\n", (void *)exe_lo, samp_total);
+         for (uint32_t i = 0; i < SAMP_RVAS; ++i)
+            if (samp_rva[i].n) fprintf(f, "%x %u\n", samp_rva[i].rva, samp_rva[i].n);
+         fclose(f);
+      }
+   }
+}
+
+static DWORD WINAPI samp_thread(void *arg)
+{
+   const int ms = (int)(intptr_t)arg;
+   const DWORD self = GetCurrentThreadId();
+   MODULEINFO exe;
+   GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &exe, sizeof exe);
+   const uintptr_t exe_lo = (uintptr_t)exe.lpBaseOfDll, exe_hi = exe_lo + exe.SizeOfImage;
+   const ULONGLONG start = GetTickCount64();
+   ULONGLONG next_refresh = 0, next_report = start + 30000;
+   for (;;) {
+      Sleep((DWORD)ms);
+      const ULONGLONG now = GetTickCount64();
+      if (now >= next_refresh) { samp_threads_refresh(self); next_refresh = now + 1000; }
+      for (int i = 0; i < samp_nt; ++i) {
+         ULONG64 cycles = 0;
+         if (!QueryThreadCycleTime(samp_t[i].h, &cycles) || cycles == samp_t[i].cycles) continue;
+         samp_t[i].cycles = cycles;
+         if (SuspendThread(samp_t[i].h) == (DWORD)-1) continue;
+         CONTEXT c;
+         memset(&c, 0, sizeof c);
+         c.ContextFlags = CONTEXT_CONTROL;
+         const BOOL got = GetThreadContext(samp_t[i].h, &c);
+         ResumeThread(samp_t[i].h);
+         /* Resolved after the resume: naming a module takes the loader lock,
+          * which the stopped thread may hold. */
+         if (!got) continue;
+         ++samp_t[i].n;
+#if defined(_M_X64) || defined(__x86_64__)
+         samp_note((uintptr_t)c.Rip, exe_lo, exe_hi);
+#elif defined(_M_ARM64) || defined(__aarch64__)
+         samp_note((uintptr_t)c.Pc, exe_lo, exe_hi);
+#else
+         samp_note((uintptr_t)c.Eip, exe_lo, exe_hi);
+#endif
+      }
+      if (now >= next_report) {
+         samp_report((int)((now - start) / 1000), exe_lo);
+         next_report = now + 30000;
+      }
+   }
+   return 0;
+}
+
+void luna_os_sampler_start(void)
+{
+   const char *v = getenv("LUNARIA_SAMPLE");
+   const int ms = v ? atoi(v) : 0;
+   if (ms <= 0) return;
+   HANDLE t = CreateThread(NULL, 0, samp_thread, (void *)(intptr_t)ms, 0, NULL);
+   if (t) {
+      SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL);
+      CloseHandle(t);
+      fprintf(stderr, "[sample] sampling every %d ms\n", ms);
+   }
+}

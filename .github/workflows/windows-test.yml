@@ -42,6 +42,8 @@ jobs:
         run: |
           $exe = (Get-ChildItem app -Recurse -Filter lunaria.exe | Select-Object -First 1)
           New-Item -ItemType Directory -Force out\shots, data | Out-Null
+          Get-CimInstance Win32_Processor | ForEach-Object { "cpu: $($_.Name), $($_.NumberOfCores) cores / $($_.NumberOfLogicalProcessors) threads" } | Tee-Object out\machine.txt
+          "ram: $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)) GB" | Tee-Object -Append out\machine.txt
           $env:LUNARIA_COMP_SHOT_S = "15"
           foreach ($kv in "${{ inputs.env }}".Split(';')) { if ($kv -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2]; "env $($matches[1])=$($matches[2])" } }
           $env:LUNARIA_DUMP_DIR = (Resolve-Path out\shots).Path -replace '\\','/'

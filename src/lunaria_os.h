@@ -1284,6 +1284,8 @@ void *luna_os_reserve(void *want, size_t len, int exact);
  * no-op everywhere else. */
 #ifdef _WIN32
 void luna_lazy_ensure(const void *addr, size_t len);
+/* LUNARIA_SAMPLE=MS starts a CPU sampler (debug); no-op when unset. */
+void luna_os_sampler_start(void);
 #else
 static inline void luna_lazy_ensure(const void *addr, size_t len) { (void)addr; (void)len; }
 #endif

@@ -2658,6 +2658,7 @@ int wmain(int argc, wchar_t *wide_argv[])
 {
    SetUnhandledExceptionFilter(crash_filter);
    AddVectoredExceptionHandler(0, crash_veh);
+   luna_os_sampler_start();
    char **argv = calloc((size_t)argc + 1, sizeof *argv);
    if (!argv) return EXIT_FAILURE;
    for (int i = 0; i < argc; i++) {
