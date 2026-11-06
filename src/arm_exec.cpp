@@ -15461,6 +15461,77 @@ static void gl_sample_fbos_at_present(void) {
     pfn_glBindFramebuffer(0x8D40, (GLuint)prev);
 }
 
+/* ETC1/ETC2/EAC on a host that cannot sample them (D3D11 under ANGLE, most
+ * desktop GPUs): ANGLE unpacks each one to plain RGBA on the CPU, 4-8x the
+ * VRAM of the compressed data.  ANGLE_lossy_etc_decode instead transcodes it
+ * to a format the GPU reads compressed (BC1/BC3/BC4/BC5), at a small loss of
+ * precision.  Used when the host offers it; LUNARIA_ETC_LOSSY=0 turns it off.
+ * The first few uploads of each format are checked with glGetError and a
+ * format ANGLE refuses goes back to the normal path for good. */
+static int g_etc_lossy = -1;
+static uint8_t g_etc_lossy_bad[16];     /* indexed by format - 0x9690 */
+static unsigned g_etc_lossy_checks[16];
+static std::unordered_set<GLuint> g_etc_lossy_tex;
+static unsigned long long g_etc_lossy_n, g_etc_lossy_bytes;
+
+static GLenum etc_lossy_format(GLenum f) {
+    if (g_etc_lossy < 0) {
+        const char *env = lunaria_env("LUNARIA_ETC_LOSSY");
+        const char *ext = pfn_glGetString ? (const char *)pfn_glGetString(0x1F03) : nullptr;
+        if (!ext) return 0;                       /* no current context yet: ask later */
+        g_etc_lossy = !(env && env[0] == '0') && strstr(ext, "GL_ANGLE_lossy_etc_decode");
+        fprintf(stderr, "[gl] ETC textures: %s\n", g_etc_lossy
+                ? "kept compressed on the GPU (ANGLE_lossy_etc_decode)"
+                : env && env[0] == '0' ? "unpacked by the host (LUNARIA_ETC_LOSSY=0)"
+                                       : "unpacked by the host (no ANGLE_lossy_etc_decode)");
+    }
+    if (!g_etc_lossy) return 0;
+    GLenum to = 0;
+    switch (f) {
+    case 0x8D64: to = 0x9690; break;            /* ETC1_RGB8_OES */
+    case 0x9270: to = 0x9691; break;            /* R11_EAC */
+    case 0x9271: to = 0x9692; break;            /* SIGNED_R11_EAC */
+    case 0x9272: to = 0x9693; break;            /* RG11_EAC */
+    case 0x9273: to = 0x9694; break;            /* SIGNED_RG11_EAC */
+    case 0x9274: to = 0x9695; break;            /* RGB8_ETC2 */
+    case 0x9275: to = 0x9696; break;            /* SRGB8_ETC2 */
+    case 0x9276: to = 0x9697; break;            /* RGB8_PUNCHTHROUGH_ALPHA1_ETC2 */
+    case 0x9277: to = 0x9698; break;            /* SRGB8_PUNCHTHROUGH_ALPHA1_ETC2 */
+    case 0x9278: to = 0x9699; break;            /* RGBA8_ETC2_EAC */
+    case 0x9279: to = 0x969A; break;            /* SRGB8_ALPHA8_ETC2_EAC */
+    default: return 0;
+    }
+    return g_etc_lossy_bad[to - 0x9690] ? 0 : to;
+}
+
+static GLuint etc_bound_texture(GLenum target) {
+    GLint t = 0;
+    const GLenum binding = (target >= 0x8515 && target <= 0x851A) ? 0x8514 /* CUBE_MAP */
+                                                                  : 0x8069 /* TEXTURE_2D */;
+    if (pfn_glGetIntegerv) pfn_glGetIntegerv(binding, &t);
+    return (GLuint)t;
+}
+
+/* While a format is still being checked, clear older errors first so a
+ * guest's earlier mistake is not blamed on the lossy upload. */
+static void etc_lossy_pre(GLenum to) {
+    if (g_etc_lossy_checks[to - 0x9690] < 8 && pfn_glGetError)
+        for (int i = 0; i < 8 && pfn_glGetError(); ++i) {}
+}
+
+/* True when the lossy call went through; false: the caller makes the normal call. */
+static bool etc_lossy_check(GLenum to, const char *what, GLenum from) {
+    unsigned &n = g_etc_lossy_checks[to - 0x9690];
+    if (n >= 8 || !pfn_glGetError) return true;
+    ++n;
+    const GLenum e = pfn_glGetError();
+    if (e == 0) return true;
+    g_etc_lossy_bad[to - 0x9690] = 1;
+    fprintf(stderr, "[gl] ETC lossy %s 0x%x -> 0x%x refused (0x%x); that format goes the normal way\n",
+            what, from, to, e);
+    return false;
+}
+
 /* LUNARIA_TRACE_TEX: what actually reaches a texture, and where it came from.
  *
  * A glyph atlas that samples as full coverage, one that was never written, and
@@ -37562,6 +37633,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             gl_trace_upload("CompressedImage", r0, r1, (int)r3, (int)h, 0, 0, r2,
                             0, data, (size_t)(sz > 0 ? sz : 0));
             ArmLockDropped unlocked; /* see the sub-image case */
+            const GLenum lossy = etc_lossy_format((GLenum)r2);
+            if (lossy) {
+                etc_lossy_pre(lossy);
+                pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,lossy,(GLsizei)r3,h,brd,sz,data);
+                if (etc_lossy_check(lossy, "image", (GLenum)r2)) {
+                    g_etc_lossy_tex.insert(etc_bound_texture((GLenum)r0));
+                    g_etc_lossy_bytes += (unsigned long long)(sz > 0 ? sz : 0);
+                    if (g_etc_lossy_n++ < 3 || (g_etc_lossy_n & 255) == 0)
+                        fprintf(stderr, "[gl] ETC lossy: %llu uploads, %llu KB kept compressed "
+                                "(last 0x%x %dx%d)\n", g_etc_lossy_n, g_etc_lossy_bytes >> 10,
+                                (unsigned)r2, (int)r3, (int)h);
+                    break;
+                }
+            }
+            if (!g_etc_lossy_tex.empty()) g_etc_lossy_tex.erase(etc_bound_texture((GLenum)r0));
             pfn_glCompressedTexImage2D((GLenum)r0,(GLint)r1,(GLenum)r2,(GLsizei)r3,h,brd,sz,data);
         }
         break;
@@ -37594,6 +37680,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * sleeper, so guest sleeps overshot by as much as 38 ms against a 37.9 ms
              * worst-case lock wait. Those are the same milliseconds. */
             ArmLockDropped unlocked;
+            /* Only into a level this path created: the format must match. */
+            const GLenum lossy = etc_lossy_format(fmt);
+            if (lossy && g_etc_lossy_tex.count(etc_bound_texture((GLenum)r0))) {
+                etc_lossy_pre(lossy);
+                pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,lossy,sz,data);
+                if (etc_lossy_check(lossy, "sub-image", fmt)) break;
+            }
             pfn_glCompressedTexSubImage2D((GLenum)r0,(GLint)r1,(GLint)r2,(GLint)r3,w,h,fmt,sz,data);
         }
         break;
