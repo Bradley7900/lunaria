@@ -49,8 +49,11 @@ jobs:
           $icd = Get-ChildItem C:\msys64\mingw64 -Recurse -Filter "lvp_icd*.json" | Select-Object -First 1
           if (-not $icd) { throw "no lavapipe ICD json in the mesa package" }
           Get-Content $icd.FullName
-          "VK_DRIVER_FILES=$($icd.FullName)" | Add-Content $env:GITHUB_ENV
-          "VK_ICD_FILENAMES=$($icd.FullName)" | Add-Content $env:GITHUB_ENV
+          # The runner is elevated, and the Vulkan loader ignores VK_DRIVER_FILES /
+          # VK_ICD_FILENAMES in an elevated process. Register it the way a real
+          # driver does instead (this runner is thrown away after the job).
+          New-Item -Force "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers" | Out-Null
+          New-ItemProperty -Force -Path "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers" -Name $icd.FullName -PropertyType DWord -Value 0 | Out-Null
           # lavapipe needs its mingw64 DLLs on PATH; lunaria.exe still loads its own first (app folder wins).
           "C:\msys64\mingw64\bin" | Add-Content $env:GITHUB_PATH
 
