@@ -2658,7 +2658,12 @@ int wmain(int argc, wchar_t *wide_argv[])
 {
    SetUnhandledExceptionFilter(crash_filter);
    AddVectoredExceptionHandler(0, crash_veh);
-   luna_os_sampler_start();
+   {
+      extern uint64_t dynarmic_a64_compile_count(void);
+      extern uint64_t dynarmic_a64_compile_ns(void);
+      luna_os_sampler_start((unsigned long long (*)(void))dynarmic_a64_compile_count,
+                            (unsigned long long (*)(void))dynarmic_a64_compile_ns);
+   }
    char **argv = calloc((size_t)argc + 1, sizeof *argv);
    if (!argv) return EXIT_FAILURE;
    for (int i = 0; i < argc; i++) {

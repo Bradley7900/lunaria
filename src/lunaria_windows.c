@@ -3931,8 +3931,21 @@ static int samp_cmp_desc(const void *a, const void *b)
    return x < y ? 1 : x > y ? -1 : 0;
 }
 
+/* Handed in by the loader: the OS layer is also linked into tests that have
+ * no JIT, so it cannot name dynarmic's counters itself. */
+static unsigned long long (*samp_jit_count)(void), (*samp_jit_ns)(void);
+
 static void samp_report(int seconds, uintptr_t exe_lo)
 {
+   /* Translation cost over time: how much of it lands at load and how much
+    * keeps happening in play, which is what a translated-code cache saves. */
+   if (samp_jit_count && samp_jit_ns) {
+      static unsigned long long last_n, last_ns;
+      const unsigned long long n = samp_jit_count(), ns = samp_jit_ns();
+      fprintf(stderr, "[sample] t=%ds jit: %llu blocks compiled, %.0f ms total; last window +%llu blocks, +%.0f ms\n",
+              seconds, n, ns / 1e6, n - last_n, (ns - last_ns) / 1e6);
+      last_n = n; last_ns = ns;
+   }
    if (!samp_total) return;
    fprintf(stderr, "[sample] t=%ds %.1f Gcycles of CPU sampled. by module:\n", seconds, samp_total / 1e6);
    struct { unsigned long long n; int i; } order[SAMP_MODS + 1];
@@ -4014,8 +4027,10 @@ static DWORD WINAPI samp_thread(void *arg)
    return 0;
 }
 
-void luna_os_sampler_start(void)
+void luna_os_sampler_start(unsigned long long (*jit_count)(void), unsigned long long (*jit_ns)(void))
 {
+   samp_jit_count = jit_count;
+   samp_jit_ns = jit_ns;
    const char *v = getenv("LUNARIA_SAMPLE");
    const int ms = v ? atoi(v) : 0;
    if (ms <= 0) return;
