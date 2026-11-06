@@ -194,6 +194,7 @@ void *luna_os_library_open_local(const char *path)
  * pattern must match exactly once, and a section is only touched while it is
  * still all zeroes.  A future ANGLE that fixes this, or whose code differs,
  * fails a check and is left alone, with a log line saying which. */
+static INIT_ONCE g_angle_vk_once = INIT_ONCE_STATIC_INIT;
 static bool angle_vk_cs_is_zero(const unsigned char *cs)
 {
    for (size_t i = 0; i < sizeof(CRITICAL_SECTION); ++i) if (cs[i]) return false;
