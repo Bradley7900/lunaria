@@ -52,6 +52,8 @@
 #include <time.h>
 #include <unistd.h>
 
+static bool keyedit_pointer(double x, double y, int action);
+static bool keyedit_key(int key, int action);
 static bool  g_ready;          /* luna_init() has run against a live context */
 static bool  g_failed;         /* …and failed; do not retry every frame */
 static char *g_html;           /* guest widget document (dialogs, …) */
@@ -1500,6 +1502,7 @@ bound:
  * dialog — it must not eat the touches a title needs once it starts drawing. */
 bool luna_overlay_pointer(double x, double y, int action)
 {
+   if (keyedit_pointer(x, y, action)) return true;
    pthread_mutex_lock(&g_doc_lock);
    bool guest = g_html != NULL && !g_native_input_focus;
    bool ime = g_ime_html != NULL;
@@ -2135,6 +2138,33 @@ static const char g_menu_style[] =
    "backdrop-filter:blur(20px);color:#ffffff;font-size:13px;white-space:nowrap;"
    "pointer-events:none;}";
 
+static const char g_keyedit_style[] =
+   "#luna-menu-backdrop{position:absolute;left:0;top:0;right:0;bottom:0;}"
+   ".kes{position:absolute;border:2px solid rgba(255,255,255,0.85);background:rgba(255,255,255,0.10);}"
+   ".kes.sel{border:2px solid #0a64d8;background:rgba(10,100,216,0.20);}"
+   ".kel{position:absolute;left:0;right:0;text-align:center;color:#ffffff;font-size:13px;font-weight:bold;}"
+   ".keb{position:absolute;width:42px;height:42px;line-height:42px;border-radius:23px;text-align:center;"
+   "background:rgba(30,30,32,0.80);border:2px solid rgba(255,255,255,0.85);color:#ffffff;font-size:13px;"
+   "font-weight:bold;white-space:nowrap;overflow:hidden;}"
+   ".keb.sel{background:#0a64d8;}"
+   ".keb.pend{background:rgba(10,100,216,0.50);}"
+   ".kebar{position:absolute;left:0;right:0;top:0;height:40px;line-height:40px;padding:0 200px 0 14px;"
+   "background:rgba(30,30,32,0.84);color:#ffffff;font-size:13px;white-space:nowrap;overflow:hidden;}"
+   ".kebtn{position:absolute;border-radius:6px;text-align:center;background:rgba(255,255,255,0.18);"
+   "color:#ffffff;font-size:13px;}"
+   ".kebtn.pri{background:#0a64d8;}";
+
+/* On-screen keymap editor state; the editor itself is beside menu_clicked. */
+static bool g_ke_open;
+static luna_kedit g_ke;
+static char g_ke_path[4096];
+static int g_ke_sel = -1;            /* button index, KE_STICK, or -1 */
+static bool g_ke_drag, g_ke_pending, g_ke_dirty;
+static float g_ke_px, g_ke_py;       /* the clicked spot waiting for a key */
+static char g_ke_msg[160];
+enum { KE_STICK = -2, KE_DOT = 46, KE_BAR_H = 40 };
+static void keyedit_publish_locked(void);
+
 static double menu_now(void)
 {
    struct timespec ts;
@@ -2273,6 +2303,7 @@ static int menu_sub_rows(struct menu_buf *b)
       y += menu_header(b, "KEYBOARD CONTROLS");
       y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
       y += menu_item(b, strcmp(current, "off") ? "km-reload" : NULL, "Reload Current File", false, NULL);
+      y += menu_item(b, "km-edit", "Edit Controls on Screen", false, NULL);
       y += menu_sep(b);
       y += menu_item(b, "km-up", "Parent Folder", false, "..");
       const char *base = strrchr(g_keydir, '/');
@@ -2415,6 +2446,7 @@ static int menu_sub_rows(struct menu_buf *b)
 /* Publishes the current state; g_menu_lock held. */
 static void menu_publish_locked(void)
 {
+   if (g_ke_open) { keyedit_publish_locked(); return; }
    if (!g_menu_open) {
       if (g_menu_notice[0]) {
          struct menu_buf b = { 0 };
@@ -2771,6 +2803,202 @@ static bool resolution_save(int index)
    return saved_w && saved_h;
 }
 
+/* ---- On-screen keymap editor ---------------------------------------------
+ * Opened from Input > Edit Controls on Screen.  The game stays visible under
+ * a light tint; every binding is a marker where its touch lands.  Click an
+ * empty spot and press a key to put a button there; drag a marker (or the
+ * stick ring) to move it; select one and press a key to rebind it, Delete to
+ * remove it, [ and ] to resize the stick.  Enter saves, Esc leaves.  Pointer
+ * and keys go to this code, never to the page's HTML or the guest, so the
+ * markers are only drawn by the document. */
+
+static int ke_w(void) { return g_w > 0 ? g_w : g_menu_w > 0 ? g_menu_w : 1024; }
+static int ke_h(void) { return g_h > 0 ? g_h : g_menu_h > 0 ? g_menu_h : 576; }
+static float ke_short(void) { return (float)(ke_w() < ke_h() ? ke_w() : ke_h()); }
+
+/* Save and Cancel sit at the right of the bar; their boxes are laid out here
+ * and hit-tested against the same numbers. */
+static void ke_button_box(int which, int *x, int *y, int *w, int *h)
+{
+   *w = 84; *h = 28; *y = 6;
+   *x = ke_w() - 8 - (which == 0 ? 2 * (*w) + 8 : *w);
+}
+
+static void keyedit_publish_locked(void)
+{
+   struct menu_buf d = { 0 };
+   const int w = ke_w(), h = ke_h();
+   const float m = ke_short();
+   menu_put(&d, "<div id=\"luna-menu-backdrop\" style=\"background:rgba(0,0,0,0.22);\"></div>");
+   /* the stick: its ring is the area a drag of WASD covers */
+   {
+      const float r = g_ke.radius * m;
+      const bool sel = g_ke_sel == KE_STICK;
+      menu_putf(&d, "<div class=\"kes%s\" style=\"left:%dpx;top:%dpx;width:%dpx;height:%dpx;border-radius:%dpx;\">"
+                "<div class=\"kel\" style=\"top:%dpx;\">WASD</div></div>",
+                sel ? " sel" : "", (int)(g_ke.stick_x * w - r), (int)(g_ke.stick_y * h - r),
+                (int)(2 * r), (int)(2 * r), (int)r, (int)(r - 9));
+   }
+   for (int i = 0; i < g_ke.n; ++i) {
+      const luna_kedit_button *b = &g_ke.b[i];
+      menu_putf(&d, "<div class=\"keb%s\" style=\"left:%dpx;top:%dpx;\">", i == g_ke_sel ? " sel" : "",
+                (int)(b->x * w) - KE_DOT / 2, (int)(b->y * h) - KE_DOT / 2);
+      menu_put_text(&d, luna_key_name(b->key));
+      menu_put(&d, "</div>");
+   }
+   if (g_ke_pending)
+      menu_putf(&d, "<div class=\"keb pend\" style=\"left:%dpx;top:%dpx;\">?</div>",
+                (int)(g_ke_px * w) - KE_DOT / 2, (int)(g_ke_py * h) - KE_DOT / 2);
+   menu_put(&d, "<div class=\"kebar\">");
+   menu_put_text(&d, g_ke_msg[0] ? g_ke_msg
+                 : g_ke_pending ? "Press the key for this spot (Esc: cancel)"
+                 : g_ke_sel >= 0 ? "Press a key to rebind, Delete to remove, or drag it"
+                 : g_ke_sel == KE_STICK ? "Drag to move, [ and ] to resize"
+                 : "Click where a button is, then press its key. Drag to move. Enter saves.");
+   menu_put(&d, "</div>");
+   for (int i = 0; i < 2; ++i) {
+      int bx, by, bw, bh; ke_button_box(i, &bx, &by, &bw, &bh);
+      menu_putf(&d, "<div class=\"kebtn%s\" style=\"left:%dpx;top:%dpx;width:%dpx;height:%dpx;line-height:%dpx;\">%s</div>",
+                i == 0 ? " pri" : "", bx, by, bw, bh, bh, i == 0 ? "Save" : "Cancel");
+   }
+   luna_overlay_set_menu(d.p, g_keyedit_style, true);
+   free(d.p);
+}
+
+static void keyedit_close_locked(const char *notice)
+{
+   g_ke_open = false;
+   luna_kedit_free(&g_ke);
+   g_ke_sel = -1; g_ke_drag = g_ke_pending = false;
+   if (notice) menu_notice_locked(notice);
+   menu_publish_locked();
+}
+
+/* Where a save goes: over the file in use (its first version kept as .bak), or
+ * a new custom-N.conf beside the other keymaps when none is loaded. */
+static bool keyedit_target_locked(char *out, size_t cap)
+{
+   if (g_ke_path[0]) return snprintf(out, cap, "%s", g_ke_path) < (int)cap;
+   if (!g_keydir[0]) keyfiles_read();
+   luna_file_mkdir(g_keydir, 0755);
+   for (int i = 1; i < 1000; ++i) {
+      const int n = i > 1 ? snprintf(out, cap, "%s/custom-%d.conf", g_keydir, i)
+                          : snprintf(out, cap, "%s/custom.conf", g_keydir);
+      if (n >= (int)cap) return false;
+      FILE *f = fopen(out, "r");
+      if (!f) return true;
+      fclose(f);
+   }
+   return false;
+}
+
+static void keyedit_save_locked(void)
+{
+   char path[4096];
+   if (!keyedit_target_locked(path, sizeof path) || !luna_kedit_save(&g_ke, path)) {
+      snprintf(g_ke_msg, sizeof g_ke_msg, "Cannot save the keymap (check the walk key and stick size)");
+      fprintf(stderr, "[keyedit] save failed: %s\n", path);
+      keyedit_publish_locked();
+      return;
+   }
+   fprintf(stderr, "[keyedit] saved %d buttons to %s\n", g_ke.n, path);
+   if (luna_keymap_select(path)) menu_conf_set("LUNARIA_KEYMAP", path);
+   keyedit_close_locked("Keyboard controls saved");
+}
+
+static void keyedit_begin_locked(void)
+{
+   char path[4096]; luna_keymap_current(path, sizeof path);
+   if (!strcmp(path, "off")) path[0] = 0;
+   if (!luna_kedit_load(&g_ke, path)) {
+      menu_notice_locked("Cannot read the keymap file");
+      return;
+   }
+   snprintf(g_ke_path, sizeof g_ke_path, "%s", path);
+   g_ke_open = true;
+   g_ke_sel = -1; g_ke_drag = g_ke_pending = g_ke_dirty = false;
+   g_ke_msg[0] = 0;
+   fprintf(stderr, "[keyedit] editing %s (%d buttons)\n", path[0] ? path : "a new keymap", g_ke.n);
+}
+
+static bool keyedit_pointer(double x, double y, int action)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   if (!g_ke_open) { pthread_mutex_unlock(&g_menu_lock); return false; }
+   const float fx = (float)(x / ke_w()), fy = (float)(y / ke_h());
+   bool changed = false;
+   if (action == 1) {
+      g_ke_msg[0] = 0;
+      for (int i = 0; i < 2; ++i) {
+         int bx, by, bw, bh; ke_button_box(i, &bx, &by, &bw, &bh);
+         if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+            if (i == 0) keyedit_save_locked(); else keyedit_close_locked(NULL);
+            pthread_mutex_unlock(&g_menu_lock);
+            return true;
+         }
+      }
+      int hit = -1;
+      float best = (KE_DOT / 2.f + 4) * (KE_DOT / 2.f + 4);
+      for (int i = 0; i < g_ke.n; ++i) {
+         const float dx = (float)x - g_ke.b[i].x * ke_w(), dy = (float)y - g_ke.b[i].y * ke_h();
+         if (dx * dx + dy * dy <= best) { best = dx * dx + dy * dy; hit = i; }
+      }
+      const float sr = g_ke.radius * ke_short();
+      const float sdx = (float)x - g_ke.stick_x * ke_w(), sdy = (float)y - g_ke.stick_y * ke_h();
+      if (hit < 0 && sdx * sdx + sdy * sdy <= sr * sr) hit = KE_STICK;
+      g_ke_pending = false;
+      if (hit != -1) { g_ke_sel = hit; g_ke_drag = true; }
+      else if (y >= KE_BAR_H) { g_ke_sel = -1; g_ke_pending = true; g_ke_px = fx; g_ke_py = fy; }
+      changed = true;
+   } else if (action == -1 && g_ke_drag) {
+      const float cx = fx < 0 ? 0 : fx > 1 ? 1 : fx, cy = fy < 0 ? 0 : fy > 1 ? 1 : fy;
+      if (g_ke_sel == KE_STICK) { g_ke.stick_x = cx; g_ke.stick_y = cy; }
+      else if (g_ke_sel >= 0) { g_ke.b[g_ke_sel].x = cx; g_ke.b[g_ke_sel].y = cy; }
+      g_ke_dirty = changed = true;
+   } else if (action == 0) {
+      g_ke_drag = false;
+   }
+   if (changed && g_ke_open) keyedit_publish_locked();
+   pthread_mutex_unlock(&g_menu_lock);
+   return true;
+}
+
+static bool keyedit_key(int key, int action)
+{
+   pthread_mutex_lock(&g_menu_lock);
+   if (!g_ke_open) { pthread_mutex_unlock(&g_menu_lock); return false; }
+   if (action != 1) { pthread_mutex_unlock(&g_menu_lock); return true; }   /* GLFW_PRESS only */
+   g_ke_msg[0] = 0;
+   if (key == 256) {                                   /* Esc */
+      if (g_ke_pending || g_ke_sel != -1) { g_ke_pending = false; g_ke_sel = -1; }
+      else { keyedit_close_locked(NULL); pthread_mutex_unlock(&g_menu_lock); return true; }
+   } else if (key == 257 || key == 335) {              /* Enter */
+      keyedit_save_locked();
+      pthread_mutex_unlock(&g_menu_lock);
+      return true;
+   } else if ((key == 261 || key == 259) && g_ke_sel >= 0) {   /* Delete, Backspace */
+      luna_kedit_remove(&g_ke, g_ke_sel);
+      g_ke_sel = -1; g_ke_dirty = true;
+   } else if ((key == 91 || key == 93) && g_ke_sel == KE_STICK) {  /* [ ] */
+      float r = g_ke.radius + (key == 93 ? .01f : -.01f);
+      g_ke.radius = r < .05f ? .05f : r > .5f ? .5f : r;
+      g_ke_dirty = true;
+   } else if (g_ke_pending || g_ke_sel >= 0) {
+      const int index = g_ke_pending ? -1 : g_ke_sel;
+      const float x = g_ke_pending ? g_ke_px : g_ke.b[g_ke_sel].x;
+      const float y = g_ke_pending ? g_ke_py : g_ke.b[g_ke_sel].y;
+      const int r = luna_kedit_set(&g_ke, index, key, x, y);
+      if (r >= 0) { g_ke_sel = r; g_ke_pending = false; g_ke_dirty = true; }
+      else snprintf(g_ke_msg, sizeof g_ke_msg, "%s",
+                    r == LUNA_KEDIT_TAKEN ? "That key is used by a walk/macro line in this file"
+                    : r == LUNA_KEDIT_FULL ? "No room for more buttons in one keymap"
+                    : "Use a letter, a digit, Space, Shift or Ctrl (WASD is the stick)");
+   }
+   keyedit_publish_locked();
+   pthread_mutex_unlock(&g_menu_lock);
+   return true;
+}
+
 static void menu_clicked(const char *id)
 {
    if (strncmp(id, "luna-menu", 9)) return;
@@ -2936,6 +3164,9 @@ static void menu_clicked(const char *id)
             menu_notice_locked("Keyboard controls loaded");
          } else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
       } else keep_open = true;
+   } else if (!strcmp(id, "km-edit")) {
+      keyedit_begin_locked();
+      keep_open = !g_ke_open;
    } else if (!strcmp(id, "km-off") || !strcmp(id, "km-reload")) {
       char path[4096]; luna_keymap_current(path, sizeof path);
       if (!strcmp(id, "km-off")) strcpy(path, "off");
@@ -3043,6 +3274,7 @@ void luna_menu_open(double x, double y, int w, int h)
 {
    luna_overlay_set_menu_handler(menu_clicked);
    pthread_mutex_lock(&g_menu_lock);
+   if (g_ke_open) { pthread_mutex_unlock(&g_menu_lock); return; }   /* the editor is up */
    g_menu_open = true;
    g_settings_open = false;
    g_menu_sub = SUB_NONE;
@@ -3075,13 +3307,18 @@ void luna_menu_tick(void)
 }
 
 /* No editable host menu fields currently consume keyboard input. */
+/* Only the on-screen keymap editor takes host keys: while it is up every key
+ * is its own and none reaches the guest. */
 bool luna_overlay_host_char(uint32_t cp)
 {
    (void)cp;
-   return false;
+   pthread_mutex_lock(&g_menu_lock);
+   const bool open = g_ke_open;
+   pthread_mutex_unlock(&g_menu_lock);
+   return open;
 }
 bool luna_overlay_host_key(int key, int action, int mods)
 {
-   (void)key; (void)action; (void)mods;
-   return false;
+   (void)mods;
+   return keyedit_key(key, action);
 }

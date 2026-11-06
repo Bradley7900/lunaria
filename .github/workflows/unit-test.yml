@@ -1,0 +1,25 @@
+name: Unit tests (fork)
+
+# Small host-side tests that need no game: built straight with gcc, run with
+# the address and undefined-behaviour sanitizers.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/luna_input.*"
+      - "test/kedit_test.c"
+      - ".github/workflows/unit-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keymap editor model
+        run: |
+          gcc -std=c11 -g -Wall -Wextra -Werror -fsanitize=address,undefined -Isrc \
+              test/kedit_test.c src/luna_input.c -pthread -lm -o kedit_test
+          ./kedit_test

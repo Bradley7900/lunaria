@@ -28,7 +28,7 @@ int luna_event_id(const luna_touch_event *, int index);
 float luna_event_x(const luna_touch_event *, int index);
 float luna_event_y(const luna_touch_event *, int index);
 #include <stddef.h>
-#define LUNA_KEYMAP_BUTTONS 8
+#define LUNA_KEYMAP_BUTTONS 16
 #define LUNA_KEY_POINTS 4      /* contacts one key can press at the same time */
 #define LUNA_KEYMAP_MACROS 8
 #define LUNA_MACRO_STEPS 24
@@ -78,6 +78,36 @@ int luna_keymap_load(luna_keymap *, const char *profile);
 int luna_keymap_key(luna_keymap *, int key, int pressed, float width, float height,
                     luna_keymap_emit, void *);
 void luna_keymap_release(luna_keymap *, float width, float height, luna_keymap_emit, void *);
+
+/* Editing a keymap file: the stick and plain one-point buttons are modelled,
+ * every other line is kept verbatim in its place (see luna_input.c). */
+#define LUNA_KEDIT_MAX LUNA_KEYMAP_BUTTONS
+enum { LUNA_KEDIT_KEEP = -1, LUNA_KEDIT_STICK = -2 };
+enum { LUNA_KEDIT_BADKEY = -1, LUNA_KEDIT_TAKEN = -2, LUNA_KEDIT_FULL = -3 };
+typedef struct luna_kedit_button { int key, origin; float x, y; } luna_kedit_button;
+typedef struct luna_kedit {
+    float stick_x, stick_y, radius;
+    int has_stick, n, kept_buttons, nreserved, nlines, cap_lines;
+    luna_kedit_button b[LUNA_KEDIT_MAX];
+    int reserved[32];          /* keys owned by kept lines (walk, macros, ...) */
+    char **lines;
+    int *tags;                 /* LUNA_KEDIT_KEEP / _STICK / button origin */
+} luna_kedit;
+/* NULL, "" or "off" starts an empty keymap with a default stick. */
+int luna_kedit_load(luna_kedit *, const char *path);
+int luna_kedit_find(const luna_kedit *, int key);
+/* index -1 adds (or moves the button already on that key); otherwise rebinds
+ * button `index`, dropping any other button on the key.  Returns the index or
+ * LUNA_KEDIT_BADKEY / _TAKEN / _FULL. */
+int luna_kedit_set(luna_kedit *, int index, int key, float x, float y);
+void luna_kedit_remove(luna_kedit *, int index);
+/* Writes path (first save keeps the old file as path.bak); only a file that
+ * luna_keymap_load accepts replaces it. */
+int luna_kedit_save(const luna_kedit *, const char *path);
+void luna_kedit_free(luna_kedit *);
+/* Keymap name of a GLFW key code ("A", "7", "SPACE", ...) or NULL. */
+const char *luna_key_name(int code);
+int luna_key_normalize(int code);
 
 /* Everything that happens on a clock rather than a key event: repeat taps,
  * macro steps and the replay of a recording.  Call it regularly from the

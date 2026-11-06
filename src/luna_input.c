@@ -522,3 +522,180 @@ int luna_keymap_take(luna_keymap *out)
     pthread_mutex_unlock(&selection_lock);
     return pending;
 }
+
+/* ---- Editing a keymap file in place -------------------------------------
+ * What the on-screen editor changes is the stick and the plain one-point
+ * buttons; every other line (comments, walk, macros, multi-point or repeating
+ * buttons) is written back exactly as it was read, in its place. */
+
+const char *luna_key_name(int code)
+{
+    static const char names[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static char one[36][2];
+    if (code == 32) return "SPACE";
+    if (code == 340 || code == 344) return "SHIFT";
+    if (code == 341 || code == 345) return "CTRL";
+    const char *p = code > 0 && code < 128 ? strchr(names, code) : NULL;
+    if (!p) return NULL;
+    char *s = one[p - names];
+    s[0] = (char)code; s[1] = 0;
+    return s;
+}
+int luna_key_normalize(int code)
+{
+    return code == 344 ? 340 : code == 345 ? 341 : code;
+}
+
+static char *kedit_strdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+static int kedit_push_line(luna_kedit *e, const char *text, int tag)
+{
+    if (e->nlines == e->cap_lines) {
+        int cap = e->cap_lines ? e->cap_lines * 2 : 32;
+        char **l = realloc(e->lines, (size_t)cap * sizeof *l);
+        if (!l) return 0;
+        e->lines = l;
+        int *t = realloc(e->tags, (size_t)cap * sizeof *t);
+        if (!t) return 0;
+        e->tags = t;
+        e->cap_lines = cap;
+    }
+    char *copy = kedit_strdup(text);
+    if (!copy) return 0;
+    e->lines[e->nlines] = copy;
+    e->tags[e->nlines++] = tag;
+    return 1;
+}
+static void kedit_reserve(luna_kedit *e, int code)
+{
+    if (code > 0 && e->nreserved < (int)(sizeof e->reserved / sizeof e->reserved[0]))
+        e->reserved[e->nreserved++] = code;
+}
+
+void luna_kedit_free(luna_kedit *e)
+{
+    for (int i = 0; i < e->nlines; ++i) free(e->lines[i]);
+    free(e->lines); free(e->tags);
+    memset(e, 0, sizeof *e);
+}
+
+int luna_kedit_load(luna_kedit *e, const char *path)
+{
+    memset(e, 0, sizeof *e);
+    e->stick_x = .15f; e->stick_y = .75f; e->radius = .15f;
+    if (!path || !*path || !strcmp(path, "off")) return 1;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[1024];
+    int ok = 1;
+    while (ok && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char copy[1024], *t[16];
+        snprintf(copy, sizeof copy, "%s", line);
+        int n = split(copy, t, 16), tag = LUNA_KEDIT_KEEP;
+        float x, y, r;
+        if (n && t[0][0] != '#') {
+            if (!strcmp(t[0], "stick") && n == 4 && !e->has_stick && number(t[1], &x) && number(t[2], &y) &&
+                number(t[3], &r) && unit(x) && unit(y) && r > 0 && r <= .5f) {
+                e->stick_x = x; e->stick_y = y; e->radius = r; e->has_stick = 1;
+                tag = LUNA_KEDIT_STICK;
+            } else if (!strcmp(t[0], "button") && n == 4 && key_code(t[1]) >= 0 && number(t[2], &x) &&
+                       number(t[3], &y) && unit(x) && unit(y) && e->n < LUNA_KEDIT_MAX &&
+                       luna_kedit_find(e, key_code(t[1])) < 0) {
+                luna_kedit_button *b = &e->b[e->n];
+                b->key = key_code(t[1]); b->x = x; b->y = y; b->origin = e->n;
+                tag = e->n++;
+            } else if (n >= 2) {
+                if (!strcmp(t[0], "button")) ++e->kept_buttons;
+                kedit_reserve(e, key_code(t[1]));
+            }
+        }
+        ok = kedit_push_line(e, line, tag);
+    }
+    if (ferror(f)) ok = 0;
+    fclose(f);
+    if (!ok) { luna_kedit_free(e); return 0; }
+    return 1;
+}
+
+int luna_kedit_find(const luna_kedit *e, int key)
+{
+    key = luna_key_normalize(key);
+    for (int i = 0; i < e->n; ++i) if (e->b[i].key == key) return i;
+    return -1;
+}
+
+int luna_kedit_set(luna_kedit *e, int index, int key, float x, float y)
+{
+    key = luna_key_normalize(key);
+    if (!luna_key_name(key) || key == 'W' || key == 'A' || key == 'S' || key == 'D') return LUNA_KEDIT_BADKEY;
+    for (int i = 0; i < e->nreserved; ++i) if (e->reserved[i] == key) return LUNA_KEDIT_TAKEN;
+    if (x < 0) x = 0;
+    if (x > 1) x = 1;
+    if (y < 0) y = 0;
+    if (y > 1) y = 1;
+    const int other = luna_kedit_find(e, key);
+    if (index < 0) {
+        if (other >= 0) { e->b[other].x = x; e->b[other].y = y; return other; }
+        if (e->n >= LUNA_KEDIT_MAX || e->n + e->kept_buttons >= LUNA_KEYMAP_BUTTONS) return LUNA_KEDIT_FULL;
+        luna_kedit_button *b = &e->b[e->n];
+        b->key = key; b->x = x; b->y = y; b->origin = -1;
+        return e->n++;
+    }
+    if (index >= e->n) return LUNA_KEDIT_BADKEY;
+    e->b[index].key = key;
+    e->b[index].x = x; e->b[index].y = y;
+    if (other >= 0 && other != index) {
+        luna_kedit_remove(e, other);
+        if (other < index) --index;
+    }
+    return index;
+}
+
+void luna_kedit_remove(luna_kedit *e, int index)
+{
+    if (index < 0 || index >= e->n) return;
+    memmove(&e->b[index], &e->b[index + 1], (size_t)(e->n - index - 1) * sizeof e->b[0]);
+    --e->n;
+}
+
+static void kedit_write_button(FILE *f, const luna_kedit_button *b)
+{
+    fprintf(f, "button %s %.4f %.4f\n", luna_key_name(b->key), b->x, b->y);
+}
+
+int luna_kedit_save(const luna_kedit *e, const char *path)
+{
+    if (!path || !*path) return 0;
+    char tmp[4200], bak[4200];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp ||
+        snprintf(bak, sizeof bak, "%s.bak", path) >= (int)sizeof bak) return 0;
+    FILE *f = fopen(tmp, "w");
+    if (!f) return 0;
+    if (!e->nlines) fprintf(f, "# Made with the on-screen editor. Coordinates are fractions of the screen.\n");
+    if (!e->has_stick) fprintf(f, "stick %.4f %.4f %.4f\n", e->stick_x, e->stick_y, e->radius);
+    for (int i = 0; i < e->nlines; ++i) {
+        const int tag = e->tags[i];
+        if (tag == LUNA_KEDIT_KEEP) fprintf(f, "%s\n", e->lines[i]);
+        else if (tag == LUNA_KEDIT_STICK) fprintf(f, "stick %.4f %.4f %.4f\n", e->stick_x, e->stick_y, e->radius);
+        else for (int j = 0; j < e->n; ++j) if (e->b[j].origin == tag) kedit_write_button(f, &e->b[j]);
+    }
+    for (int j = 0; j < e->n; ++j) if (e->b[j].origin < 0) kedit_write_button(f, &e->b[j]);
+    int ok = !ferror(f);
+    ok = fclose(f) == 0 && ok;
+    /* Only a file the loader accepts replaces the old one. */
+    luna_keymap check;
+    if (!ok || !luna_keymap_load(&check, tmp)) { remove(tmp); return 0; }
+    FILE *old = fopen(path, "r"), *keep = old ? fopen(bak, "r") : NULL;
+    if (keep) fclose(keep);
+    if (old) fclose(old);
+    if (old && !keep) rename(path, bak);   /* the first save keeps the original */
+    else remove(path);                      /* rename() will not replace on Windows */
+    if (rename(tmp, path)) { remove(tmp); return 0; }
+    return 1;
+}
