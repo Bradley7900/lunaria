@@ -3765,6 +3765,86 @@ static struct { uintptr_t lo, hi; char name[48]; unsigned long long n; } samp_m[
 static int samp_nm;
 static struct { uint32_t rva; unsigned long long n; } samp_rva[SAMP_RVAS];
 static unsigned long long samp_total, samp_anon;
+#define SAMP_SYS (1u << 14)
+static struct { uintptr_t pc; unsigned long long n; } samp_sys[SAMP_SYS];  /* outside lunaria.exe */
+
+/* "module!export+off" for a PC in a loaded DLL, from its export table. */
+static void samp_name(uintptr_t pc, char *out, size_t cap)
+{
+   HMODULE m = NULL;
+   snprintf(out, cap, "%p", (void *)pc);
+   if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)pc, &m) || !m)
+      return;
+   char path[MAX_PATH];
+   const char *mod = "?";
+   if (GetModuleFileNameA(m, path, sizeof path)) {
+      mod = strrchr(path, '\\');
+      mod = mod ? mod + 1 : path;
+   }
+   const uint8_t *base = (const uint8_t *)m;
+   const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+   const IMAGE_DATA_DIRECTORY *dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+   const uint32_t rva = (uint32_t)(pc - (uintptr_t)base);
+   const char *best = NULL;
+   uint32_t best_rva = 0;
+   if (dd->VirtualAddress && dd->Size) {
+      const IMAGE_EXPORT_DIRECTORY *ex = (const IMAGE_EXPORT_DIRECTORY *)(base + dd->VirtualAddress);
+      const DWORD *funcs = (const DWORD *)(base + ex->AddressOfFunctions);
+      const DWORD *names = (const DWORD *)(base + ex->AddressOfNames);
+      const WORD *ords = (const WORD *)(base + ex->AddressOfNameOrdinals);
+      for (DWORD i = 0; i < ex->NumberOfNames; ++i) {
+         const uint32_t f = funcs[ords[i]];
+         if (f <= rva && f >= best_rva) { best_rva = f; best = (const char *)(base + names[i]); }
+      }
+   }
+   if (best) snprintf(out, cap, "%s!%s+0x%x", mod, best, rva - best_rva);
+   else snprintf(out, cap, "%s+0x%x", mod, rva);
+}
+
+static int samp_cmp_sys(const void *a, const void *b)
+{
+   const unsigned long long x = *(const unsigned long long *)((const char *)a + sizeof(uintptr_t));
+   const unsigned long long y = *(const unsigned long long *)((const char *)b + sizeof(uintptr_t));
+   return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* Top DLL functions: sort a copy of the PC table, name the heaviest PCs and
+ * merge PCs that land in the same export. */
+static void samp_report_sys(void)
+{
+   static struct { uintptr_t pc; unsigned long long n; } copy[SAMP_SYS];
+   static struct { char name[96]; unsigned long long n; } agg[64];
+   int nc = 0, na = 0;
+   for (uint32_t i = 0; i < SAMP_SYS; ++i)
+      if (samp_sys[i].n) { copy[nc].pc = samp_sys[i].pc; copy[nc].n = samp_sys[i].n; ++nc; }
+   qsort(copy, (size_t)nc, sizeof copy[0], samp_cmp_sys);
+   for (int i = 0; i < nc && i < 300; ++i) {
+      char full[160];
+      samp_name(copy[i].pc, full, sizeof full);
+      char *plus = strrchr(full, '+');
+      if (plus && strchr(full, '!')) *plus = 0;   /* merge by export, keep offsets for unnamed */
+      int j = 0;
+      while (j < na && strcmp(agg[j].name, full)) ++j;
+      if (j == na) {
+         if (na == 64) continue;
+         snprintf(agg[na].name, sizeof agg[na].name, "%s", full);
+         agg[na].n = 0;
+         ++na;
+      }
+      agg[j].n += copy[i].n;
+   }
+   for (int i = 0; i < na; ++i)
+      for (int j = i + 1; j < na; ++j)
+         if (agg[j].n > agg[i].n) {
+            char t[96]; unsigned long long tn = agg[i].n;
+            memcpy(t, agg[i].name, sizeof t); memcpy(agg[i].name, agg[j].name, sizeof t);
+            memcpy(agg[j].name, t, sizeof t); agg[i].n = agg[j].n; agg[j].n = tn;
+         }
+   fprintf(stderr, "[sample] top functions outside lunaria.exe:\n");
+   for (int i = 0; i < na && i < 16; ++i)
+      fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * agg[i].n / samp_total, agg[i].name);
+}
 
 static void samp_threads_refresh(DWORD self)
 {
@@ -3815,6 +3895,12 @@ static void samp_note(uintptr_t pc, unsigned long long w, uintptr_t exe_lo, uint
          if (samp_rva[k].n == 0) { samp_rva[k].rva = rva; samp_rva[k].n = w; break; }
          if (samp_rva[k].rva == rva) { samp_rva[k].n += w; break; }
       }
+   } else {
+      uint32_t k = (uint32_t)(((uint64_t)pc * 11400714819323198485ull) >> 50);
+      for (uint32_t probe = 0; probe < SAMP_SYS; ++probe, k = (k + 1) & (SAMP_SYS - 1)) {
+         if (samp_sys[k].n == 0) { samp_sys[k].pc = pc; samp_sys[k].n = w; break; }
+         if (samp_sys[k].pc == pc) { samp_sys[k].n += w; break; }
+      }
    }
    for (int i = 0; i < samp_nm; ++i)
       if (pc >= samp_m[i].lo && pc < samp_m[i].hi) { samp_m[i].n += w; return; }
@@ -3859,6 +3945,7 @@ static void samp_report(int seconds, uintptr_t exe_lo)
       fprintf(stderr, "[sample]   %5.1f%%  %s\n", 100.0 * order[j].n / samp_total,
               order[j].i < 0 ? "(no module: translated guest code)" : samp_m[order[j].i].name);
    }
+   samp_report_sys();
    struct { unsigned long long n; int i; } tord[SAMP_THREADS];
    for (int i = 0; i < samp_nt; ++i) { tord[i].n = samp_t[i].n; tord[i].i = i; }
    qsort(tord, (size_t)samp_nt, sizeof tord[0], samp_cmp_desc);
