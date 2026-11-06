@@ -13685,6 +13685,91 @@ static void drive_ndk_choreographer(ArmExecCtx &ctx) {
     }
 }
 
+/* ---- [compat]: what a game asks the host GL for and does not get --------
+ * A game written for a phone GPU can need things ANGLE's backend does not
+ * offer (D3D11 stops at ES 3.1: no geometry/tessellation shaders, no
+ * framebuffer fetch, ...).  On a device that never fails, so the game rarely
+ * checks; here it shows up as a black model or a missing effect and nothing
+ * in the log says why.  These lines say why, once per distinct problem:
+ *   - a shader's `#version 320 es` when the host context is below 3.2,
+ *   - a shader's `#extension NAME` the host does not list,
+ *   - a shader that failed to compile or a program that failed to link, with
+ *     the host compiler's own message.
+ * Always on: each distinct line prints once, so a working game costs nothing. */
+static std::mutex g_compat_mu;
+static std::set<std::string> g_compat_seen;
+static bool compat_once(const std::string &key) {
+    std::lock_guard<std::mutex> lock(g_compat_mu);
+    if (g_compat_seen.size() > 512) return false;
+    return g_compat_seen.insert(key).second;
+}
+static const std::string &compat_host_exts(void) {
+    static std::string exts;
+    static bool loaded;
+    if (!loaded) {
+        typedef const unsigned char *(*GetStr)(unsigned);
+        static GetStr gs = (GetStr)eglGetProcAddress("glGetString");
+        const char *e = gs ? (const char *)gs(0x1F03 /* GL_EXTENSIONS */) : nullptr;
+        if (e) { exts = std::string(" ") + e + " "; loaded = true; }
+    }
+    return exts;
+}
+static int compat_host_es_minor(void) {
+    static int minor = -1;
+    if (minor < 0) {
+        typedef const unsigned char *(*GetStr)(unsigned);
+        static GetStr gs = (GetStr)eglGetProcAddress("glGetString");
+        const char *v = gs ? (const char *)gs(0x1F02 /* GL_VERSION */) : nullptr;
+        int ma = 0, mi = 0;
+        if (v && sscanf(v, "OpenGL ES %d.%d", &ma, &mi) == 2) minor = ma * 10 + mi;
+    }
+    return minor;
+}
+static void compat_check_shader_source(uint64_t id, const std::string &src) {
+    const std::string &exts = compat_host_exts();
+    size_t at = 0;
+    while (at < src.size()) {
+        size_t eol = src.find('\n', at);
+        if (eol == std::string::npos) eol = src.size();
+        size_t ws = src.find_first_not_of(" \t", at);
+        if (ws != std::string::npos && ws < eol && src[ws] == '#') {
+            std::string line = src.substr(ws, eol - ws);
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            int ver = 0;
+            char name[128], how[32];
+            if (sscanf(line.c_str(), "#version %d es", &ver) == 1) {
+                const int have = compat_host_es_minor();
+                if (ver >= 320 && have > 0 && have < 32 &&
+                    compat_once("ver" + std::to_string(ver)))
+                    fprintf(stderr, "[compat] shader %llu needs GLSL ES %d.%02d; this host context is "
+                            "OpenGL ES %d.%d (ANGLE's D3D11 backend stops at 3.1; its Vulkan "
+                            "backend does 3.2)\n", (unsigned long long)id, ver / 100, ver % 100,
+                            have / 10, have % 10);
+            } else if (sscanf(line.c_str(), "#extension %127[A-Za-z0-9_] : %31s", name, how) == 2 &&
+                       strcmp(name, "all") != 0 && !exts.empty() &&
+                       exts.find(std::string(" ") + name + " ") == std::string::npos &&
+                       compat_once(std::string("ext ") + name)) {
+                fprintf(stderr, "[compat] shader %llu asks for %s (%s), which this host does not "
+                        "offer%s\n", (unsigned long long)id, name, how,
+                        !strcmp(how, "require") ? ": the shader will fail to compile" :
+                        ": the shader must take its fallback path");
+            }
+        }
+        at = eol + 1;
+    }
+}
+static void compat_report_failure(const char *what, unsigned id, const char *log) {
+    std::string first = log ? log : "";
+    if (first.size() > 400) first.resize(400);
+    for (char &c : first) if (c == '\n' || c == '\r') c = ' ';
+    /* Key on the message, not the id: a game that fails one way fails it in
+     * every material. */
+    std::string key = std::string(what) + first.substr(0, 120);
+    if (!compat_once(key)) return;
+    fprintf(stderr, "[compat] %s %u failed: %s\n", what, id,
+            first.empty() ? "(no message from the host compiler)" : first.c_str());
+}
+
 // glMapBufferRange shadows: host pointers can't be exposed to the guest.
 /* `deferred`: a write-only map that never touched the host buffer.  The guest
  * writes the shadow; unmap / flush upload it with glBufferData/SubData.  See
@@ -38246,6 +38331,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     fclose(fp);
                 }
             }
+            compat_check_shader_source(r0, src);
             /* Finish the GL_TEXTURE_EXTERNAL_OES -> GL_TEXTURE_2D mapping. Binding is
              * redirected (gl_map_target), and the shader side has to follow: an external
              * sampler reads the EXTERNAL_OES binding point, which nothing here ever
@@ -38325,6 +38411,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             GLint *value = (GLint*)ctx.mem.ptr(r2);
             ArmLockDropped gl_unlocked;
             pfn_glGetShaderiv((GLuint)r0, (GLenum)r1, value);
+            if (r1 == 0x8B81u /* COMPILE_STATUS */ && value && !*value && pfn_glGetShaderInfoLog) {
+                char log[512] = {0};
+                GLsizei n = 0;
+                pfn_glGetShaderInfoLog((GLuint)r0, (GLsizei)sizeof log - 1, &n, log);
+                compat_report_failure("shader compile", (unsigned)r0, log);
+            }
             if (lunaria_env("LUNARIA_TRACE_GLSHADER") && value)
                 fprintf(stderr, "[glsh] GetShaderiv(%u,0x%x)=%d tid=%u context=%p\n",
                         (unsigned)r0, (unsigned)r1, (int)*value,
@@ -38425,6 +38517,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             GLint *value = (GLint*)ctx.mem.ptr(r2);
             ArmLockDropped gl_unlocked;
             pfn_glGetProgramiv((GLuint)r0, (GLenum)r1, value);
+            if (r1 == 0x8B82u /* LINK_STATUS */ && value && !*value && pfn_glGetProgramInfoLog) {
+                char log[512] = {0};
+                GLsizei n = 0;
+                pfn_glGetProgramInfoLog((GLuint)r0, (GLsizei)sizeof log - 1, &n, log);
+                compat_report_failure("program link", (unsigned)r0, log);
+            }
         }
         break;
     case SVC_GL_GetProgramInfoLog: {
