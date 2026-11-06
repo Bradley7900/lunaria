@@ -17757,13 +17757,15 @@ static bool init_host_egl() {
                     fprintf(stderr, "[arm_exec] init_host_egl: Vulkan check: %s\n", why);
             }
             if (backend && !strcmp(backend, "vulkan")) {
+                luna_os_angle_vulkan_prepare();
                 if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan"))
                     g_egl_dpy = EGL_NO_DISPLAY;
             } else if (!initialize_angle(EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, "D3D11")) {
                 /* D3D11's own fallback must not take the same crash. */
                 char why[96];
                 if (!host_vulkan_usable(why, sizeof why) ||
-                    !initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan")) {
+                    (luna_os_angle_vulkan_prepare(),
+                     !initialize_angle(EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, "Vulkan"))) {
                     fprintf(stderr, "[arm_exec] init_host_egl: no usable backend (Vulkan: %s)\n", why);
                     g_egl_dpy = EGL_NO_DISPLAY;
                 }

@@ -1378,6 +1378,9 @@ const char *luna_os_library_error(void);
 int luna_os_setenv(const char *name, const char *value, int overwrite);
 /* Remove a host launch variable without changing guest environ. */
 int luna_os_unsetenv(const char *name);
+/* Windows: call before ANGLE's Vulkan backend starts (see lunaria_windows.c).
+ * Elsewhere a no-op. Safe to call more than once and from any thread. */
+void luna_os_angle_vulkan_prepare(void);
 /* Nonblocking external command input: POSIX FIFO or Windows named pipe.
  * Windows paths use \\.\pipe\NAME. Open returns -1 on failure. */
 intptr_t luna_os_command_pipe_open(const char *path);

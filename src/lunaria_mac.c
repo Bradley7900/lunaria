@@ -1516,3 +1516,5 @@ void *luna_os_library_loaded_symbol(const char *module, const char *name)
    dlclose(handle);
    return symbol;
 }
+
+void luna_os_angle_vulkan_prepare(void) {}

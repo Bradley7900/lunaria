@@ -12,6 +12,7 @@
 #include "luna_boot.h"
 #include "luna_ime.h"
 #include "luna_overlay.h"
+#include "lunaria_os.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -1031,6 +1032,7 @@ static EGLDisplay comp_own_display(EGLNativeWindowType win, EGLDisplay guest,
                                   : EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
       EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
    };
+   luna_os_angle_vulkan_prepare();   /* types[] can reach ANGLE's Vulkan backend */
    for (int i = 0; i < 2; ++i) {
       const EGLint attrs[] = { EGL_PLATFORM_ANGLE_TYPE_ANGLE, types[i], EGL_NONE };
       EGLDisplay d = gpd(EGL_PLATFORM_ANGLE_ANGLE, (void *)dc, attrs);
