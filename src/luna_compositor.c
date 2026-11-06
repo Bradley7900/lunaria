@@ -381,7 +381,7 @@ static void share_flush_pending(void)
  *    the game, and it was then kept for 120 s.  A tie now looks again in
  *    20 s;
  *  - nothing noticed a heavier scene after the pick.  Now a frame rate that
- *    falls below 75% of what the pick measured looks again at once. */
+ *    falls below 85% of what the pick measured looks again at once. */
 #define PICK_WARMUP_NS   (20ull * 1000000000ull)
 #define PICK_WINDOW_NS   (2ull * 1000000000ull)
 #define PICK_RECHECK_NS  (120ull * 1000000000ull)
@@ -420,7 +420,7 @@ static bool share_choose(void)
          else if (now - watch_t0 >= PICK_WATCH_NS) {
             const double fps = (frames - watch_f0) * 1e9 / (double)(now - watch_t0);
             watch_t0 = now; watch_f0 = frames;
-            if (fps >= 10.0 && fps < pick_fps * 0.75 && now - last_pick >= PICK_MIN_GAP_NS &&
+            if (fps >= 10.0 && fps < pick_fps * 0.85 && now - last_pick >= PICK_MIN_GAP_NS &&
                 next_check > now) {
                fprintf(stderr, "[compositor] frame rate fell to %.1f fps from %.1f, timing both paths again\n",
                        fps, pick_fps);
