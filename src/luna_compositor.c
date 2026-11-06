@@ -26,6 +26,11 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <EGL/eglext_angle.h>
+#endif
+
 #define SLOTS 3
 
 static EGLDisplay g_dpy = EGL_NO_DISPLAY;
@@ -33,6 +38,17 @@ static EGLConfig  g_cfg;
 static EGLContext g_ctx = EGL_NO_CONTEXT;
 static EGLSurface g_win = EGL_NO_SURFACE;
 static EGLNativeWindowType g_native;
+
+/* Windows: ANGLE gives every context on one EGLDisplay the same D3D11 device,
+ * and its D3D11 state cache is per device, not per context.  With the
+ * compositor drawing on its own thread while the guest draws on another,
+ * the guest's draws went to whatever render target the compositor had bound
+ * last: clears (which name their target) still landed, every draw vanished,
+ * and Unity titles showed only their clear colour.  So on Windows the
+ * compositor runs on a display of its own (a separate device) and frames
+ * cross over as pixels, the path Vulkan frames already use.
+ * LUNARIA_COMP_SHARED_DISPLAY=1 restores the shared display. */
+static bool g_own_display;
 
 static atomic_bool g_active;
 static atomic_ullong g_frames;
@@ -150,12 +166,39 @@ static struct comp_source *source_for(EGLContext ctx, int w, int h)
    return src;
 }
 
+static void submit_pixels(int w, int h, const void *pixels, int stride,
+                          bool bgra, int swap_interval, bool bottom_up);
+
 void luna_comp_submit(int w, int h, int swap_interval)
 {
    if (!atomic_load_explicit(&g_active, memory_order_acquire) || w <= 0 || h <= 0)
       return;
    EGLContext ctx = eglGetCurrentContext();
    if (ctx == EGL_NO_CONTEXT) return;
+
+   if (g_own_display) {
+      /* The compositor is on another display: read the default framebuffer
+       * back and hand it over as pixels (already in texture row order). */
+      static _Thread_local uint8_t *buf;
+      static _Thread_local size_t cap;
+      const size_t need = (size_t)w * 4u * (size_t)h;
+      if (cap < need) {
+         uint8_t *nb = realloc(buf, need);
+         if (!nb) return;
+         buf = nb;
+         cap = need;
+      }
+      GLint prev_read = 0, pack = 4;
+      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+      glGetIntegerv(GL_PACK_ALIGNMENT, &pack);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+      glPixelStorei(GL_PACK_ALIGNMENT, 4);
+      glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+      glPixelStorei(GL_PACK_ALIGNMENT, pack);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+      submit_pixels(w, h, buf, w * 4, false, swap_interval, true);
+      return;
+   }
 
    pthread_mutex_lock(&g_mu);
    /* A device's BufferQueue: with vsync on, a frame that is still queued
@@ -600,6 +643,44 @@ static void *comp_main(void *arg)
    return NULL;
 }
 
+#ifdef _WIN32
+/* A second ANGLE display, on the same backend as the guest's, keyed by the
+ * window's DC so ANGLE does not hand back the guest's display. */
+static EGLDisplay comp_own_display(EGLNativeWindowType win, EGLDisplay guest,
+                                   EGLConfig *cfg)
+{
+   const char *shared = getenv("LUNARIA_COMP_SHARED_DISPLAY");
+   if (shared && shared[0] && shared[0] != '0') return EGL_NO_DISPLAY;
+   PFNEGLGETPLATFORMDISPLAYEXTPROC gpd = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
+      eglGetProcAddress("eglGetPlatformDisplayEXT");
+   HDC dc = GetDC((HWND)win);
+   if (!gpd || !dc) return EGL_NO_DISPLAY;
+   const char *be = getenv("LUNARIA_ANGLE_BACKEND");
+   const EGLint types[2] = {
+      be && !strcmp(be, "vulkan") ? EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE
+                                  : EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
+      EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE,
+   };
+   for (int i = 0; i < 2; ++i) {
+      const EGLint attrs[] = { EGL_PLATFORM_ANGLE_TYPE_ANGLE, types[i], EGL_NONE };
+      EGLDisplay d = gpd(EGL_PLATFORM_ANGLE_ANGLE, (void *)dc, attrs);
+      EGLint major = 0, minor = 0;
+      if (d == EGL_NO_DISPLAY || d == guest || !eglInitialize(d, &major, &minor))
+         continue;
+      const EGLint ca[] = {
+         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+         EGL_NONE
+      };
+      EGLint n = 0;
+      if (eglChooseConfig(d, ca, cfg, 1, &n) && n == 1) return d;
+      eglTerminate(d);
+   }
+   return EGL_NO_DISPLAY;
+}
+#endif
+
 bool luna_comp_start(void *egl_display, void *egl_config, void *native_window)
 {
    if (atomic_load(&g_active)) return true;
@@ -607,7 +688,28 @@ bool luna_comp_start(void *egl_display, void *egl_config, void *native_window)
    g_cfg = (EGLConfig)egl_config;
    g_native = (EGLNativeWindowType)(uintptr_t)native_window;
 
-   g_win = eglCreateWindowSurface(g_dpy, g_cfg, g_native, NULL);
+#ifdef _WIN32
+   {
+      EGLConfig own_cfg;
+      EGLDisplay own = comp_own_display(g_native, g_dpy, &own_cfg);
+      if (own != EGL_NO_DISPLAY) {
+         EGLSurface s = eglCreateWindowSurface(own, own_cfg, g_native, NULL);
+         if (s != EGL_NO_SURFACE) {
+            g_dpy = own;
+            g_cfg = own_cfg;
+            g_win = s;
+            g_own_display = true;
+            fprintf(stderr, "[compositor] own ANGLE display (separate device); "
+                    "guest frames arrive as pixels\n");
+         } else {
+            fprintf(stderr, "[compositor] own display: window surface failed (0x%x), "
+                    "sharing the guest's display\n", eglGetError());
+         }
+      }
+   }
+#endif
+   if (g_win == EGL_NO_SURFACE)
+      g_win = eglCreateWindowSurface(g_dpy, g_cfg, g_native, NULL);
    if (g_win == EGL_NO_SURFACE) {
       fprintf(stderr, "[compositor] eglCreateWindowSurface failed (0x%x)\n",
               eglGetError());
