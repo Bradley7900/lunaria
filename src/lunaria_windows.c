@@ -3453,10 +3453,16 @@ static unsigned luna_zone_cache_next;
 static struct { wchar_t key[128]; WORD year; int used; BOOL ok; TIME_ZONE_INFORMATION out; } luna_year_cache[8];
 static unsigned luna_year_cache_next;
 
+static int luna_zone_cache_off(void)   /* LUNARIA_TZ_CACHE=0, for A/B runs */
+{
+   static int off = -1;
+   if (off < 0) { const char *e = getenv("LUNARIA_TZ_CACHE"); off = e && e[0] == '0'; }
+   return off;
+}
 static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
 {
    const char *name = zone ? zone : "";
-   if (strlen(name) >= sizeof luna_zone_cache[0].name) return luna_zone_uncached(zone, tz);
+   if (luna_zone_cache_off() || strlen(name) >= sizeof luna_zone_cache[0].name) return luna_zone_uncached(zone, tz);
    AcquireSRWLockShared(&luna_zone_cache_lock);
    for (unsigned i = 0; i < 8; ++i)
       if (luna_zone_cache[i].used && !strcmp(luna_zone_cache[i].name, name)) {
@@ -3481,7 +3487,7 @@ static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
 }
 static BOOL luna_zone_year(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_ZONE_INFORMATION *out)
 {
-   if (!zone->TimeZoneKeyName[0]) return luna_zone_year_uncached(year, zone, out);
+   if (luna_zone_cache_off() || !zone->TimeZoneKeyName[0]) return luna_zone_year_uncached(year, zone, out);
    AcquireSRWLockShared(&luna_zone_cache_lock);
    for (unsigned i = 0; i < 8; ++i)
       if (luna_year_cache[i].used && luna_year_cache[i].year == year &&

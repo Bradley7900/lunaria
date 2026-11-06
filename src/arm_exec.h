@@ -998,6 +998,10 @@ void arm64_exec_svc_ring_dump(void);
 /* Presents the guest itself drove through the EGL bridge.  The pump loop
  * watches this to notice that the guest has stopped producing frames. */
 uint64_t arm_exec_guest_swap_count(void);
+/* The guest's frame times since the last call (and resets them): median,
+ * 99th percentile and worst in ms, frames over 33 ms and over 50 ms.
+ * Returns how many frames, 0 for none. */
+int arm_exec_frame_times(double *p50, double *p99, double *worst, int *over33, int *over50);
 
 /*
  * Host calls: a guest-callable entry point for a host function, without an

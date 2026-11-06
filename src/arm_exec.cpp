@@ -13728,6 +13728,35 @@ static std::vector<uint32_t> g_egl_sync_free;
 
 // Counts presents the guest drove through the EGL bridge.
 static uint64_t g_guest_egl_swap_count = 0;
+/* Time between the guest's presents, for the [perf] line: an average fps hides
+ * the hitch a player feels, the slowest frames show it. */
+static std::mutex g_frame_time_mu;
+static std::vector<float> g_frame_time_ms;
+static uint64_t g_frame_time_last_ns;
+static uint64_t host_mono_ns();
+static void frame_time_note(void) {
+    const uint64_t now = host_mono_ns();
+    std::lock_guard<std::mutex> lock(g_frame_time_mu);
+    if (g_frame_time_last_ns && g_frame_time_ms.size() < 100000)
+        g_frame_time_ms.push_back((float)((double)(now - g_frame_time_last_ns) / 1e6));
+    g_frame_time_last_ns = now;
+}
+extern "C" int arm_exec_frame_times(double *p50, double *p99, double *worst,
+                                    int *over33, int *over50) {
+    std::vector<float> v;
+    {
+        std::lock_guard<std::mutex> lock(g_frame_time_mu);
+        v.swap(g_frame_time_ms);
+    }
+    if (v.empty()) return 0;
+    std::sort(v.begin(), v.end());
+    *p50 = v[v.size() / 2];
+    *p99 = v[std::min(v.size() - 1, (size_t)((double)v.size() * 0.99))];
+    *worst = v.back();
+    *over33 = (int)(v.end() - std::upper_bound(v.begin(), v.end(), 33.4f));
+    *over50 = (int)(v.end() - std::upper_bound(v.begin(), v.end(), 50.0f));
+    return (int)v.size();
+}
 /* Latched false once the boot card is down, so the SVC dispatch stops paying
  * for it entirely rather than calling across into libjvm.so for ever. */
 static bool g_boot_card_up = true;
@@ -17532,6 +17561,7 @@ static bool anw_post_locked_buffer(ArmExecCtx &ctx) {
     }
     if (ok) {
         ++g_guest_egl_swap_count;
+        frame_time_note();
         luna_boot_guest_presented();
         egl_on_swap_complete();
     }
@@ -18531,6 +18561,7 @@ extern "C" int arm_exec_egl_present_surface(uint32_t handle) {
     eglQueryContext(g_egl_dpy, eglGetCurrentContext(), EGL_CONTEXT_CLIENT_VERSION, &version);
     if (width <= 0 || height <= 0) return EGL_FALSE;
     ++g_guest_egl_swap_count;
+    frame_time_note();
     luna_boot_guest_presented();
     luna_qfkey_start("lunaria", width, height);
     if (luna_qfkey_wants_frame() && !(luna_comp_active() && version < 3)) {

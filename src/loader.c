@@ -702,6 +702,14 @@ static void perf_tick(void)
            (double)gticks / 1e6, (double)(gticks - last_ticks) / dt / 1e6,
            (double)xlat / 1e6, (double)(xlat - last_xlat) / dt / 1e6);
    {
+      double p50, p99, worst;
+      int over33, over50;
+      const int n = arm_exec_frame_times(&p50, &p99, &worst, &over33, &over50);
+      if (n)
+         fprintf(stderr, "[perf]   frames: %d, median %.1f ms, 99%% %.1f ms, worst %.1f ms, "
+                 "over 33 ms: %d, over 50 ms: %d\n", n, p50, p99, worst, over33, over50);
+   }
+   {
       uint64_t a32[3];
       arm_exec_translated_insn_a32(a32);
       if (a32[0] | a32[1] | a32[2])
