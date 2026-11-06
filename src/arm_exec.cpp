@@ -28920,13 +28920,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 !last_report.compare_exchange_strong(prev, now)) return;
             fprintf(stderr, "[svctime] top by total time:\n");
             bool used[1024] = {};
-            for (int pass = 0; pass < 10; ++pass) {
+            {
+                uint64_t all_ns = 0, all_calls = 0;
+                for (int i = 0; i < 1024; ++i) { all_ns += ns[i].load(); all_calls += calls[i].load(); }
+                fprintf(stderr, "[svctime] all: %llu calls, %.1f ms\n", (unsigned long long)all_calls, all_ns / 1e6);
+            }
+            for (int pass = 0; pass < 15; ++pass) {
                 int best = -1; uint64_t bv = 0;
                 for (int i = 0; i < 1024; ++i)
                     if (!used[i] && ns[i].load() > bv) { bv = ns[i].load(); best = i; }
                 if (best < 0) break;
                 used[best] = true;
-                fprintf(stderr, "[svctime]   svc=%d calls=%llu total=%.1fms avg=%.1fus\n", best,
+                fprintf(stderr, "[svctime]   svc=%d %-24s calls=%llu total=%.1fms avg=%.2fus\n", best,
+                        svc_symbol_name((uint32_t)best),
                         (unsigned long long)calls[best].load(), bv / 1e6,
                         bv / 1e3 / (double)std::max<uint64_t>(1, calls[best].load()));
             }
