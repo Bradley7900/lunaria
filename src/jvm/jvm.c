@@ -1906,6 +1906,13 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
     * state.  A jvalue is one aligned 8-byte vararg slot, so the cursor begins
     * directly at the array. */
    v->ap = (va_list)(uintptr_t)args;
+#elif defined(_WIN32)
+   /* Win64 va_list is a plain char pointer too (every vararg is one 8-byte
+    * slot).  The SysV branch below wrote 24 bytes into it, so the first
+    * va_arg() read the address (fp_offset << 32 | gp_offset) = 0xb000000030
+    * and every Call*MethodA into a host stub crashed (Unity's initJni ->
+    * getSystemService on Windows). */
+   v->ap = (va_list)(uintptr_t)args;
 #elif defined(__x86_64__)
    struct { unsigned gp_offset, fp_offset; void *overflow, *reg_save; } *t =
       (void *)&v->ap;
