@@ -3378,7 +3378,7 @@ rescan:
 
 /* IANA identifiers map to Windows' own, year-specific timezone rules. */
 #include "unicode/windows_zones.h"
-static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
+static int luna_zone_uncached(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
 {
    if (!zone || !*zone)
       return GetDynamicTimeZoneInformation(tz) == TIME_ZONE_ID_INVALID ? -1 : 0;
@@ -3427,7 +3427,7 @@ static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
    }
    return -1;
 }
-static BOOL luna_zone_year(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_ZONE_INFORMATION *out)
+static BOOL luna_zone_year_uncached(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_ZONE_INFORMATION *out)
 {
    if (zone->TimeZoneKeyName[0])
       return GetTimeZoneInformationForYear(year, zone, out);
@@ -3439,6 +3439,73 @@ static BOOL luna_zone_year(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_
    memcpy(out->StandardName, zone->StandardName, sizeof out->StandardName);
    memcpy(out->DaylightName, zone->DaylightName, sizeof out->DaylightName);
    return TRUE;
+}
+
+/* Both lookups above read the registry: luna_zone_uncached walks every zone
+ * Windows knows (EnumDynamicTimeZoneInformation, ~140 registry keys) to find
+ * one by name, and a year's rules are another read.  localtime() paid both on
+ * every call - measured at 17 ms per call on a GitHub runner, a dropped frame
+ * each time a game asked the time.  Neither answer changes while we run (the
+ * year is part of the key), so each is kept, failures included. */
+static SRWLOCK luna_zone_cache_lock = SRWLOCK_INIT;
+static struct { char name[128]; int used, result; DYNAMIC_TIME_ZONE_INFORMATION tz; } luna_zone_cache[8];
+static unsigned luna_zone_cache_next;
+static struct { wchar_t key[128]; WORD year; int used; BOOL ok; TIME_ZONE_INFORMATION out; } luna_year_cache[8];
+static unsigned luna_year_cache_next;
+
+static int luna_zone(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
+{
+   const char *name = zone ? zone : "";
+   if (strlen(name) >= sizeof luna_zone_cache[0].name) return luna_zone_uncached(zone, tz);
+   AcquireSRWLockShared(&luna_zone_cache_lock);
+   for (unsigned i = 0; i < 8; ++i)
+      if (luna_zone_cache[i].used && !strcmp(luna_zone_cache[i].name, name)) {
+         const int result = luna_zone_cache[i].result;
+         if (!result) *tz = luna_zone_cache[i].tz;
+         ReleaseSRWLockShared(&luna_zone_cache_lock);
+         return result;
+      }
+   ReleaseSRWLockShared(&luna_zone_cache_lock);
+   DYNAMIC_TIME_ZONE_INFORMATION found;
+   memset(&found, 0, sizeof found);
+   const int result = luna_zone_uncached(zone, &found);
+   AcquireSRWLockExclusive(&luna_zone_cache_lock);
+   const unsigned slot = luna_zone_cache_next++ % 8;
+   snprintf(luna_zone_cache[slot].name, sizeof luna_zone_cache[slot].name, "%s", name);
+   luna_zone_cache[slot].result = result;
+   luna_zone_cache[slot].tz = found;
+   luna_zone_cache[slot].used = 1;
+   ReleaseSRWLockExclusive(&luna_zone_cache_lock);
+   if (!result) *tz = found;
+   return result;
+}
+static BOOL luna_zone_year(WORD year, DYNAMIC_TIME_ZONE_INFORMATION *zone, TIME_ZONE_INFORMATION *out)
+{
+   if (!zone->TimeZoneKeyName[0]) return luna_zone_year_uncached(year, zone, out);
+   AcquireSRWLockShared(&luna_zone_cache_lock);
+   for (unsigned i = 0; i < 8; ++i)
+      if (luna_year_cache[i].used && luna_year_cache[i].year == year &&
+          !wcscmp(luna_year_cache[i].key, zone->TimeZoneKeyName)) {
+         const BOOL ok = luna_year_cache[i].ok;
+         if (ok) *out = luna_year_cache[i].out;
+         ReleaseSRWLockShared(&luna_zone_cache_lock);
+         return ok;
+      }
+   ReleaseSRWLockShared(&luna_zone_cache_lock);
+   TIME_ZONE_INFORMATION rules;
+   memset(&rules, 0, sizeof rules);
+   const BOOL ok = luna_zone_year_uncached(year, zone, &rules);
+   AcquireSRWLockExclusive(&luna_zone_cache_lock);
+   const unsigned slot = luna_year_cache_next++ % 8;
+   wcsncpy(luna_year_cache[slot].key, zone->TimeZoneKeyName, 127);
+   luna_year_cache[slot].key[127] = 0;
+   luna_year_cache[slot].year = year;
+   luna_year_cache[slot].ok = ok;
+   luna_year_cache[slot].out = rules;
+   luna_year_cache[slot].used = 1;
+   ReleaseSRWLockExclusive(&luna_zone_cache_lock);
+   if (ok) *out = rules;
+   return ok;
 }
 static int luna_ms_system(int64_t ms, SYSTEMTIME *st)
 {
@@ -4211,6 +4278,20 @@ static void pio_bench(void)
    }
    luna_fd_close(fd);
    DeleteFileA(path);
+   {   /* localtime's zone work, as it was (registry every call) and cached */
+      DYNAMIC_TIME_ZONE_INFORMATION tz; TIME_ZONE_INFORMATION year;
+      LONG64 t0 = io_now();
+      for (int i = 0; i < 20; ++i) {
+         luna_zone_uncached("America/New_York", &tz);
+         luna_zone_year_uncached(2026, &tz, &year);
+      }
+      LONG64 t1 = io_now();
+      struct tm tm; int32_t off; char name[128];
+      for (int i = 0; i < 200; ++i) luna_calendar_break((1700000000LL + i * 3600) * 1000, "America/New_York", &tm, &off, name, sizeof name);
+      LONG64 t2 = io_now();
+      fprintf(stderr, "[iobench] localtime zone lookup: uncached %.1f us/call, cached (whole localtime) %.2f us/call\n",
+              (t1 - t0) * 1e6 / f.QuadPart / 20, (t2 - t1) * 1e6 / f.QuadPart / 200);
+   }
 }
 
 void luna_os_sampler_start(unsigned long long (*jit_count)(void), unsigned long long (*jit_ns)(void))
