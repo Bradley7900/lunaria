@@ -2021,17 +2021,36 @@ static void resolution_values(int index, int *width, int *height)
    *width = g_resolutions[index].width; *height = g_resolutions[index].height;
    if (g_menu_h > g_menu_w) { int t = *width; *width = *height; *height = t; }
 }
-struct menu_setting { const char *key, *label; int value, initial; const int *choices; size_t count; };
+/* A numeric setting cycles through `choices` (0 = Automatic, the key unset).
+ * A named one (`names` set) cycles through indices: names[i] is shown and
+ * envs[i] is what the key is set to, NULL leaving it unset. */
+struct menu_setting { const char *key, *label; int value, initial; const int *choices; size_t count;
+                      const char *const *names, *const *envs; };
 static const int ram_choices[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
 static const int cpu_choices[] = {1, 2, 4, 6, 8, 12, 16};
 static const int engine_choices[] = {0, 1, 2, 3, 4, 6, 8};
 static const int dpi_choices[] = {0, 160, 240, 320, 420, 480, 640};
-#define SETTING(key, label, choices) {key, label, 0, 0, choices, sizeof choices / sizeof choices[0]}
+#define SETTING(key, label, choices) {key, label, 0, 0, choices, sizeof choices / sizeof choices[0], NULL, NULL}
+#define SETTING_NAMED(key, label, names, envs) \
+   {key, label, 0, 0, index_choices, sizeof names / sizeof names[0], names, envs}
+static const int index_choices[] = {0, 1, 2, 3};
+static const char *const frame_names[] = {"Automatic (measured)", "Shared GPU textures", "Copy through memory"};
+static const char *const frame_envs[] = {NULL, "1", "0"};
+static const char *const etc_names[] = {"Compressed on GPU", "Unpacked (exact)"};
+static const char *const etc_envs[] = {NULL, "0"};
+static const char *const astc_names[] = {"Convert to BC3", "Convert, uncompressed", "Off (unsupported)"};
+static const char *const astc_envs[] = {NULL, "rgba", "0"};
+static const char *const cache_names[] = {"On", "Off"};
+static const char *const cache_envs[] = {NULL, "0"};
 static struct menu_setting g_settings[] = {
    SETTING("LUNARIA_MEM_TOTAL_MB", "Memory reported to Android (MiB)", ram_choices),
    SETTING("LUNARIA_CPU_COUNT", "CPU cores reported to Android", cpu_choices),
    SETTING("LUNARIA_A64_ENGINES", "Parallel execution engines", engine_choices),
    SETTING("LUNARIA_DPI", "Screen density (DPI)", dpi_choices),
+   SETTING_NAMED("LUNARIA_COMP_SHARE", "Frame hand-off", frame_names, frame_envs),
+   SETTING_NAMED("LUNARIA_ETC_LOSSY", "ETC textures", etc_names, etc_envs),
+   SETTING_NAMED("LUNARIA_ASTC", "ASTC textures", astc_names, astc_envs),
+   SETTING_NAMED("LUNARIA_TEXCACHE", "Converted texture cache", cache_names, cache_envs),
 };
 #undef SETTING
 static void settings_load(void)
@@ -2041,7 +2060,12 @@ static void settings_load(void)
       struct menu_setting *v = &g_settings[i];
       if (!g_settings_loaded) {
          const char *env = getenv(v->key);
-         v->initial = env ? atoi(env) : i == 0 ? 6144 : i == 1 ? 4 : 0;
+         if (v->names) {
+            v->initial = 0;
+            for (size_t k = 1; env && k < v->count; ++k)
+               if (v->envs[k] && !strcmp(env, v->envs[k])) v->initial = (int)k;
+         } else
+            v->initial = env ? atoi(env) : i == 0 ? 6144 : i == 1 ? 4 : 0;
       }
       v->value = v->initial;
    }
@@ -2463,7 +2487,7 @@ static void menu_publish_locked(void)
       const int width = g_menu_w < 488 ? g_menu_w - 16 : 472;
       menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
       menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;width:%dpx;\">",
-                (g_menu_w - width) / 2, menu_clampi((g_menu_h - 310) / 2, 8, g_menu_h), width);
+                (g_menu_w - width) / 2, menu_clampi((g_menu_h - 400) / 2, 8, g_menu_h), width);
       menu_header(&doc, "SETTINGS — THIS APP");
       menu_item(&doc, NULL, "Resolution applies now; other changes on restart.", false, NULL);
       menu_sep(&doc);
@@ -2471,7 +2495,9 @@ static void menu_publish_locked(void)
          char id[32], value[32];
          snprintf(id, sizeof id, "setting-%zu", i);
          snprintf(value, sizeof value, "%d", g_settings[i].value);
-         menu_item(&doc, id, g_settings[i].label, false, g_settings[i].value ? value : "Automatic");
+         menu_item(&doc, id, g_settings[i].label, false,
+                   g_settings[i].names ? g_settings[i].names[g_settings[i].value]
+                   : g_settings[i].value ? value : "Automatic");
       }
       char resolution[32];
       int rw = g_menu_w, rh = g_menu_h;
@@ -3068,7 +3094,8 @@ static void menu_clicked(const char *id)
          if (v->value == v->initial) continue;
          restart_required = true;
          snprintf(value, sizeof value, "%d", v->value);
-         if (menu_conf_write(v->key, v->value ? value : NULL, false)) v->initial = v->value;
+         const char *to = v->names ? v->envs[v->value] : v->value ? value : NULL;
+         if (menu_conf_write(v->key, to, false)) v->initial = v->value;
          else saved = false;
       }
       if (g_resolution_dirty) {
@@ -3270,6 +3297,39 @@ static void menu_clicked(const char *id)
    pthread_mutex_unlock(&g_menu_lock);
 }
 
+/* LUNARIA_DBG_SETTINGS=S: S seconds in, open Settings and step the Frame
+ * hand-off and ASTC rows once each (nothing is saved; Cancel 20 s later), so
+ * a headless run can photograph the panel. */
+static void settings_selftest_tick(void)
+{
+   static int stage = -1;
+   static double t0;
+   if (stage == -1) {
+      const char *e = getenv("LUNARIA_DBG_SETTINGS");
+      stage = e && atoi(e) > 0 ? 0 : 99;
+      t0 = menu_now() + (e ? atoi(e) : 0);
+      return;
+   }
+   if (stage >= 99 || menu_now() < t0 + (stage ? 20 : 0)) return;
+   if (stage == 0) {
+      luna_menu_open(20, 20, ke_w(), ke_h());
+      menu_clicked("luna-menu-settings");
+      for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i)
+         if (!strcmp(g_settings[i].key, "LUNARIA_COMP_SHARE") || !strcmp(g_settings[i].key, "LUNARIA_ASTC")) {
+            char id[48]; snprintf(id, sizeof id, "luna-menu-setting-%zu", i);
+            menu_clicked(id);
+            fprintf(stderr, "[settings-test] %s -> %s
+", g_settings[i].label, g_settings[i].names[g_settings[i].value]);
+         }
+      stage = 1;
+   } else {
+      menu_clicked("luna-menu-settings-cancel");
+      fprintf(stderr, "[settings-test] cancelled, settings open=%d
+", (int)g_settings_open);
+      stage = 99;
+   }
+}
+
 /* LUNARIA_DBG_KEYEDIT=S: S seconds after the first menu tick, drive the
  * keymap editor through luna_overlay_pointer / luna_overlay_host_key exactly
  * as the window's input would (add J, drag the stick, add K, save 26 s
@@ -3366,6 +3426,7 @@ void luna_menu_close(void)
 void luna_menu_tick(void)
 {
    keyedit_selftest_tick();
+   settings_selftest_tick();
    pthread_mutex_lock(&g_menu_lock);
    if (g_menu_notice[0] && menu_now() >= g_menu_notice_until) {
       g_menu_notice[0] = '\0';
