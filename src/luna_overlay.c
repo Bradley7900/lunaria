@@ -3270,6 +3270,73 @@ static void menu_clicked(const char *id)
    pthread_mutex_unlock(&g_menu_lock);
 }
 
+/* LUNARIA_DBG_KEYEDIT=S: S seconds after the first menu tick, drive the
+ * keymap editor through luna_overlay_pointer / luna_overlay_host_key exactly
+ * as the window's input would (add J, drag the stick, add K, save 26 s
+ * later), so a headless run can photograph it with LUNARIA_COMP_SHOT_S and
+ * check the file it wrote. */
+static void keyedit_selftest_tick(void)
+{
+   static int stage = -1;
+   static double t0;
+   if (stage == -1) {
+      const char *e = getenv("LUNARIA_DBG_KEYEDIT");
+      stage = e && atoi(e) > 0 ? 0 : 99;
+      t0 = menu_now() + (e ? atoi(e) : 0);
+      return;
+   }
+   if (stage >= 99) return;
+   const double t = menu_now() - t0, w = ke_w(), h = ke_h();
+   if (t < stage) return;
+   switch (stage) {
+   case 0:
+      menu_clicked("luna-menu-km-edit");
+      fprintf(stderr, "[keyedit-test] editor open=%d size %dx%d\n", (int)g_ke_open, (int)w, (int)h);
+      break;
+   case 1:
+      luna_overlay_pointer(w * .60, h * .40, 1);
+      luna_overlay_pointer(w * .60, h * .40, 0);
+      break;
+   case 2:
+      luna_overlay_host_key('J', 1, 0);
+      luna_overlay_host_key('J', 0, 0);
+      break;
+   case 3: {
+      pthread_mutex_lock(&g_menu_lock);
+      const double sx = g_ke.stick_x * w, sy = g_ke.stick_y * h;
+      pthread_mutex_unlock(&g_menu_lock);
+      luna_overlay_pointer(sx, sy, 1);
+      luna_overlay_pointer(sx + w * .05, sy - h * .03, -1);
+      luna_overlay_pointer(w * .22, h * .70, -1);
+      luna_overlay_pointer(w * .22, h * .70, 0);
+      break;
+   }
+   case 4:
+      luna_overlay_pointer(w * .78, h * .62, 1);
+      luna_overlay_pointer(w * .78, h * .62, 0);
+      luna_overlay_host_key('K', 1, 0);
+      luna_overlay_host_key('K', 0, 0);
+      pthread_mutex_lock(&g_menu_lock);
+      fprintf(stderr, "[keyedit-test] %d buttons, stick %.3f,%.3f r %.3f\n", g_ke.n, g_ke.stick_x, g_ke.stick_y, g_ke.radius);
+      pthread_mutex_unlock(&g_menu_lock);
+      stage = 29;   /* hold the editor up for the screenshots, then save */
+      return;
+   case 30: {
+      luna_overlay_host_key(257, 1, 0);
+      char path[4096]; luna_keymap_current(path, sizeof path);
+      fprintf(stderr, "[keyedit-test] after Enter: editor open=%d, keymap now %s\n", (int)g_ke_open, path);
+      FILE *f = fopen(path, "r");
+      char line[256];
+      while (f && fgets(line, sizeof line, f)) fprintf(stderr, "[keyedit-test]   %s", line);
+      if (f) fclose(f);
+      stage = 99;
+      return;
+   }
+   default: break;
+   }
+   ++stage;
+}
+
 void luna_menu_open(double x, double y, int w, int h)
 {
    luna_overlay_set_menu_handler(menu_clicked);
@@ -3298,6 +3365,7 @@ void luna_menu_close(void)
 
 void luna_menu_tick(void)
 {
+   keyedit_selftest_tick();
    pthread_mutex_lock(&g_menu_lock);
    if (g_menu_notice[0] && menu_now() >= g_menu_notice_until) {
       g_menu_notice[0] = '\0';
