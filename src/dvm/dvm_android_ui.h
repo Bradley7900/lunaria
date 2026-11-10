@@ -7630,7 +7630,24 @@ static void store_update(struct dvm *vm, dvm_ref context, const char *pkg)
 {
    char file[4096];
    if (luna_apk_find_update(pkg, file, sizeof file) == 0) {
-      fprintf(stderr, "[update] installing %s over %s and restarting\n", file, pkg);
+      /* Never on the first press: the player is told which file was found
+       * and confirms by pressing update again within two minutes. */
+      static char pending[4096];
+      static time_t pending_at;
+      const time_t now = time(NULL);
+      if (strcmp(pending, file) || now - pending_at > 120) {
+         snprintf(pending, sizeof pending, "%s", file);
+         pending_at = now;
+         const char *base = strrchr(file, '/');
+         char msg[700];
+         snprintf(msg, sizeof msg, "Update found: %s. Press update again to install it (your save stays), "
+                  "or ignore this to keep playing.", base ? base + 1 : file);
+         fprintf(stderr, "[update] found %s for %s, waiting for a second press\n", file, pkg);
+         host_toast(vm, context, msg);
+         return;
+      }
+      pending[0] = '\0';
+      fprintf(stderr, "[update] confirmed: installing %s over %s and restarting\n", file, pkg);
       luna_apk_restart_archive(file);   /* returns only if it failed */
       host_toast(vm, context, "Found the update file but could not restart with it. Open it from the Lunaria launcher.");
       return;
