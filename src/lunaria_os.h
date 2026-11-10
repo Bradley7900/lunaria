@@ -1362,6 +1362,11 @@ int luna_os_fd_path(int fd, char *buf, size_t bufsz);
  * a launcher or Finder is free to choose. */
 int luna_os_executable_path(char *buf, size_t bufsz);
 
+/* Open an http:// or https:// URL in a browser on the host desktop.
+ * LUNARIA_EXTERNAL_BROWSER picks the browser; default is the system's.
+ * Anything but http/https is refused (EINVAL). */
+int luna_os_open_url(const char *url);
+
 /* True when a dynamic-loader address belongs to executable code.  Guest
  * calls need an ABI bridge; host data symbols must never receive one. */
 int luna_os_symbol_is_function(void *address);

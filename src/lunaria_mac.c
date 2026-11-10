@@ -160,6 +160,7 @@ void luna_os_backtrace_print(void *const *frames, int count)
 #include <sys/socket.h>
 #include <sys/statvfs.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <net/if.h>
@@ -1518,3 +1519,35 @@ void *luna_os_library_loaded_symbol(const char *module, const char *name)
 }
 
 void luna_os_angle_vulkan_prepare(void) {}
+
+/* Open an http(s) URL in a browser on the host desktop (a game's login or
+ * "open website" button).  LUNARIA_EXTERNAL_BROWSER names a browser to use;
+ * otherwise the desktop's default opener does.  The URL is one argv entry,
+ * never a shell string, and only http/https is accepted. */
+int luna_os_open_url(const char *url)
+{
+   if (!url || (strncmp(url, "http://", 7) && strncmp(url, "https://", 8))) {
+      errno = EINVAL;
+      return -1;
+   }
+   const char *browser = getenv("LUNARIA_EXTERNAL_BROWSER");
+#if defined(__APPLE__)
+   const char *opener = (browser && *browser) ? browser : "open";
+#else
+   const char *opener = (browser && *browser) ? browser : "xdg-open";
+#endif
+   pid_t pid = fork();
+   if (pid < 0) return -1;
+   if (pid == 0) {
+      /* Grandchild runs the opener, so nothing is left for us to reap. */
+      if (fork() == 0) {
+         setsid();
+         execlp(opener, opener, url, (char *)NULL);
+         _exit(127);
+      }
+      _exit(0);
+   }
+   int status;
+   while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+   return 0;
+}

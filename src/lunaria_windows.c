@@ -4666,3 +4666,40 @@ void luna_os_sampler_start(unsigned long long (*jit_count)(void), unsigned long 
       fprintf(stderr, "[sample] sampling every %d ms\n", ms);
    }
 }
+
+/* Open an http(s) URL in a browser on the host desktop (a game's login or
+ * "open website" button).  LUNARIA_EXTERNAL_BROWSER names a browser
+ * executable to use; otherwise the user's default browser opens it.  Only
+ * plain http/https reaches here (the caller checks), and the URL is passed
+ * as one quoted argument, so a guest cannot make this run anything else. */
+int luna_os_open_url(const char *url)
+{
+   if (!url || (strncmp(url, "http://", 7) && strncmp(url, "https://", 8))) {
+      errno = EINVAL;
+      return -1;
+   }
+   for (const char *p = url; *p; ++p)
+      if ((unsigned char)*p < 0x20 || *p == '"') { errno = EINVAL; return -1; }
+   const char *browser = getenv("LUNARIA_EXTERNAL_BROWSER");
+   char cmd[8192];
+   int n;
+   if (browser && *browser)
+      n = snprintf(cmd, sizeof cmd, "\"%s\" \"%s\"", browser, url);
+   else
+      n = snprintf(cmd, sizeof cmd, "rundll32.exe url.dll,FileProtocolHandler \"%s\"", url);
+   if (n < 0 || (size_t)n >= sizeof cmd) { errno = ENAMETOOLONG; return -1; }
+   wchar_t wcmd[8192];
+   if (!MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, (int)(sizeof wcmd / sizeof wcmd[0]))) {
+      errno = EINVAL;
+      return -1;
+   }
+   STARTUPINFOW si = { .cb = sizeof si };
+   PROCESS_INFORMATION pi;
+   if (!CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+      errno = ENOENT;
+      return -1;
+   }
+   CloseHandle(pi.hThread);
+   CloseHandle(pi.hProcess);
+   return 0;
+}

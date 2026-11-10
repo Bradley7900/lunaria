@@ -7650,6 +7650,22 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
       union dvm_value act = { 0 };
       (void)dvm_get_field(vm, intent, "action", "Ljava/lang/String;", &act);
       const char *a = act.l ? dvm_string_utf8(vm, act.l) : NULL;
+      /* No Android browser here: a web link (login pages, "open website",
+       * Custom Tabs) goes to the desktop browser instead of failing. */
+      if (a && !strcmp(a, "android.intent.action.VIEW")) {
+         union dvm_value data = { 0 }, text = { 0 };
+         (void)dvm_get_field(vm, intent, "data", "Landroid/net/Uri;", &data);
+         if (data.l && am_vcall(vm, data.l, "toString", "()Ljava/lang/String;", NULL, 0, &text) && text.l) {
+            const char *url = dvm_string_utf8(vm, text.l);
+            if (url && (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8))) {
+               int rc = getenv("LUNARIA_NO_EXTERNAL_BROWSER") ? -1 : luna_os_open_url(url);
+               fprintf(stderr, "[activity] web link %s on the desktop browser: %.200s\n",
+                       rc == 0 ? "opened" : "NOT opened", url);
+               if (rc == 0) return true;
+            }
+         }
+         if (dvm_exception(vm)) dvm_clear_exception(vm);
+      }
       dvm__throw(vm, "android/content/ActivityNotFoundException",
                  "No Activity found to handle Intent { %s%s }",
                  a ? "act=" : "", a ? a : "");
