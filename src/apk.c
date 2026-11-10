@@ -2113,6 +2113,10 @@ done:
  * cannot be taken back: a later run pointed elsewhere does not find what an
  * earlier one downloaded. */
 static bool g_google_from_launcher;
+static bool g_google_auto;
+static char g_google_auto_pkg[256];
+static int google_find_download(const char *root, char *out, size_t cap, char *pkg_out, size_t pkg_cap);
+static int google_setup_restart(void);
 static int launcher_ask(int *argc, const char ***argv)
 {
    static const char *const devices[] = {"", "pixel6", "pixel7", "galaxys21", "lunaria", NULL};
@@ -2303,7 +2307,11 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       char note[APK_PATH + 128];
       snprintf(note, sizeof note, "Shared data folder: %s",
                env_value("LUNARIA_DATA_ROOT", "."));
-      if (luna_launcher_pick_named(selected, sizeof selected, "Install Google services", note)) return 1;
+      /* Guided setup: Google apps the person downloaded and has not
+       * installed yet are taken from Downloads in order, no picker. */
+      if (!google_find_download(env_value("LUNARIA_DATA_ROOT", "."), selected, sizeof selected, g_google_auto_pkg, sizeof g_google_auto_pkg)) {
+         g_google_auto = true;
+      } else if (luna_launcher_pick_named(selected, sizeof selected, "Install Google services", note)) return 1;
       argument = selected;
    } else {
       if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
@@ -3062,6 +3070,66 @@ int luna_apk_google_services_open(int setup, const char *profile)
 
 /* Starts over with no arguments: the screen a launch without an APK shows,
  * where another one can be chosen.  Returns only when it could not. */
+/* Newest downloaded archive of the first Google app (framework, then
+ * services, then Play Store) that has no system install under `root` yet. */
+static int google_find_download(const char *root, char *out, size_t cap, char *pkg_out, size_t pkg_cap)
+{
+   static const char *const order[] = {"com.google.android.gsf", "com.google.android.gms", "com.android.vending"};
+   char dirs[2][APK_PATH];
+   int nd = 0;
+   const char *env = getenv("LUNARIA_UPDATE_DIR");
+   if (env && *env) snprintf(dirs[nd++], APK_PATH, "%s", env);
+#ifdef _WIN32
+   const char *home = getenv("USERPROFILE");
+#else
+   const char *home = getenv("HOME");
+#endif
+   if (home && *home) snprintf(dirs[nd++], APK_PATH, "%s/Downloads", home);
+   for (size_t o = 0; o < sizeof order / sizeof order[0]; ++o) {
+      char have[APK_PATH];
+      if (!system_archive_path(root, order[o], have, sizeof have) && exists(have)) continue;
+      time_t best = 0;
+      out[0] = '\0';
+      for (int d = 0; d < nd; ++d) {
+         luna_directory *dir = luna_directory_open(dirs[d]);
+         if (!dir) continue;
+         luna_directory_entry *ent;
+         while ((ent = luna_directory_read(dir))) {
+            const char *name = ent->d_name;
+            if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks")) continue;
+            char path[APK_PATH], pkg[256];
+            struct stat st;
+            snprintf(path, sizeof path, "%s/%s", dirs[d], name);
+            if (luna_file_stat_follow(path, &st) != 0 || st.st_mtime <= best) continue;
+            if (!update_archive_package(path, pkg, sizeof pkg) || strcmp(pkg, order[o])) continue;
+            best = st.st_mtime;
+            snprintf(out, cap, "%s", path);
+         }
+         luna_directory_close(dir);
+      }
+      if (out[0]) {
+         snprintf(pkg_out, pkg_cap, "%s", order[o]);
+         fprintf(stderr, "[apk] Google services: found %s in Downloads\n", out);
+         return 0;
+      }
+   }
+   return -1;
+}
+
+static int google_setup_restart(void)
+{
+   char exe[APK_PATH];
+   if (!g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
+   const char *args[3] = { exe, "--google-services", NULL };
+   fflush(NULL);
+#ifdef _WIN32
+   _execve(exe, args, (const char *const *)g_restart_environment);
+#else
+   execve(exe, (char *const *)args, g_restart_environment);
+#endif
+   return -1;
+}
+
 int luna_apk_restart_launcher(void)
 {
    char exe[APK_PATH];
@@ -3082,8 +3150,19 @@ int luna_apk_prepare(int *argc, const char ***argv)
    int result = apk_prepare_inner(argc, argv);
    if (result == 0 && host_driver_defaults()) result = apk_error("cannot configure host driver");
    if (result == 0 && luna_launcher_cancelled()) result = apk_error("installation cancelled");
-   const bool back_to_launcher = g_google_from_launcher && result == 1 && !luna_launcher_cancelled();
+   const bool back_to_launcher = (g_google_from_launcher || g_google_auto) && result == 1 && !luna_launcher_cancelled();
    luna_launcher_end(result == 0);
+   /* Guided setup: once this one really landed, go straight on to the next
+    * downloaded Google app. Requiring the install to exist stops a loop. */
+   if (back_to_launcher && g_google_auto) {
+      char next[APK_PATH], pkg[256], have[APK_PATH];
+      const char *root = env_value("LUNARIA_DATA_ROOT", ".");
+      if (!system_archive_path(root, g_google_auto_pkg, have, sizeof have) && exists(have) &&
+          !google_find_download(root, next, sizeof next, pkg, sizeof pkg)) {
+         fprintf(stderr, "[apk] Google services: next is %s\n", next);
+         if (google_setup_restart()) fprintf(stderr, "[apk] cannot continue Google services setup\n");
+      }
+   }
    /* Installed (or picked nothing) from the launcher's Google services button:
     * show the launcher again rather than closing on the person. */
    if (back_to_launcher && luna_apk_restart_launcher())
