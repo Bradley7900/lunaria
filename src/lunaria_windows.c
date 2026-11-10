@@ -4667,6 +4667,44 @@ void luna_os_sampler_start(unsigned long long (*jit_count)(void), unsigned long 
    }
 }
 
+/* HKCU\Software\Classes\<scheme>: a per-user URL protocol, no admin.  A
+ * scheme some other program already handles is left alone. */
+int luna_os_register_url_scheme(const char *scheme, const char *command)
+{
+   if (!scheme || !*scheme || !command) { errno = EINVAL; return -1; }
+   wchar_t ws[96], wcmd[8192], key[256], cur[8192];
+   if (!MultiByteToWideChar(CP_UTF8, 0, scheme, -1, ws, 96) ||
+       !MultiByteToWideChar(CP_UTF8, 0, command, -1, wcmd, 8192)) { errno = EINVAL; return -1; }
+   _snwprintf(key, 256, L"Software\Classes\%ls\shell\open\command", ws);
+   key[255] = 0;
+   DWORD size = sizeof cur;
+   if (RegGetValueW(HKEY_CURRENT_USER, key, NULL, RRF_RT_REG_SZ, NULL, cur, &size) == ERROR_SUCCESS &&
+       !wcsstr(cur, L"--deliver-url")) return 1;
+   size = sizeof cur;
+   wchar_t mkey[256];
+   _snwprintf(mkey, 256, L"%ls\shell\open\command", ws);
+   mkey[255] = 0;
+   if (RegGetValueW(HKEY_CLASSES_ROOT, mkey, NULL, RRF_RT_REG_SZ, NULL, cur, &size) == ERROR_SUCCESS &&
+       !wcsstr(cur, L"--deliver-url")) return 1;
+   HKEY base = NULL, cmd = NULL;
+   wchar_t bkey[160], desc[128];
+   _snwprintf(bkey, 160, L"Software\Classes\%ls", ws);
+   bkey[159] = 0;
+   _snwprintf(desc, 128, L"URL:%ls (Lunaria)", ws);
+   desc[127] = 0;
+   int rc = -1;
+   if (RegCreateKeyExW(HKEY_CURRENT_USER, bkey, 0, NULL, 0, KEY_WRITE, NULL, &base, NULL) == ERROR_SUCCESS &&
+       RegSetValueExW(base, NULL, 0, REG_SZ, (const BYTE *)desc, (DWORD)((wcslen(desc) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS &&
+       RegSetValueExW(base, L"URL Protocol", 0, REG_SZ, (const BYTE *)L"", sizeof(wchar_t)) == ERROR_SUCCESS &&
+       RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, NULL, 0, KEY_WRITE, NULL, &cmd, NULL) == ERROR_SUCCESS &&
+       RegSetValueExW(cmd, NULL, 0, REG_SZ, (const BYTE *)wcmd, (DWORD)((wcslen(wcmd) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS)
+      rc = 0;
+   if (cmd) RegCloseKey(cmd);
+   if (base) RegCloseKey(base);
+   if (rc) errno = EIO;
+   return rc;
+}
+
 /* Open an http(s) URL in a browser on the host desktop (a game's login or
  * "open website" button).  LUNARIA_EXTERNAL_BROWSER names a browser
  * executable to use; otherwise the user's default browser opens it.  Only

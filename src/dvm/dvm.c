@@ -4169,6 +4169,7 @@ int dvm__drain_for_wait(struct dvm *vm) { return drain_pending(vm, true); }
  *
  * The pump's frame is this emulator's main-thread loop, so this belongs in it
  * next to the other things a device's main thread does every turn. */
+void dvm_deliver_inbox_url(struct dvm *vm);
 void dvm_main_looper_tick(struct dvm *vm)
 {
    /* Not only when a message is pending: input the emulator's own windows
@@ -4204,6 +4205,7 @@ void dvm_main_looper_tick(struct dvm *vm)
    const dvm_ref saved_looper = g_current_looper;
    g_current_looper = 0;
    dvm__network_tick(vm);
+   dvm_deliver_inbox_url(vm);
    bool dispatched = false;
    const uint64_t now = dvm__now_ms();
    for (int i = 0; i < vm->npending; ++i)

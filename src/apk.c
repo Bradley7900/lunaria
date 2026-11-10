@@ -2112,6 +2112,70 @@ done:
  * had been given.  The data folder leads because it is the one choice that
  * cannot be taken back: a later run pointed elsewhere does not find what an
  * earlier one downloaded. */
+/* Login return links.  A game that logs in through the desktop browser gets
+ * sent back by a link in its own scheme (mygame://auth?code=...).  Each
+ * BROWSABLE VIEW filter scheme of the game is registered with the desktop
+ * (per user), pointing at `lunaria --deliver-url <data root> <link>`; that
+ * second process drops the link in <data root>/inbox-url.txt and exits, and
+ * the running game picks it up on its main looper (dvm_deliver_inbox_url). */
+static bool return_link_scheme_ok(const char *s)
+{
+   static const char *const skip[] = { "http", "https", "file", "content", "market", "mailto", "tel", "sms",
+                                       "geo", "intent", "data", "javascript", "about", "android-app", "ftp" };
+   if (!s || !*s || strlen(s) > 64 || !isalpha((unsigned char)*s)) return false;
+   for (const char *c = s; *c; ++c)
+      if (!isalnum((unsigned char)*c) && *c != '+' && *c != '-' && *c != '.') return false;
+   for (size_t i = 0; i < sizeof skip / sizeof skip[0]; ++i)
+      if (!strcasecmp(s, skip[i])) return false;
+   return true;
+}
+
+static void register_return_links(const char *rows, const char *root)
+{
+   if (!rows || !*rows || !root || getenv("LUNARIA_NO_RETURN_LINKS")) return;
+   char exe[APK_PATH], command[APK_PATH * 2 + 64];
+   if (luna_os_executable_path(exe, sizeof exe)) return;
+   if (strchr(exe, '"') || strchr(root, '"')) return;
+   snprintf(command, sizeof command, "\"%s\" --deliver-url \"%s\" \"%%1\"", exe, root);
+   char *copy = strdup(rows);
+   for (char *p = copy, *row; p && (row = luna_strsep(&p, "\n"));) {
+      char *name = luna_strsep(&row, "|"), *actions = luna_strsep(&row, "|"), *cats = luna_strsep(&row, "|");
+      (void)name;
+      if (!actions || !cats || !row || !strstr(actions, "android.intent.action.VIEW") ||
+          !strstr(cats, "android.intent.category.BROWSABLE")) continue;
+      (void)luna_strsep(&row, "|"); (void)luna_strsep(&row, "|");   /* data flag, priority */
+      for (char *spec; row && (spec = luna_strsep(&row, ";,"));) {
+         if (strncmp(spec, "scheme=", 7) || !return_link_scheme_ok(spec + 7)) continue;
+         int rc = luna_os_register_url_scheme(spec + 7, command);
+         fprintf(stderr, "[apk] return link %s://: %s\n", spec + 7,
+                 rc == 0 ? "registered" : rc == 1 ? "left alone (another app owns it)" : "not registered");
+      }
+   }
+   free(copy);
+}
+
+/* `lunaria --deliver-url <data root> <link>`: hand the link to the running
+ * game and exit.  Returns 1 when this was that call. */
+static int deliver_url_command(int argc, const char **argv)
+{
+   if (argc != 4 || strcmp(argv[1], "--deliver-url")) return 0;
+   const char *root = argv[2], *url = argv[3];
+   const char *colon = strchr(url, ':');
+   if (!colon || strlen(url) > 8000) { fprintf(stderr, "[apk] --deliver-url: not a link\n"); return 1; }
+   char scheme[80];
+   snprintf(scheme, sizeof scheme, "%.*s", (int)(colon - url < 79 ? colon - url : 79), url);
+   if (!return_link_scheme_ok(scheme)) { fprintf(stderr, "[apk] --deliver-url: scheme refused\n"); return 1; }
+   char tmp[APK_PATH], dst[APK_PATH];
+   if (path_join(tmp, sizeof tmp, root, "inbox-url.tmp") || path_join(dst, sizeof dst, root, "inbox-url.txt")) return 1;
+   FILE *f = fopen(tmp, "wb");
+   if (!f) { fprintf(stderr, "[apk] --deliver-url: cannot write %s\n", tmp); return 1; }
+   fputs(url, f);
+   fclose(f);
+   (void)remove(dst);
+   if (rename(tmp, dst)) fprintf(stderr, "[apk] --deliver-url: cannot place %s\n", dst);
+   return 1;
+}
+
 static bool g_google_from_launcher;
 static bool g_google_auto;
 static char g_google_auto_pkg[256];
@@ -2572,6 +2636,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       } else
          luna_os_unsetenv(metadata[i].key);
    }
+   if (!service_host) register_return_links(text_get(&m->activity_filters), root);
    /* A service host answers for every process the package declares. */
    if (service_host ? env_set("ANDROID_SERVICE_HOST", "1", true) : (luna_os_unsetenv("ANDROID_SERVICE_HOST"), 0))
       goto done;
@@ -3147,6 +3212,7 @@ int luna_apk_restart_launcher(void)
 
 int luna_apk_prepare(int *argc, const char ***argv)
 {
+   if (*argc > 1 && deliver_url_command(*argc, *argv)) exit(0);
    int result = apk_prepare_inner(argc, argv);
    if (result == 0 && host_driver_defaults()) result = apk_error("cannot configure host driver");
    if (result == 0 && luna_launcher_cancelled()) result = apk_error("installation cancelled");

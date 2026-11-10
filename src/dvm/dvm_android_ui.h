@@ -14602,3 +14602,59 @@ static bool list_view_tap(struct dvm *vm,dvm_ref list,dvm_ref clicked)
 static const struct rt_method rt_item_click_listener[]={
    {"onItemClick","(Landroid/widget/AdapterView;Landroid/view/View;IJ)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END
 };
+
+/* A login return link `lunaria --deliver-url` dropped in the data root (see
+ * register_return_links in apk.c): start it as a BROWSABLE VIEW intent from
+ * the top activity, the way a phone's browser hands it back to the game. */
+void dvm_deliver_inbox_url(struct dvm *vm)
+{
+   static uint64_t last;
+   const uint64_t now = dvm__now_ms();
+   if (now - last < 300) return;
+   last = now;
+   const char *root = getenv("LUNARIA_DATA_ROOT");
+   if (!root || !*root || !g_nacts) return;
+   char path[4096], url[8192];
+   if (snprintf(path, sizeof path, "%s/inbox-url.txt", root) >= (int)sizeof path) return;
+   FILE *f = fopen(path, "rb");
+   if (!f) return;
+   size_t n = fread(url, 1, sizeof url - 1, f);
+   fclose(f);
+   (void)remove(path);
+   url[n] = 0;
+   while (n && (url[n - 1] == '\n' || url[n - 1] == '\r' || url[n - 1] == ' ')) url[--n] = 0;
+   if (!n) return;
+   struct dvm_class *uc = dvm__class_by_desc(vm, "Landroid/net/Uri;");
+   struct dvm_class *ic = dvm__class_by_desc(vm, "Landroid/content/Intent;");
+   struct dvm_method *parse = uc ? dvm_find_method(vm, uc, "parse", "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
+   struct dvm_method *init = ic ? dvm_find_method(vm, ic, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V") : NULL;
+   union dvm_value text = { .l = dvm_new_string(vm, url) }, uri = { 0 }, ignored = { 0 };
+   bool ok = false;
+   if (parse && init && text.l) {
+      dvm_pin(vm, text.l);
+      if (dvm_call(vm, parse, 0, &text, 1, &uri) && uri.l) {
+         dvm_pin(vm, uri.l);
+         dvm_ref intent = dvm_new_object(vm, ic);
+         if (intent) {
+            dvm_pin(vm, intent);
+            union dvm_value a[2] = { { .l = dvm_new_string(vm, "android.intent.action.VIEW") }, uri };
+            union dvm_value cat = { .l = dvm_new_string(vm, "android.intent.category.BROWSABLE") };
+            union dvm_value flags = { .i = 0x20000000 | 0x04000000 };   /* SINGLE_TOP | CLEAR_TOP */
+            ok = a[0].l && cat.l && dvm_call(vm, init, intent, a, 2, &ignored) && !dvm_exception(vm) &&
+                 am_vcall(vm, intent, "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", &cat, 1, &ignored) &&
+                 am_vcall(vm, intent, "addFlags", "(I)Landroid/content/Intent;", &flags, 1, &ignored);
+            union dvm_value arg = { .l = intent };
+            if (ok) ok = am_vcall(vm, g_acts[g_nacts - 1].activity, "startActivity", "(Landroid/content/Intent;)V", &arg, 1, &ignored) &&
+                         !dvm_exception(vm);
+            dvm_unpin(vm, intent);
+         }
+         dvm_unpin(vm, uri.l);
+      }
+      dvm_unpin(vm, text.l);
+   }
+   if (dvm_exception(vm)) dvm_clear_exception(vm);
+   char scheme[64];
+   const char *colon = strchr(url, ':');
+   snprintf(scheme, sizeof scheme, "%.*s", colon ? (int)(colon - url) : 0, url);
+   fprintf(stderr, "[activity] return link %s://... %s\n", scheme, ok ? "handed to the game" : "NOT delivered");
+}

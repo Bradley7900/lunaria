@@ -1316,6 +1316,13 @@ void luna_os_angle_vulkan_prepare(void) {}
  * "open website" button).  LUNARIA_EXTERNAL_BROWSER names a browser to use;
  * otherwise the desktop's default opener does.  The URL is one argv entry,
  * never a shell string, and only http/https is accepted. */
+int luna_os_register_url_scheme(const char *scheme, const char *command)
+{
+   (void)scheme; (void)command;
+   errno = ENOSYS;
+   return -1;
+}
+
 int luna_os_open_url(const char *url)
 {
    if (!url || (strncmp(url, "http://", 7) && strncmp(url, "https://", 8))) {

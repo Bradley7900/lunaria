@@ -1365,6 +1365,9 @@ int luna_os_executable_path(char *buf, size_t bufsz);
 /* Open an http:// or https:// URL in a browser on the host desktop.
  * LUNARIA_EXTERNAL_BROWSER picks the browser; default is the system's.
  * Anything but http/https is refused (EINVAL). */
+/* Register `scheme` links to run `command` (%1 = the link) for this user.
+ * 0 registered, 1 another program already owns the scheme, -1 failed. */
+int luna_os_register_url_scheme(const char *scheme, const char *command);
 int luna_os_open_url(const char *url);
 
 /* True when a dynamic-loader address belongs to executable code.  Guest
