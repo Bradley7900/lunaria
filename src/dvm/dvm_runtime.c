@@ -49935,15 +49935,43 @@ static const char *webview_chrome_binary(void)
       "/Applications/Chromium.app/Contents/MacOS/Chromium",
       NULL,
    };
+#elif defined(_WIN32)
+   /* Any Chromium-family browser speaks the DevTools pipe.  Windows used to
+    * fall through to the Linux paths below, so no installed browser was ever
+    * found there.  Per-user installs (Chrome, Brave) live under LOCALAPPDATA. */
+   static const struct { const char *root, *rel; } win[] = {
+      { "ProgramFiles",      "Google\\Chrome\\Application\\chrome.exe" },
+      { "ProgramFiles(x86)", "Google\\Chrome\\Application\\chrome.exe" },
+      { "LOCALAPPDATA",      "Google\\Chrome\\Application\\chrome.exe" },
+      { "ProgramFiles",      "BraveSoftware\\Brave-Browser\\Application\\brave.exe" },
+      { "ProgramFiles(x86)", "BraveSoftware\\Brave-Browser\\Application\\brave.exe" },
+      { "LOCALAPPDATA",      "BraveSoftware\\Brave-Browser\\Application\\brave.exe" },
+      { "LOCALAPPDATA",      "Chromium\\Application\\chrome.exe" },
+      { "ProgramFiles(x86)", "Microsoft\\Edge\\Application\\msedge.exe" },
+      { "ProgramFiles",      "Microsoft\\Edge\\Application\\msedge.exe" },
+   };
+   static char found[DVM_PATH_MAX];
+   for (size_t i = 0; i < sizeof win / sizeof win[0]; ++i) {
+      const char *root = getenv(win[i].root);
+      if (!root || !*root) continue;
+      snprintf(found, sizeof found, "%s\\%s", root, win[i].rel);
+      struct stat st;
+      if (luna_file_stat_follow(found, &st) == 0 && S_ISREG(st.st_mode)) return found;
+   }
+   return NULL;
 #else
    static const char *candidates[] = {
       "/opt/google/chrome/chrome", "/usr/lib/chromium/chromium",
-      "/usr/lib/chromium-browser/chromium-browser", NULL,
+      "/usr/lib/chromium-browser/chromium-browser",
+      "/opt/brave.com/brave/brave", "/usr/bin/brave-browser",
+      "/opt/microsoft/msedge/msedge", NULL,
    };
 #endif
+#if !defined(_WIN32)
    for (int i = 0; candidates[i]; ++i)
       if (luna_file_access(candidates[i], X_OK) == 0) return candidates[i];
    return NULL;
+#endif
 }
 
 static const char *webview_browser_binary(void)
