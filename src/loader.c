@@ -2166,10 +2166,12 @@ main(int argc, const char *argv[])
     * "loading module" and dependency messages at the end of the file. */
    setvbuf(stdout, NULL, _IOLBF, 0);
 #ifdef _WIN32
-   /* The Windows CRT has no line buffering (_IOLBF means full), so a crash
-    * lost the tail of the log mid-line, the crash report included.  Unbuffered
-    * stderr keeps every line up to the fault. */
-   setvbuf(stderr, NULL, _IONBF, 0);
+   /* The Windows CRT has no line buffering (_IOLBF means full), so a crash can
+    * lose the tail of the log mid-line.  The crash handler writes its own lines
+    * straight to the handle, so that is covered; unbuffered stderr for every
+    * other line is opt-in, because on by default it kept the sample game on
+    * its loading screen for 150 s on a 2-core runner (one write per line). */
+   if (getenv("LUNARIA_STDERR_UNBUFFERED")) setvbuf(stderr, NULL, _IONBF, 0);
 #endif
 #ifndef _WIN32
    signal(SIGABRT, host_abort_report);
