@@ -116,6 +116,11 @@ const char *luna_apk_profile_current(void);
 int luna_apk_profile_list(char (*names)[65], int max);
 int luna_apk_profile_new_name(char *out, size_t cap);
 int luna_apk_restart(const char *profile);
+/* Starts over on another archive (an update), same profile and options. */
+int luna_apk_restart_archive(const char *archive);
+/* Newest .apk/.xapk/.apks for `package` in LUNARIA_UPDATE_DIR or Downloads
+ * that is newer than the running archive; 0 and its path, else -1. */
+int luna_apk_find_update(const char *package, char *out, size_t cap);
 /* Starts over with no APK, showing the launcher screen. */
 int luna_apk_restart_launcher(void);
 /* Optional Google packages and their account settings share the current

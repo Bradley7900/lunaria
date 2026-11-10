@@ -7592,6 +7592,54 @@ void dvm__activity_visible(struct dvm *vm, dvm_ref activity)
    act_reconcile_visibility(vm);
 }
 
+/* apk.c (luna_boot.h is not part of this unit). */
+int luna_apk_restart_archive(const char *archive);
+int luna_apk_find_update(const char *package, char *out, size_t cap);
+static bool toast_make_text(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
+static bool toast_show(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
+
+/* A long Toast from the emulator itself, over the game. */
+static void host_toast(struct dvm *vm, dvm_ref context, const char *msg)
+{
+   union dvm_value a[3] = { { .l = context }, { .l = dvm_new_string(vm, msg) }, { .i = 1 } };
+   union dvm_value t = { 0 }, ignored = { 0 };
+   if (a[1].l && toast_make_text(vm, 0, a, 3, &t) && t.l) (void)toast_show(vm, t.l, NULL, 0, &ignored);
+   if (dvm_exception(vm)) dvm_clear_exception(vm);
+}
+
+/* market://details?id=PKG or play.google.com/store/apps/details?id=PKG:
+ * a game sending the player to its store page, nearly always to update.
+ * There is no store here, so take the update from a file the player
+ * downloaded (see luna_apk_find_update) and start over on it. */
+static bool store_link_package(const char *url, char *pkg, size_t cap)
+{
+   if (strncmp(url, "market://", 9) &&
+       strncmp(url, "https://play.google.com/store/apps/details", 42) &&
+       strncmp(url, "http://play.google.com/store/apps/details", 41))
+      return false;
+   const char *id = strstr(url, "id=");
+   if (!id || (id[-1] != '?' && id[-1] != '&')) return false;
+   id += 3;
+   size_t n = strcspn(id, "&#");
+   if (!n || n >= cap) return false;
+   memcpy(pkg, id, n);
+   pkg[n] = '\0';
+   return true;
+}
+static void store_update(struct dvm *vm, dvm_ref context, const char *pkg)
+{
+   char file[4096];
+   if (luna_apk_find_update(pkg, file, sizeof file) == 0) {
+      fprintf(stderr, "[update] installing %s over %s and restarting\n", file, pkg);
+      luna_apk_restart_archive(file);   /* returns only if it failed */
+      host_toast(vm, context, "Found the update file but could not restart with it. Open it from the Lunaria launcher.");
+      return;
+   }
+   host_toast(vm, context,
+              "No store here. Download the new .apk or .xapk of this game into your Downloads folder, "
+              "then press update again. Your save stays.");
+}
+
 static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
                              bool from_activity, bool for_result,
                              int32_t request_code)
@@ -7657,6 +7705,13 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
          (void)dvm_get_field(vm, intent, "data", "Landroid/net/Uri;", &data);
          if (data.l && am_vcall(vm, data.l, "toString", "()Ljava/lang/String;", NULL, 0, &text) && text.l) {
             const char *url = dvm_string_utf8(vm, text.l);
+            char pkg[256];
+            if (url && store_link_package(url, pkg, sizeof pkg)) {
+               fprintf(stderr, "[activity] store link for %s: %.200s\n", pkg, url);
+               store_update(vm, self, pkg);
+               if (dvm_exception(vm)) dvm_clear_exception(vm);
+               return true;
+            }
             if (url && (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8))) {
                int rc = getenv("LUNARIA_NO_EXTERNAL_BROWSER") ? -1 : luna_os_open_url(url);
                fprintf(stderr, "[activity] web link %s on the desktop browser: %.200s\n",

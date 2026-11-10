@@ -2790,7 +2790,93 @@ int luna_apk_profile_new_name(char *out, size_t cap)
 
 /* Starts this launch over under `profile` (NULL: the same one).  Returns only
  * when it could not. */
-int luna_apk_restart(const char *profile)
+static int apk_restart_with(const char *profile, const char *archive_override);
+int luna_apk_restart(const char *profile) { return apk_restart_with(profile, NULL); }
+int luna_apk_restart_archive(const char *archive)
+{
+   return archive && *archive ? apk_restart_with(NULL, archive) : -1;
+}
+
+/* Package name of an .apk (binary manifest) or .xapk (manifest.json). */
+static bool update_archive_package(const char *path, char *pkg, size_t cap)
+{
+   struct zip z;
+   if (zip_open(&z, path)) return false;
+   bool ok = false;
+   size_t n = 0;
+   unsigned char *json = zip_memory(&z, "manifest.json", &n);
+   if (json) {
+      char *text = malloc(n + 1);
+      if (text) {
+         memcpy(text, json, n);
+         text[n] = '\0';
+         const char *k = strstr(text, "\"package_name\"");
+         const char *q = k ? strchr(k + 14, '"') : NULL;
+         const char *e = q ? strchr(q + 1, '"') : NULL;
+         if (e && (size_t)(e - q - 1) < cap) {
+            memcpy(pkg, q + 1, (size_t)(e - q - 1));
+            pkg[e - q - 1] = '\0';
+            ok = pkg[0] != '\0';
+         }
+         free(text);
+      }
+      free(json);
+   } else {
+      struct manifest m;
+      memset(&m, 0, sizeof m);
+      if (manifest_zip(&z, &m) == 0 && m.package[0]) {
+         snprintf(pkg, cap, "%s", m.package);
+         ok = true;
+      }
+      manifest_clear(&m);
+   }
+   zip_close(&z);
+   return ok;
+}
+
+/* A game asked for its store page to update itself.  There is no store
+ * here, so look for the update the user downloaded: the newest .apk / .xapk
+ * / .apks for the same package that is newer than the archive running now,
+ * in LUNARIA_UPDATE_DIR and the user's Downloads folder. */
+int luna_apk_find_update(const char *package, char *out, size_t cap)
+{
+   if (!package || !*package || !out || !cap) return -1;
+   out[0] = '\0';
+   const char *current = g_restart_argc > 1 ? g_restart_argv[g_restart_argc - 1] : NULL;
+   struct stat st;
+   time_t best = current && luna_file_stat_follow(current, &st) == 0 ? st.st_mtime : 0;
+   char dirs[2][APK_PATH];
+   int nd = 0;
+   const char *env = getenv("LUNARIA_UPDATE_DIR");
+   if (env && *env) snprintf(dirs[nd++], APK_PATH, "%s", env);
+#ifdef _WIN32
+   const char *home = getenv("USERPROFILE");
+#else
+   const char *home = getenv("HOME");
+#endif
+   if (home && *home) snprintf(dirs[nd++], APK_PATH, "%s/Downloads", home);
+   for (int d = 0; d < nd; ++d) {
+      luna_directory *dir = luna_directory_open(dirs[d]);
+      if (!dir) continue;
+      luna_directory_entry *ent;
+      while ((ent = luna_directory_read(dir))) {
+         const char *name = ent->d_name;
+         if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks")) continue;
+         char path[APK_PATH], pkg[256];
+         snprintf(path, sizeof path, "%s/%s", dirs[d], name);
+         if (luna_file_stat_follow(path, &st) != 0 || st.st_mtime <= best) continue;
+         if (current && !strcmp(path, current)) continue;
+         if (!update_archive_package(path, pkg, sizeof pkg) || strcmp(pkg, package)) continue;
+         best = st.st_mtime;
+         snprintf(out, cap, "%s", path);
+      }
+      luna_directory_close(dir);
+   }
+   fprintf(stderr, "[update] %s: %s\n", package, out[0] ? out : "no newer file in Downloads");
+   return out[0] ? 0 : -1;
+}
+
+static int apk_restart_with(const char *profile, const char *archive_override)
 {
    char exe[APK_PATH];
    if (!g_restart_argv || !g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
@@ -2809,13 +2895,28 @@ int luna_apk_restart(const char *profile)
    /* --profile goes before the archive, which must stay last. */
    const char *archive = n > 1 ? args[n - 1] : NULL;
    if (!archive) { free(args); return -1; }
+   if (archive_override) archive = archive_override;
    args[n - 1] = "--profile";
    args[n++] = profile;
    args[n++] = archive;
    args[n] = NULL;
-   fprintf(stderr, "[apk] restarting under profile %s\n", profile);
+   fprintf(stderr, "[apk] restarting under profile %s%s%s\n", profile,
+           archive_override ? " with " : "", archive_override ? archive_override : "");
    fflush(NULL);
 #ifdef _WIN32
+   /* The CRT joins argv with spaces and does not quote, so a path with a
+    * space in it (a Downloads file name, a data root) would split in two. */
+   for (int i = 0; i < n; ++i) {
+      if (!strchr(args[i], ' ') || args[i][0] == '"') continue;
+      size_t len = strlen(args[i]);
+      char *q = malloc(len + 3);
+      if (!q) continue;
+      q[0] = '"';
+      memcpy(q + 1, args[i], len);
+      q[len + 1] = '"';
+      q[len + 2] = '\0';
+      args[i] = q;   /* leaked on purpose: exec replaces the process */
+   }
    _execve(exe, args, (const char *const *)g_restart_environment);
 #else
    execve(exe, (char *const *)args, g_restart_environment);
