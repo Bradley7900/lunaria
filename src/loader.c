@@ -2165,6 +2165,12 @@ main(int argc, const char *argv[])
     * redirected to one startup log.  Fully buffered stdout otherwise leaves
     * "loading module" and dependency messages at the end of the file. */
    setvbuf(stdout, NULL, _IOLBF, 0);
+#ifdef _WIN32
+   /* The Windows CRT has no line buffering (_IOLBF means full), so a crash
+    * lost the tail of the log mid-line, the crash report included.  Unbuffered
+    * stderr keeps every line up to the fault. */
+   setvbuf(stderr, NULL, _IONBF, 0);
+#endif
 #ifndef _WIN32
    signal(SIGABRT, host_abort_report);
 #endif
@@ -2573,6 +2579,15 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
    static volatile LONG once;
    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
    EXCEPTION_RECORD *rec = info->ExceptionRecord;
+   {
+      /* Straight to the handle, no CRT stream lock: if the faulting thread
+       * held stderr's lock, or the heap is gone, this line still lands. */
+      char raw[96];
+      int n = snprintf(raw, sizeof raw, "\n[crash] handler: 0x%08lx at %p\n",
+                       (unsigned long)rec->ExceptionCode, rec->ExceptionAddress);
+      DWORD put;
+      if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), raw, (DWORD)n, &put, NULL);
+   }
    CONTEXT ctx = *info->ContextRecord;
    char module[128];
    uintptr_t base;
