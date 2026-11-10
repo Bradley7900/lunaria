@@ -2582,11 +2582,36 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
    {
       /* Straight to the handle, no CRT stream lock: if the faulting thread
        * held stderr's lock, or the heap is gone, this line still lands. */
-      char raw[96];
-      int n = snprintf(raw, sizeof raw, "\n[crash] handler: 0x%08lx at %p\n",
-                       (unsigned long)rec->ExceptionCode, rec->ExceptionAddress);
+      char raw[512];
+      MEMORY_BASIC_INFORMATION pc = {0}, sp = {0};
+      VirtualQuery(rec->ExceptionAddress, &pc, sizeof pc);
+      VirtualQuery((void *)info->ContextRecord->Rsp, &sp, sizeof sp);
+      NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+      int n = snprintf(raw, sizeof raw,
+                       "\n[crash] handler: 0x%08lx at %p thread %lu, %s 0x%llx, rsp=%llx\n"
+                       "[crash] pc region base %p alloc %p size 0x%llx protect 0x%lx type 0x%lx\n"
+                       "[crash] rsp region base %p alloc %p size 0x%llx protect 0x%lx; tib stack %p..%p\n",
+                       (unsigned long)rec->ExceptionCode, rec->ExceptionAddress,
+                       (unsigned long)GetCurrentThreadId(),
+                       rec->NumberParameters >= 2 ? (rec->ExceptionInformation[0] == 0 ? "read" :
+                          rec->ExceptionInformation[0] == 1 ? "write" : "execute") : "?",
+                       rec->NumberParameters >= 2 ? (unsigned long long)rec->ExceptionInformation[1] : 0ull,
+                       (unsigned long long)info->ContextRecord->Rsp,
+                       pc.BaseAddress, pc.AllocationBase, (unsigned long long)pc.RegionSize,
+                       (unsigned long)pc.Protect, (unsigned long)pc.Type,
+                       sp.BaseAddress, sp.AllocationBase, (unsigned long long)sp.RegionSize,
+                       (unsigned long)sp.Protect, tib->StackLimit, tib->StackBase);
       DWORD put;
       if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), raw, (DWORD)n, &put, NULL);
+      /* Code bytes around the fault: names the instruction without a debugger. */
+      if (pc.State == MEM_COMMIT && (pc.Protect & 0xf0)) {
+         const unsigned char *b = (const unsigned char *)rec->ExceptionAddress - 16;
+         int k = snprintf(raw, sizeof raw, "[crash] code at pc-16:");
+         for (int i = 0; i < 32 && k < (int)sizeof raw - 4; i++)
+            k += snprintf(raw + k, sizeof raw - k, " %02x", b[i]);
+         raw[k++] = '\n';
+         WriteFile(GetStdHandle(STD_ERROR_HANDLE), raw, (DWORD)k, &put, NULL);
+      }
    }
    CONTEXT ctx = *info->ContextRecord;
    char module[128];
