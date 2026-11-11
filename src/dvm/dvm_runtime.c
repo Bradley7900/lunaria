@@ -9146,6 +9146,13 @@ static bool loc_getVariant(struct dvm *vm, dvm_ref self, const union dvm_value *
    (void)dvm_get_field(vm, self, "variant", "Ljava/lang/String;", &v);
    RETL(v.l ? v.l : dvm_new_string(vm, ""));
 }
+/* Locale.getScript(): "" - no locale built here carries a script subtag. */
+static bool loc_getScript(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+   (void)self; (void)args; (void)nargs;
+   RETL(dvm_new_string(vm, ""));
+}
 
 static bool loc_getCountry(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
@@ -9433,6 +9440,7 @@ static const struct rt_method rt_locale[] = {
    M("getDisplayName", "()Ljava/lang/String;", loc_getDisplayName),
    M("getDisplayName", "(Ljava/util/Locale;)Ljava/lang/String;", loc_getDisplayName),
    M("getVariant", "()Ljava/lang/String;", loc_getVariant),
+   M("getScript", "()Ljava/lang/String;", loc_getScript),
    M("getCountry", "()Ljava/lang/String;", loc_getCountry),
    M("toString", "()Ljava/lang/String;", loc_toString),
    SM("getDefault", "()Ljava/util/Locale;", loc_getDefault),
@@ -17360,8 +17368,29 @@ static bool cv_getAs(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 /* android.content.ContentValues — a string-keyed bag of boxed values used by
  * ContentResolver / SQLite.  Same storage shape as Bundle; the public API
  * spells the writers `put` rather than `putString`/`putInt`. */
+/* ContentValues(ContentValues from): a copy of the other one's entries. */
+static bool content_values_copy(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value ignored = { 0 };
+   if (!map_init(vm, self, NULL, 0, &ignored)) return false;
+   if (!args[0].l) { dvm__throw(vm, "java/lang/NullPointerException", "from"); return false; }
+   struct rt_map *src = map_data(vm, args[0].l);
+   uint32_t n = src ? src->size : 0;
+   for (uint32_t i = 0; i < n; ++i) {
+      src = map_data(vm, args[0].l);
+      if (!src || i >= src->size) break;
+      union dvm_value kv[2] = { { .l = src->e[i].k }, { .l = src->e[i].v } };
+      if (!map_put(vm, self, kv, 2, &ignored)) return false;
+   }
+   (void)out;
+   RETV();
+}
 static const struct rt_method rt_content_values[] = {
    M("<init>", "()V", map_init),
+   M("<init>", "(Landroid/content/ContentValues;)V", content_values_copy),
    M("put", "(Ljava/lang/String;Ljava/lang/String;)V", bundle_putString),
    M("put", "(Ljava/lang/String;Ljava/lang/Integer;)V", bundle_putObject),
    M("put", "(Ljava/lang/String;Ljava/lang/Long;)V", bundle_putObject),
@@ -21526,9 +21555,22 @@ static bool entry_init(struct dvm *vm, dvm_ref self,
    (void)dvm_set_field(vm, self, "value", "Ljava/lang/Object;", value);
    RETV();
 }
+/* SimpleEntry(Map.Entry e) / SimpleImmutableEntry(Map.Entry e). */
+static bool entry_init_copy(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value kv[2] = { { 0 }, { 0 } };
+   if (!am_vcall(vm, args[0].l, "getKey", "()Ljava/lang/Object;", NULL, 0, &kv[0]) ||
+       !am_vcall(vm, args[0].l, "getValue", "()Ljava/lang/Object;", NULL, 0, &kv[1]))
+      return false;
+   return entry_init(vm, self, kv, 2, out);
+}
 
 static const struct rt_method rt_map_entry[] = {
    M("<init>", "(Ljava/lang/Object;Ljava/lang/Object;)V", entry_init),
+   M("<init>", "(Ljava/util/Map$Entry;)V", entry_init_copy),
    M("getKey", "()Ljava/lang/Object;", entry_getKey),
    M("getValue", "()Ljava/lang/Object;", entry_getValue),
    M("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;", entry_setValue),
@@ -39203,6 +39245,19 @@ static bool intent_getScheme(struct dvm *vm, dvm_ref self,
                                               "getScheme", "()Ljava/lang/String;");
    return method && dvm_call(vm, method, data.l, NULL, 0, out);
 }
+/* getDataString(): the data URI as text, or null (AppMetrica reads it). */
+static bool intent_getDataString(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value data = {0};
+   (void)dvm_get_field(vm, self, "data", "Landroid/net/Uri;", &data);
+   if (!data.l) RETL(0);
+   struct dvm_method *method = dvm_find_method(vm, dvm_object_class(vm, data.l),
+                                              "toString", "()Ljava/lang/String;");
+   return method && dvm_call(vm, method, data.l, NULL, 0, out);
+}
 
 static bool intent_resolveType(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
@@ -39357,6 +39412,7 @@ static const struct rt_method rt_intent[] = {
    M("setType", "(Ljava/lang/String;)Landroid/content/Intent;", intent_setType),
    M("setDataAndType", "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;", intent_setDataAndType),
    M("getData", "()Landroid/net/Uri;", intent_getData),
+   M("getDataString", "()Ljava/lang/String;", intent_getDataString),
    M("getScheme", "()Ljava/lang/String;", intent_getScheme),
    M("setData", "(Landroid/net/Uri;)Landroid/content/Intent;", intent_setData),
    M("getComponent", "()Landroid/content/ComponentName;", intent_getComponent),
