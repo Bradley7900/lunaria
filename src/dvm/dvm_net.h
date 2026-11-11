@@ -98,6 +98,14 @@ bool dvm_http_perform_with_connector(void **transport,const char *method,const c
    int timeout_ms,bool follow_redirects,struct dvm_http_response *out,
    dvm_http_connector connector,void *context);
 
+/* The host's root certificates as DER blobs (Windows: the system ROOT store,
+ * read once; elsewhere 0 - OpenSSL's default paths cover it there).  The
+ * arrays live for the whole process. */
+int dvm_tls_host_roots(const unsigned char *const **der, const int **len);
+/* SSL_CTX_set_default_verify_paths plus the host roots above.  ctx is an
+ * SSL_CTX *, untyped so this header stays free of OpenSSL. */
+void dvm_tls_trust_host_roots(void *ctx);
+
 void dvm_http_response_free(struct dvm_http_response *r);
 
 /* Reads the next piece of the body.  Returns 0 at end of body, -1 on a

@@ -31,11 +31,99 @@
 #include <sys/time.h>
 #endif
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #define HTTP_MAX_REDIRECTS 5
+
+/* ---- host root certificates ---------------------------------------------
+ * OpenSSL's default verify paths are Linux files; on Windows they do not exist,
+ * so every HTTPS handshake failed "unable to get local issuer certificate"
+ * (Firebase, Crashlytics, RuStore in LDoE's log).  Windows keeps its trust
+ * anchors in the ROOT system store; read it once through crypt32, loaded at run
+ * time.  <wincrypt.h> is not included: its X509_NAME and friends collide with
+ * OpenSSL's, and only the encoded bytes are needed. */
+static const unsigned char **host_root_der;
+static int *host_root_len;
+static int host_root_count;
+static pthread_once_t host_roots_once = PTHREAD_ONCE_INIT;
+
+#ifdef _WIN32
+struct win_cert_context {      /* CERT_CONTEXT's leading fields */
+   DWORD encoding;
+   BYTE *encoded;
+   DWORD encoded_size;
+};
+#endif
+
+static void host_roots_load(void)
+{
+#ifdef _WIN32
+   typedef void *(WINAPI *open_fn)(ULONG_PTR, LPCWSTR);
+   typedef const struct win_cert_context *(WINAPI *enum_fn)(void *, const struct win_cert_context *);
+   typedef BOOL (WINAPI *close_fn)(void *, DWORD);
+   HMODULE crypt = LoadLibraryA("crypt32.dll");
+   open_fn open_store = crypt ? (open_fn)(void *)GetProcAddress(crypt, "CertOpenSystemStoreW") : NULL;
+   enum_fn next = crypt ? (enum_fn)(void *)GetProcAddress(crypt, "CertEnumCertificatesInStore") : NULL;
+   close_fn close_store = crypt ? (close_fn)(void *)GetProcAddress(crypt, "CertCloseStore") : NULL;
+   void *store = open_store && next && close_store ? open_store(0, L"ROOT") : NULL;
+   if (!store) {
+      fprintf(stderr, "[tls] Windows ROOT certificate store unavailable\n");
+      return;
+   }
+   int cap = 0;
+   for (const struct win_cert_context *c = next(store, NULL); c; c = next(store, c)) {
+      if (!(c->encoding & 1 /* X509_ASN_ENCODING */) || !c->encoded || !c->encoded_size) continue;
+      if (host_root_count == cap) {
+         int ncap = cap ? cap * 2 : 128;
+         const unsigned char **d = realloc(host_root_der, (size_t)ncap * sizeof *d);
+         if (!d) break;
+         host_root_der = d;
+         int *l = realloc(host_root_len, (size_t)ncap * sizeof *l);
+         if (!l) break;
+         host_root_len = l; cap = ncap;
+      }
+      unsigned char *copy = malloc(c->encoded_size);
+      if (!copy) break;
+      memcpy(copy, c->encoded, c->encoded_size);
+      host_root_der[host_root_count] = copy;
+      host_root_len[host_root_count++] = (int)c->encoded_size;
+   }
+   close_store(store, 0);
+   fprintf(stderr, "[tls] %d root certificates from the Windows ROOT store\n", host_root_count);
+#endif
+}
+
+int dvm_tls_host_roots(const unsigned char *const **der, const int **len)
+{
+   pthread_once(&host_roots_once, host_roots_load);
+   if (der) *der = host_root_der;
+   if (len) *len = host_root_len;
+   return host_root_count;
+}
+
+void dvm_tls_trust_host_roots(void *ctx_)
+{
+   SSL_CTX *ctx = ctx_;
+   SSL_CTX_set_default_verify_paths(ctx);
+   const unsigned char *const *der;
+   const int *len;
+   int n = dvm_tls_host_roots(&der, &len);
+   X509_STORE *store = n ? SSL_CTX_get_cert_store(ctx) : NULL;
+   for (int i = 0; store && i < n; ++i) {
+      const unsigned char *p = der[i];
+      X509 *x = d2i_X509(NULL, &p, len[i]);
+      if (!x) continue;
+      X509_STORE_add_cert(store, x);   /* duplicates are refused, harmlessly */
+      X509_free(x);
+   }
+   ERR_clear_error();
+}
 
 static pthread_once_t network_once = PTHREAD_ONCE_INIT;
 static _Atomic bool network_enabled;
@@ -403,7 +491,7 @@ static bool connect_to(const struct url *u, int timeout_ms, struct stream *s,
    SSL_CTX_set_options(s->ctx, SSL_OP_NO_SSLv3);
    /* Verify against the host's trust store.  A silent no-verify fallback would
     * make every MITM look like a working connection. */
-   SSL_CTX_set_default_verify_paths(s->ctx);
+   dvm_tls_trust_host_roots(s->ctx);
    SSL_CTX_set_verify(s->ctx, SSL_VERIFY_PEER, NULL);
 
    s->ssl = SSL_new(s->ctx);
@@ -1335,7 +1423,7 @@ struct dvm_tls *dvm_tls_connect_cancel(int fd, const char *host, int verify,
    }
    SSL_CTX_set_options(t->ctx, SSL_OP_NO_SSLv3);
    if (verify & DVM_TLS_VERIFY_CHAIN) {
-      SSL_CTX_set_default_verify_paths(t->ctx);
+      dvm_tls_trust_host_roots(t->ctx);
       SSL_CTX_set_verify(t->ctx, SSL_VERIFY_PEER, NULL);
    } else {
       SSL_CTX_set_verify(t->ctx, SSL_VERIFY_NONE, NULL);

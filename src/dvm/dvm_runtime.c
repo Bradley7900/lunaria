@@ -19340,6 +19340,28 @@ static dvm_ref load_host_accepted_issuers(struct dvm *vm)
    };
    FILE *fp = NULL;
    for (int i = 0; bundles[i] && !fp; ++i) fp = luna_file_fopen(bundles[i], "rb");
+   const unsigned char *const *host_der;
+   const int *host_len;
+   int host_n = fp ? 0 : dvm_tls_host_roots(&host_der, &host_len);
+   if (!fp && host_n > 0) {
+      /* Windows: no bundle file, the system ROOT store instead. */
+      dvm_ref *tmp = malloc((size_t)host_n * sizeof *tmp);
+      int n = 0;
+      for (int i = 0; tmp && i < host_n; ++i) {
+         dvm_ref cert = x509_from_der(vm, (uint8_t *)host_der[i], host_len[i]);
+         if (!cert) continue;
+         dvm_pin(vm, cert);
+         tmp[n++] = cert;
+      }
+      dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/security/cert/X509Certificate;", (uint32_t)n);
+      dvm_ref *items = arr ? (dvm_ref *)dvm_array_data(vm, arr) : NULL;
+      for (int i = 0; items && i < n; ++i) items[i] = tmp[i];
+      free(tmp);
+      vm->accepted_issuers = arr;
+      if (arr) dvm_pin(vm, arr);
+      fprintf(stderr, "[tls] getAcceptedIssuers: %d of %d Windows root certificates\n", n, host_n);
+      return vm->accepted_issuers;
+   }
    if (!fp) {
       fprintf(stderr, "[tls] no host CA bundle — getAcceptedIssuers empty\n");
       vm->accepted_issuers =
@@ -19916,6 +19938,16 @@ static const struct rt_method rt_x509_trust_interface[]={
    {"checkClientTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
    {"checkServerTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
    {"getAcceptedIssuers","()[Ljava/security/cert/X509Certificate;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END
+};
+/* javax.net.ssl.X509ExtendedTrustManager: abstract; the Socket / SSLEngine
+ * overloads are the subclass's job, as on a device. */
+static const struct rt_method rt_x509_extended_trust_manager[]={
+   M("<init>","()V",empty_void),
+   {"checkClientTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"checkServerTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"checkClientTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   {"checkServerTrusted","([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
+   M_END
 };
 
 static const struct rt_method rt_x509_trust_manager[]={
@@ -80762,6 +80794,12 @@ static const struct rt_class rt_classes[] = {
      NULL, true },
    { "Ljavax/net/ssl/X509TrustManager;", "Ljava/lang/Object;",
      rt_x509_trust_interface, NULL, rt_iface_trust_manager, NULL, true },
+   /* Abstract class (API 24) that SDKs subclass for their own trust logic.
+    * Unlisted, it had no X509TrustManager in its hierarchy, so RuStore pay's
+    * CompositeX509TrustManagerApi24 failed check-cast to X509TrustManager and
+    * LDoE quit during startup. */
+   { "Ljavax/net/ssl/X509ExtendedTrustManager;", "Ljava/lang/Object;",
+     rt_x509_extended_trust_manager, NULL, rt_iface_x509_trust_manager },
    /* The platform default trust manager, as a device names it. */
    { "Lcom/android/org/conscrypt/TrustManagerImpl;", "Ljava/lang/Object;",
      rt_x509_trust_manager, rt_trust_fields, rt_iface_x509_trust_manager },
