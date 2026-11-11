@@ -42569,7 +42569,7 @@ static bool acct_commit(struct acct_db *db)
    }
    const bool ok = fflush(fp) == 0 && luna_file_sync(fileno(fp), 0) == 0;
    fclose(fp);
-   return ok && rename(tmp, db->path) == 0;
+   return ok && luna_file_rename(tmp, db->path) == 0;
 }
 static bool acct_add(struct acct_db *db, char kind, const char *a, const char *b, const char *c, const char *d)
 {

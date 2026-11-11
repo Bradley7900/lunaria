@@ -2805,7 +2805,7 @@ static bool menu_conf_write(const char *key, const char *value, bool apply)
             goto done;
          }
       }
-      if (fclose(out) != 0 || rename(tmp, path) != 0) {
+      if (fclose(out) != 0 || luna_file_rename(tmp, path) != 0) {
          unlink(tmp);
          fprintf(stderr, "[menu] cannot replace %s\n", path);
       } else saved = true;

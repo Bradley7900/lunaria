@@ -2172,7 +2172,7 @@ static int deliver_url_command(int argc, const char **argv)
    fputs(url, f);
    fclose(f);
    (void)remove(dst);
-   if (rename(tmp, dst)) fprintf(stderr, "[apk] --deliver-url: cannot place %s\n", dst);
+   if (luna_file_rename(tmp, dst)) fprintf(stderr, "[apk] --deliver-url: cannot place %s\n", dst);
    return 1;
 }
 
