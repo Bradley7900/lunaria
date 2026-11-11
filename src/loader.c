@@ -712,6 +712,18 @@ static void perf_tick(void)
                  "over 33 ms: %d, over 50 ms: %d\n", n, p50, p99, worst, over33, over50);
    }
    {
+      /* A player's log is often the only view of their machine: when the
+       * game fills RAM, the host swaps and every guest thread stalls for
+       * seconds, which reads like an emulator hang unless RAM is in the log. */
+      uint64_t total = 0, avail = 0;
+      const uint64_t peak_kb = luna_os_peak_rss_kb();
+      if (luna_os_mem_info(&total, &avail) == 0 && total)
+         fprintf(stderr, "[perf]   ram: lunaria peak %llu MB, this PC %llu MB free of %llu MB%s\n",
+                 (unsigned long long)(peak_kb / 1024),
+                 (unsigned long long)(avail >> 20), (unsigned long long)(total >> 20),
+                 avail < total / 10 ? " (LOW - the PC is likely swapping)" : "");
+   }
+   {
       uint64_t a32[3];
       arm_exec_translated_insn_a32(a32);
       if (a32[0] | a32[1] | a32[2])
