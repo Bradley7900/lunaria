@@ -603,6 +603,20 @@ void *luna_os_map_file_flags(void *want, size_t len, int prot, int policy,
    DWORD access = (prot & LUNA_PROT_EXEC) ? FILE_MAP_EXECUTE : 0;
    access |= writable ? (shared ? FILE_MAP_WRITE : FILE_MAP_COPY) : FILE_MAP_READ;
 
+   /* Linux maps whole pages past the end of a file (the tail reads as zeros,
+    * a page wholly past EOF faults); Windows refuses a view longer than the
+    * file.  The callers round len up to a page, so a 4-byte file (AndroidX
+    * DataStore's shared counter) always failed with ENOMEM.  Ask for the bytes
+    * the file has: the view still covers whole pages, as on Linux.  Only when
+    * that last page reaches the end of the request - otherwise the caller
+    * would record pages as mapped that are not. */
+   LARGE_INTEGER file_size;
+   if (GetFileSizeEx(h, &file_size) && file_size.QuadPart > 0 &&
+       (uint64_t)file_size.QuadPart > off) {
+      const uint64_t have = (uint64_t)file_size.QuadPart - off;
+      if ((uint64_t)len > have && ((have + 4095u) & ~4095ull) >= (uint64_t)len)
+         len = (size_t)have;
+   }
    HANDLE m = CreateFileMappingA(h, NULL, page, 0, 0, NULL);
    if (!m) return NULL;
    void *p = NULL;
