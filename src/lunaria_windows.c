@@ -1642,6 +1642,23 @@ static wchar_t *luna_file_wide(const char *path)
    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, length)) {
       free(wide); errno = EILSEQ; return NULL;
    }
+   /* Past MAX_PATH (260) a plain drive path fails with ERROR_PATH_NOT_FOUND
+    * unless the machine has LongPathsEnabled.  A game unpacked under a deep
+    * folder crossed it partway through (LDoE died at 1217 of 1536 MiB when
+    * lunaria sat in D:\Games\lunaria-...\, and finished from D:\).  The \\?\
+    * form lifts the limit to 32767; it skips normalisation, so normalise
+    * first with GetFullPathNameW (which also turns / into \). */
+   if (length > 240 && ((wide[0] | 0x20) >= L'a' && (wide[0] | 0x20) <= L'z') && wide[1] == L':' &&
+       (wide[2] == L'\\' || wide[2] == L'/')) {
+      DWORD need = GetFullPathNameW(wide, 0, NULL, NULL);
+      wchar_t *full = need ? (wchar_t *)malloc(((size_t)need + 4) * sizeof *full) : NULL;
+      if (full) {
+         memcpy(full, L"\\\\?\\", 4 * sizeof *full);
+         DWORD got = GetFullPathNameW(wide, need, full + 4, NULL);
+         if (got && got < need) { free(wide); return full; }
+         free(full);
+      }
+   }
    return wide;
 }
 /* RootDirectory keeps relative opens tied to the directory object even if
