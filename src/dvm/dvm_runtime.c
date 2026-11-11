@@ -19510,6 +19510,11 @@ static bool ks_load(struct dvm *vm,dvm_ref self,const union dvm_value *args,int 
 }
 static bool ks_get_type(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 { (void)args;(void)nargs;dvm_get_field(vm,self,"type","Ljava/lang/String;",out);return true; }
+/* KeyStore.getDefaultType(): "BKS" on Android.  Left unimplemented it returned
+ * null, and SDKs that build their own trust store (RuStore pay, OkHttp pinning
+ * helpers) died in getInstance(null) with NullPointerException "type". */
+static bool ks_get_default_type(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{ (void)self;(void)args;(void)nargs;RETL(dvm_new_string(vm,"BKS")); }
 static bool ks_certificate(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
    if(!ks_require_loaded(vm,self)) return false;
@@ -19610,6 +19615,7 @@ static const struct rt_field rt_keystore_fields[] = {
 
 static const struct rt_method rt_keystore[] = {
    M("getType","()Ljava/lang/String;",ks_get_type),
+   SM("getDefaultType","()Ljava/lang/String;",ks_get_default_type),
    M("getCertificate","(Ljava/lang/String;)Ljava/security/cert/Certificate;",ks_certificate),
    M("setCertificateEntry","(Ljava/lang/String;Ljava/security/cert/Certificate;)V",ks_certificate),
    SM("getInstance", "(Ljava/lang/String;)Ljava/security/KeyStore;",
@@ -20265,6 +20271,68 @@ static bool map_putIfAbsent(struct dvm *vm,dvm_ref self,const union dvm_value *a
    union dvm_value current={0};if(!map_get(vm,self,args,1,&current))return false;
    if(current.l)RETL(current.l);
    return map_put(vm,self,args,nargs,out);
+}
+
+/* Map's Java 8 compute family, with the JDK's null rules: a null result
+ * removes the key (or adds nothing).  HashMap, ConcurrentHashMap, TreeMap and
+ * Hashtable all share this storage; before these existed the calls fell to the
+ * null stub, so a cache filled with computeIfAbsent stayed empty and its caller
+ * got null back (Yandex ads hit this during LDoE startup). */
+static bool map_set_or_remove(struct dvm *vm,dvm_ref self,dvm_ref key,dvm_ref value,bool had)
+{
+   union dvm_value kv[2]={{.l=key},{.l=value}},ignored={0};
+   if(value) return map_put(vm,self,kv,2,&ignored);
+   if(had) return map_remove(vm,self,kv,1,&ignored);
+   return true;
+}
+static bool map_computeIfAbsent(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},r={0};
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(cur.l) RETL(cur.l);
+   if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","mappingFunction");return false;}
+   if(!am_vcall(vm,args[1].l,"apply","(Ljava/lang/Object;)Ljava/lang/Object;",args,1,&r)) return false;
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,false)) return false;
+   RETL(r.l);
+}
+static bool map_computeIfPresent(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},r={0};
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(!cur.l) RETL(0);
+   if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","remappingFunction");return false;}
+   union dvm_value kv[2]={{.l=args[0].l},{.l=cur.l}};
+   if(!am_vcall(vm,args[1].l,"apply","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",kv,2,&r)) return false;
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,true)) return false;
+   RETL(r.l);
+}
+static bool map_compute(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},has={0},r={0};
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(!cur.l && !map_containsKey(vm,self,args,1,&has)) return false;
+   if(!args[1].l) {dvm__throw(vm,"java/lang/NullPointerException","remappingFunction");return false;}
+   union dvm_value kv[2]={{.l=args[0].l},{.l=cur.l}};
+   if(!am_vcall(vm,args[1].l,"apply","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",kv,2,&r)) return false;
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,cur.l||has.i)) return false;
+   RETL(r.l);
+}
+static bool map_merge(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   union dvm_value cur={0},r={0};
+   if(!args[1].l || !args[2].l) {dvm__throw(vm,"java/lang/NullPointerException",NULL);return false;}
+   if(!map_get(vm,self,args,1,&cur)) return false;
+   if(!cur.l) r.l=args[1].l;
+   else {
+      union dvm_value ov[2]={{.l=cur.l},{.l=args[1].l}};
+      if(!am_vcall(vm,args[2].l,"apply","(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",ov,2,&r)) return false;
+   }
+   if(!map_set_or_remove(vm,self,args[0].l,r.l,cur.l!=0)) return false;
+   RETL(r.l);
 }
 
 /* remove(key, value) / replace(key, value) — the conditional forms. */
@@ -21003,6 +21071,18 @@ static const struct rt_method rt_class_value[] = {
    M("putIfAbsent", \
      "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", \
      map_putIfAbsent), \
+   M("computeIfAbsent", \
+     "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;", \
+     map_computeIfAbsent), \
+   M("computeIfPresent", \
+     "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;", \
+     map_computeIfPresent), \
+   M("compute", \
+     "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;", \
+     map_compute), \
+   M("merge", \
+     "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;", \
+     map_merge), \
    M("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z", map_remove_kv), \
    M("replace", \
      "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", map_replace),
