@@ -42,6 +42,7 @@
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <shobjidl.h>
 #else
 #include <unistd.h>
 #endif
@@ -1154,6 +1155,124 @@ static void pick_dialog_done(const LunaFileDialogResult *result, void *userdata)
     else snprintf(dropped, sizeof dropped, "%s", result->paths[0]);
 }
 
+#ifdef _WIN32
+/* Windows: the system Open / Select Folder dialog instead of the built-in
+ * one (players reported its Browse buttons doing nothing).  It runs on its own
+ * thread so the launcher keeps drawing; the picker loop collects the answer
+ * through win_pick_poll().  ole32/shell32 are loaded at run time, so the link
+ * line does not change.  LUNARIA_BUILTIN_FILE_DIALOG=1 keeps the old dialog. */
+static const GUID win_clsid_file_open = {0xDC1C5A9C,0xE88A,0x4DDE,{0xA5,0xA1,0x60,0xF8,0x2A,0x20,0xAE,0xF7}};
+static const GUID win_iid_file_open = {0xD57C7288,0xD4AD,0x4768,{0xBE,0x02,0x9D,0x96,0x95,0x32,0xD9,0x60}};
+static const GUID win_iid_shell_item = {0x43826D1E,0xE718,0x42EE,{0xBC,0x55,0xA1,0xE2,0x61,0xC3,0x7B,0xFE}};
+static atomic_int win_pick_state;         /* 0 idle, 1 dialog open, 2 answer ready */
+static int win_pick_folder_mode;
+static wchar_t win_pick_title[256], win_pick_initial[4096];
+static HWND win_pick_owner;
+static char win_pick_result[4096];
+
+static DWORD WINAPI win_pick_thread(LPVOID unused)
+{
+    (void)unused;
+    win_pick_result[0] = 0;
+    typedef HRESULT (WINAPI *init_fn)(LPVOID, DWORD);
+    typedef void (WINAPI *uninit_fn)(void);
+    typedef HRESULT (WINAPI *create_fn)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID *);
+    typedef void (WINAPI *free_fn)(LPVOID);
+    typedef HRESULT (WINAPI *item_fn)(PCWSTR, void *, REFIID, void **);
+    HMODULE ole = LoadLibraryA("ole32.dll"), shell = LoadLibraryA("shell32.dll");
+    init_fn co_init = ole ? (init_fn)(void *)GetProcAddress(ole, "CoInitializeEx") : NULL;
+    uninit_fn co_uninit = ole ? (uninit_fn)(void *)GetProcAddress(ole, "CoUninitialize") : NULL;
+    create_fn co_create = ole ? (create_fn)(void *)GetProcAddress(ole, "CoCreateInstance") : NULL;
+    free_fn co_free = ole ? (free_fn)(void *)GetProcAddress(ole, "CoTaskMemFree") : NULL;
+    item_fn item_from_path = shell ? (item_fn)(void *)GetProcAddress(shell, "SHCreateItemFromParsingName") : NULL;
+    IFileOpenDialog *dialog = NULL;
+    if (co_init && co_uninit && co_create && co_free &&
+        SUCCEEDED(co_init(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) {
+        if (SUCCEEDED(co_create(&win_clsid_file_open, NULL, CLSCTX_INPROC_SERVER,
+                                &win_iid_file_open, (void **)&dialog)) && dialog) {
+            FILEOPENDIALOGOPTIONS options = 0;
+            dialog->lpVtbl->GetOptions(dialog, &options);
+            options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST |
+                       (win_pick_folder_mode ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST);
+            dialog->lpVtbl->SetOptions(dialog, options);
+            if (win_pick_title[0]) dialog->lpVtbl->SetTitle(dialog, win_pick_title);
+            if (!win_pick_folder_mode) {
+                COMDLG_FILTERSPEC types[] = {
+                    { L"Android packages", L"*.apk;*.xapk;*.apks;*.aab;*.so" },
+                    { L"All files", L"*.*" },
+                };
+                dialog->lpVtbl->SetFileTypes(dialog, 2, types);
+            }
+            IShellItem *start = NULL;
+            if (win_pick_initial[0] && item_from_path &&
+                SUCCEEDED(item_from_path(win_pick_initial, NULL, &win_iid_shell_item, (void **)&start)) && start) {
+                dialog->lpVtbl->SetFolder(dialog, start);
+                start->lpVtbl->Release(start);
+            }
+            IShellItem *chosen = NULL;
+            if (SUCCEEDED(dialog->lpVtbl->Show(dialog, win_pick_owner)) &&
+                SUCCEEDED(dialog->lpVtbl->GetResult(dialog, &chosen)) && chosen) {
+                PWSTR path = NULL;
+                if (SUCCEEDED(chosen->lpVtbl->GetDisplayName(chosen, SIGDN_FILESYSPATH, &path)) && path) {
+                    if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, win_pick_result,
+                                             (int)sizeof win_pick_result, NULL, NULL))
+                        win_pick_result[0] = 0;
+                    co_free(path);
+                }
+                chosen->lpVtbl->Release(chosen);
+            }
+            dialog->lpVtbl->Release(dialog);
+        }
+        co_uninit();
+    }
+    if (!dialog) fprintf(stderr, "[apk-ui] Windows file dialog unavailable; using the built-in one\n");
+    atomic_store(&win_pick_state, dialog ? 2 : 3);
+    return 0;
+}
+
+/* 1 = the Windows dialog is handling it (or already open), 0 = use built-in. */
+static int win_pick_open(int folder, const char *title, const char *initial)
+{
+    const char *builtin = getenv("LUNARIA_BUILTIN_FILE_DIALOG");
+    if (builtin && builtin[0] && builtin[0] != '0') return 0;
+    int idle = 0;
+    if (!atomic_compare_exchange_strong(&win_pick_state, &idle, 1)) return 1;
+    win_pick_folder_mode = folder;
+    win_pick_title[0] = win_pick_initial[0] = 0;
+    if (title) MultiByteToWideChar(CP_UTF8, 0, title, -1, win_pick_title, 256);
+    win_pick_title[255] = 0;
+    if (initial && initial[0]) {
+        MultiByteToWideChar(CP_UTF8, 0, initial, -1, win_pick_initial, 4096);
+        win_pick_initial[4095] = 0;
+        for (wchar_t *c = win_pick_initial; *c; ++c) if (*c == L'/') *c = L'\\';
+    }
+    win_pick_owner = GetActiveWindow();
+    HANDLE thread = CreateThread(NULL, 0, win_pick_thread, NULL, 0, NULL);
+    if (!thread) { atomic_store(&win_pick_state, 0); return 0; }
+    CloseHandle(thread);
+    fprintf(stderr, "[apk-ui] Windows %s dialog opened\n", folder ? "folder" : "file");
+    return 1;
+}
+static void pick_open_dialog(int field);
+/* Called every frame of the picker loop. */
+static void win_pick_poll(void)
+{
+    int state = atomic_load(&win_pick_state);
+    if (state == 3) {           /* COM failed: fall back to the built-in dialog */
+        atomic_store(&win_pick_state, 4);
+        pick_open_dialog(pick_folder_for);
+        atomic_store(&win_pick_state, 0);
+        return;
+    }
+    if (state != 2) return;
+    if (win_pick_result[0]) {
+        if (pick_folder_for >= 0) snprintf(pick_folder, sizeof pick_folder, "%s", win_pick_result);
+        else snprintf(dropped, sizeof dropped, "%s", win_pick_result);
+    } else pick_folder_for = -1;
+    atomic_store(&win_pick_state, 0);
+}
+#endif
+
 static void pick_open_dialog(int field)
 {
     char start[4096] = "";
@@ -1179,6 +1298,18 @@ static void pick_open_dialog(int field)
         config.filter_name = "Android packages";
         config.filter_patterns = "*.apk *.xapk *.apks *.aab *.so";
     }
+#ifdef _WIN32
+    /* state 4 = the Windows dialog failed and asked for the built-in one */
+    if (atomic_load(&win_pick_state) != 4) {
+        char downloads[4096] = "";
+        const char *profile = getenv("USERPROFILE");
+        if (!config.initial_path && profile)
+            snprintf(downloads, sizeof downloads, "%s\\Downloads", profile);
+        if (win_pick_open(field >= 0, config.title,
+                          config.initial_path ? config.initial_path : downloads))
+            return;
+    }
+#endif
     if (luna_file_dialog_show(&config, pick_dialog_done, NULL) < 0)
         luna_set_text(luna_get_element_by_id("error"),
                       "Cannot open the file browser. Drop the file on this window.");
@@ -1541,6 +1672,9 @@ static int launcher_form(char *path, size_t capacity,
     while (!cancelled) {
         frame(1);
         if (!package && !title) pick_store_tick();
+#ifdef _WIN32
+        win_pick_poll();
+#endif
         if (pick_folder[0] && pick_folder_for >= 0) {
             pick_set_field((size_t)pick_folder_for, pick_folder);
             pick_folder[0] = 0; pick_folder_for = -1;
