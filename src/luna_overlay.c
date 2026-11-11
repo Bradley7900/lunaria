@@ -2026,7 +2026,7 @@ static void resolution_values(int index, int *width, int *height)
  * envs[i] is what the key is set to, NULL leaving it unset. */
 struct menu_setting { const char *key, *label; int value, initial; const int *choices; size_t count;
                       const char *const *names, *const *envs; };
-static const int ram_choices[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
+static const int ram_choices[] = {512, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384};
 static const int cpu_choices[] = {1, 2, 4, 6, 8, 12, 16};
 static const int engine_choices[] = {0, 1, 2, 3, 4, 6, 8};
 static const int dpi_choices[] = {0, 160, 240, 320, 420, 480, 640};
@@ -2074,7 +2074,7 @@ static void settings_load(void)
             for (size_t k = 1; env && k < v->count; ++k)
                if (v->envs[k] && !strcmp(env, v->envs[k])) v->initial = (int)k;
          } else
-            v->initial = env ? atoi(env) : i == 0 ? 6144 : i == 1 ? 4 : 0;
+            v->initial = env ? atoi(env) : i == 0 ? (int)lunaria_mem_default_mb() : i == 1 ? 4 : 0;
       }
       v->value = v->initial;
    }

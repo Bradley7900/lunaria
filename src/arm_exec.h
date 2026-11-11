@@ -160,7 +160,7 @@ static inline unsigned luna_pcm_mix(struct luna_pcm_queue *q, int32_t *mix, unsi
  * dvm_runtime.c) all include this one already.
  *
  * Env (all optional):
- *   LUNARIA_MEM_TOTAL_MB      — total RAM advertised (default 6144 = 6 GiB)
+ *   LUNARIA_MEM_TOTAL_MB      — total RAM advertised (default 3/8 of the PC, 2-6 GiB)
  *   LUNARIA_MEM_AVAIL_MB      — available RAM (default ~5/6 of total)
  *   LUNARIA_MEM_THRESHOLD_MB  — low-memory threshold (default 48)
  *   LUNARIA_MEM_FREE_MB       — MemFree in /proc/meminfo (default ~2/3 avail)
@@ -189,10 +189,37 @@ static inline uint32_t lunaria_env_u32(const char *name, uint32_t def)
     return end != e && value <= UINT32_MAX ? (uint32_t)value : def;
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes);
+#ifdef __cplusplus
+}
+#endif
+
+/* With no LUNARIA_MEM_TOTAL_MB, advertise 3/8 of this PC's RAM, 2-6 GiB in
+ * 512 MiB steps.  A flat 6 GiB made Unity size its heaps and caches for a
+ * phone with 6 GiB to spare: Last Day on Earth took 4.5 GB of an 8 GB laptop,
+ * the PC swapped, and the game froze for seconds at a time and drew nothing.
+ * 8 GB -> 3 GiB, 16 GB and up -> the old 6 GiB. */
+static inline long lunaria_mem_default_mb(void)
+{
+    static long cached;
+    if (cached) return cached;
+    uint64_t total = 0;
+    long mb = 6144;
+    if (luna_os_mem_info(&total, NULL) == 0 && total) {
+        mb = (long)((total >> 20) * 3 / 8) & ~511L;
+        if (mb < 2048) mb = 2048;
+        if (mb > 6144) mb = 6144;
+    }
+    return cached = mb;
+}
+
 /* Clamp phone-class totals into a sane range for the emulator. */
 static inline long lunaria_mem_total_mb(void)
 {
-    long mb = lunaria_env_long("LUNARIA_MEM_TOTAL_MB", 6144);
+    long mb = lunaria_env_long("LUNARIA_MEM_TOTAL_MB", lunaria_mem_default_mb());
     if (mb < 512)
         mb = 512;
     if (mb > 16384)
