@@ -359,7 +359,12 @@ static DWORD luna_prot_to_host(int prot)
  * LUNARIA_LAZY_COMMIT=0 restores reserve-and-commit. */
 #define LAZY_MIN   ((size_t)256 << 20)
 #define LAZY_CHUNK ((uintptr_t)64 << 10)
-#define LAZY_MAX   8
+/* Unity's Dynamic Heap reserves a fresh 512 MiB block whenever it grows.
+ * With 8 slots LDoE filled the table during startup, and every block after
+ * that fell through to reserve-and-commit: 511 MB of commit charge each,
+ * 5 GB on an 8 GB laptop, and the PC swapped while the game drew nothing.
+ * Freed ranges give their slot back (lazy_reserve reuses it). */
+#define LAZY_MAX   256
 static struct { uintptr_t lo, hi; } lazy_ranges[LAZY_MAX];
 static volatile LONG lazy_count;
 static SRWLOCK lazy_lock = SRWLOCK_INIT;
@@ -465,16 +470,31 @@ static void *lazy_reserve(void *want, size_t len, int exact)
       if (lazy_state > 0 && !AddVectoredExceptionHandler(1, lazy_veh)) lazy_state = -1;
       fprintf(stderr, "[mem] lazy commit %s\n", lazy_state > 0 ? "on" : "off");
    }
-   if (lazy_state < 0 || len < LAZY_MIN || lazy_count >= LAZY_MAX) return NULL;
+   if (lazy_state < 0 || len < LAZY_MIN) return NULL;
    void *p = VirtualAlloc(exact ? want : NULL, len,
                           MEM_RESERVE | (exact ? 0 : MEM_TOP_DOWN), PAGE_READWRITE);
    if (!p) return NULL;
    if (exact && p != want) { VirtualFree(p, 0, MEM_RELEASE); return NULL; }
    AcquireSRWLockExclusive(&lazy_lock);
-   const LONG n = lazy_count;
-   lazy_ranges[n].lo = (uintptr_t)p;
-   lazy_ranges[n].hi = (uintptr_t)p + len;
-   InterlockedExchange(&lazy_count, n + 1);
+   LONG n = lazy_count, slot = -1;
+   for (LONG i = 0; i < n; ++i)
+      if (!lazy_ranges[i].lo && !lazy_ranges[i].hi) { slot = i; break; }
+   if (slot < 0 && n < LAZY_MAX) slot = n;
+   if (slot < 0) {
+      static int warned;
+      ReleaseSRWLockExclusive(&lazy_lock);
+      VirtualFree(p, 0, MEM_RELEASE);
+      if (!warned++)
+         fprintf(stderr, "[mem] WARNING: %d lazy ranges in use, further large reservations "
+                 "are committed up front\n", LAZY_MAX);
+      return NULL;
+   }
+   /* lazy_find reads without the lock: a slot with hi set and lo still 0
+    * would claim every address below hi, so lo goes in first. */
+   lazy_ranges[slot].lo = (uintptr_t)p;
+   MemoryBarrier();
+   lazy_ranges[slot].hi = (uintptr_t)p + len;
+   if (slot == n) InterlockedExchange(&lazy_count, n + 1);
    ReleaseSRWLockExclusive(&lazy_lock);
    fprintf(stderr, "[mem] reserved %zu MB at %p, committed on first touch\n",
            len >> 20, p);
@@ -541,7 +561,10 @@ int luna_os_release(void *addr, size_t len)
          ok = VirtualFree(base, 0, MEM_RELEASE);
          if (ok && lazy >= 0) {
             AcquireSRWLockExclusive(&lazy_lock);
-            lazy_ranges[lazy].lo = lazy_ranges[lazy].hi = 0;
+            /* hi first, for the same lock-free reader as in lazy_reserve. */
+            lazy_ranges[lazy].hi = 0;
+            MemoryBarrier();
+            lazy_ranges[lazy].lo = 0;
             ReleaseSRWLockExclusive(&lazy_lock);
          }
       }
