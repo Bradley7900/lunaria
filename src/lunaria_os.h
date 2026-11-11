@@ -1384,6 +1384,12 @@ const char *luna_os_library_error(void);
 /* Host launch configuration. Windows follows its CRT convention: setting
  * an empty value removes that variable. Guest environ is managed separately. */
 int luna_os_setenv(const char *name, const char *value, int overwrite);
+#ifdef _WIN32
+/* This PC's own time zone as an IANA name ("Africa/Cairo"), or NULL. */
+const char *luna_os_host_timezone(void);
+/* This PC's display language as "en-US" / "ar-EG", or NULL. */
+const char *luna_os_host_locale(void);
+#endif
 /* Remove a host launch variable without changing guest environ. */
 int luna_os_unsetenv(const char *name);
 /* Windows: call before ANGLE's Vulkan backend starts (see lunaria_windows.c).

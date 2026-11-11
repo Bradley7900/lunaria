@@ -3760,6 +3760,64 @@ rescan:
 
 /* IANA identifiers map to Windows' own, year-specific timezone rules. */
 #include "unicode/windows_zones.h"
+
+/* The emulated phone used to be set to Asia/Tokyo and Japanese unless the
+ * player set LUNARIA_TIMEZONE / LUNARIA_LOCALE; Windows has no LANG for the
+ * fallback to read, so every Windows player got a Japanese device (LDoE's
+ * window title came up in Japanese).  These read the PC's own settings. */
+static char host_timezone[64];
+static BOOL CALLBACK host_timezone_once(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+   (void)once; (void)param; (void)context;
+   char *result = host_timezone;
+   DYNAMIC_TIME_ZONE_INFORMATION d;
+   if (GetDynamicTimeZoneInformation(&d) == TIME_ZONE_ID_INVALID || !d.TimeZoneKeyName[0])
+      return TRUE;
+   /* Windows 10 1903+ ships ICU; region NULL picks CLDR's canonical zone
+    * ("001"), which the flat table below cannot (its first Tokyo entry is
+    * Asia/Dili). */
+   typedef int32_t (*icu_fn)(const wchar_t *, int32_t, const char *, wchar_t *, int32_t, int *);
+   HMODULE icu = LoadLibraryA("icu.dll");
+   icu_fn lookup = icu ? (icu_fn)(void *)GetProcAddress(icu, "ucal_getTimeZoneIDForWindowsID") : NULL;
+   wchar_t id[64];
+   int status = 0;
+   int32_t n = lookup ? lookup(d.TimeZoneKeyName, -1, NULL, id, 63, &status) : 0;
+   if (n > 0 && n < 63 && status <= 0) {
+      id[n] = 0;
+      if (!WideCharToMultiByte(CP_UTF8, 0, id, -1, result, sizeof host_timezone, NULL, NULL)) result[0] = 0;
+   }
+   for (size_t i = 0; !result[0] && i < sizeof luna_windows_zones / sizeof luna_windows_zones[0]; i++)
+      if (!wcscmp(luna_windows_zones[i].windows, d.TimeZoneKeyName))
+         snprintf(result, sizeof host_timezone, "%s", luna_windows_zones[i].iana);
+   return TRUE;
+}
+const char *luna_os_host_timezone(void)
+{
+   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+   InitOnceExecuteOnce(&once, host_timezone_once, NULL, NULL);
+   return host_timezone[0] ? host_timezone : NULL;
+}
+
+static char host_locale[LOCALE_NAME_MAX_LENGTH];
+static BOOL CALLBACK host_locale_once(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+   (void)once; (void)param; (void)context;
+   wchar_t name[LOCALE_NAME_MAX_LENGTH];
+   LANGID ui = GetUserDefaultUILanguage();
+   if (!LCIDToLocaleName(MAKELCID(ui, SORT_DEFAULT), name, LOCALE_NAME_MAX_LENGTH, 0) &&
+       !GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH))
+      return TRUE;
+   if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, host_locale, sizeof host_locale, NULL, NULL))
+      host_locale[0] = 0;
+   return TRUE;
+}
+const char *luna_os_host_locale(void)
+{
+   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+   InitOnceExecuteOnce(&once, host_locale_once, NULL, NULL);
+   return host_locale[0] ? host_locale : NULL;
+}
+
 static int luna_zone_uncached(const char *zone, DYNAMIC_TIME_ZONE_INFORMATION *tz)
 {
    if (!zone || !*zone)

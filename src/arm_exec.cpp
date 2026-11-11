@@ -4199,7 +4199,12 @@ static thread_local unsigned g_guest_timezone_depth;
 extern "C" const char *arm_exec_device_timezone(void)
 {
     const char *zone = lunaria_env("LUNARIA_TIMEZONE");
-    return zone && *zone ? zone : "Asia/Tokyo";
+    if (zone && *zone) return zone;
+#ifdef _WIN32
+    /* This PC's zone; the Tokyo default predates the Windows port. */
+    if (const char *host = luna_os_host_timezone()) return host;
+#endif
+    return "Asia/Tokyo";
 }
 /* The device has one timezone for the life of the process, so install it
  * once and leave it installed. Saving the host's TZ, setting the device zone
@@ -11878,6 +11883,10 @@ extern "C" void arm_exec_device_locale(char *lang2, char *country2)
         if (!usable(spec)) { spec = getenv("LC_ALL"); source = "LC_ALL"; }
         if (!usable(spec)) { spec = getenv("LC_MESSAGES"); source = "LC_MESSAGES"; }
         if (!usable(spec)) { spec = getenv("LANG"); source = "LANG"; }
+#ifdef _WIN32
+        /* Windows sets none of those: use the display language. */
+        if (!usable(spec)) { spec = luna_os_host_locale(); source = "Windows display language"; }
+#endif
         /* "ja_JP.UTF-8", "ja-JP", "ja".  "C" and "POSIX" name no place. */
         char l[3] = "ja", c[3] = "JP";
         if (usable(spec)) {
