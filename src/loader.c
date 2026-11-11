@@ -32,6 +32,8 @@
 #include "lunaria_os.h"
 #ifdef _WIN32
 #include <pthread.h>
+#include <io.h>
+#include <wchar.h>
 #endif
 /* The bionic-compatible dlfcn entry points (src/linker/dlfcn.c). */
 void dl_parse_library_path(const char *path, char *delim);
@@ -2560,6 +2562,106 @@ main(int argc, const char *argv[])
  * map file or an unstripped build), the guest pc/lr of the crashing thread,
  * and walks a few host frames. */
 const char *arm_exec_guest_state(void);
+
+/* Log file.  Started by double-click or by dropping an APK on the exe, the
+ * console closes with the process, so a crash took its log with it and players
+ * had no way to send one.  stdout and stderr now go through a pipe; a thread
+ * copies everything to the console as before AND to lunaria-last-run.log next
+ * to the exe (or %TEMP% when that folder is read-only).  The run before is kept
+ * as lunaria-previous-run.log.  LUNARIA_NO_LOG_FILE=1 turns it off. */
+static HANDLE g_log_pipe_read;
+static int g_log_console_fd = -1;
+static FILE *g_log_file;
+static char g_log_path[MAX_PATH * 3];
+
+static DWORD WINAPI log_tee_thread(LPVOID unused)
+{
+   (void)unused;
+   char buf[8192];
+   DWORD n;
+   while (ReadFile(g_log_pipe_read, buf, sizeof buf, &n, NULL) && n) {
+      if (g_log_console_fd >= 0) (void)_write(g_log_console_fd, buf, n);
+      if (g_log_file) { fwrite(buf, 1, n, g_log_file); fflush(g_log_file); }
+   }
+   return 0;
+}
+
+/* Waits (up to ~1 s) until the thread has copied everything written so far.
+ * Called on exit and from the crash report, so the last lines reach the file. */
+static void log_tee_drain(void)
+{
+   if (!g_log_pipe_read) return;
+   fflush(stdout); fflush(stderr);
+   for (int i = 0; i < 100; i++) {
+      DWORD avail = 0;
+      if (!PeekNamedPipe(g_log_pipe_read, NULL, 0, NULL, &avail, NULL) || !avail) break;
+      Sleep(10);
+   }
+   Sleep(20);   /* the last ReadFile's bytes: read from the pipe, still being written */
+}
+
+static bool log_open_in(const wchar_t *dir)
+{
+   wchar_t cur[MAX_PATH + 64], prev[MAX_PATH + 64];
+   if (_snwprintf(cur, MAX_PATH + 63, L"%ls\\lunaria-last-run.log", dir) < 0) return false;
+   if (_snwprintf(prev, MAX_PATH + 63, L"%ls\\lunaria-previous-run.log", dir) < 0) return false;
+   cur[MAX_PATH + 63] = prev[MAX_PATH + 63] = 0;
+   (void)MoveFileExW(cur, prev, MOVEFILE_REPLACE_EXISTING);
+   g_log_file = _wfopen(cur, L"wb");
+   if (!g_log_file) return false;
+   WideCharToMultiByte(CP_UTF8, 0, cur, -1, g_log_path, sizeof g_log_path, NULL, NULL);
+   return true;
+}
+
+static void log_tee_start(int argc, wchar_t **argv)
+{
+   const char *off = getenv("LUNARIA_NO_LOG_FILE");
+   if (off && off[0] && off[0] != '0') return;
+   /* Helper runs (a return link handed over by the browser, pool hosts) must
+    * not rotate or truncate the log of the game that is still running. */
+   if (argc > 1 && (!wcscmp(argv[1], L"--deliver-url") || wcsstr(argv[1], L"-process-")))
+      return;
+   wchar_t dir[MAX_PATH];
+   DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+   wchar_t *slash = (n && n < MAX_PATH) ? wcsrchr(dir, L'\\') : NULL;
+   if (slash) *slash = 0;
+   if (!slash || !log_open_in(dir)) {
+      n = GetTempPathW(MAX_PATH, dir);
+      if (!n || n >= MAX_PATH) return;
+      if (dir[n - 1] == L'\\') dir[n - 1] = 0;
+      if (!log_open_in(dir)) return;
+   }
+   HANDLE rd, wr;
+   SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+   if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) { fclose(g_log_file); g_log_file = NULL; return; }
+   SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+   fflush(stdout); fflush(stderr);
+   /* After a restart (exec), stderr is the old run's pipe and nobody reads it
+    * any more: write to the console directly instead. */
+   if (getenv("LUNARIA_LOG_TEE_ON"))
+      g_log_console_fd = _wopen(L"CONOUT$", _O_WRONLY | _O_BINARY);
+   else
+      g_log_console_fd = _dup(_fileno(stderr));   /* -1 with no console: file only */
+   _putenv("LUNARIA_LOG_TEE_ON=1");
+   int fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_BINARY);
+   if (fd < 0 || _dup2(fd, _fileno(stderr)) || _dup2(fd, _fileno(stdout))) {
+      CloseHandle(rd); fclose(g_log_file); g_log_file = NULL;
+      if (g_log_console_fd >= 0) { _dup2(g_log_console_fd, _fileno(stderr)); _close(g_log_console_fd); }
+      g_log_console_fd = -1;
+      return;
+   }
+   _close(fd);
+   SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
+   SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(_fileno(stdout)));
+   setvbuf(stdout, NULL, _IONBF, 0);
+   setvbuf(stderr, NULL, _IONBF, 0);
+   g_log_pipe_read = rd;
+   HANDLE t = CreateThread(NULL, 0, log_tee_thread, NULL, 0, NULL);
+   if (t) CloseHandle(t);
+   atexit(log_tee_drain);
+   fprintf(stderr, "[log] this run is also saved to %s\n", g_log_path);
+}
+
 static void crash_module(const void *addr, char *name, size_t cap, uintptr_t *base)
 {
    HMODULE module = NULL;
@@ -2681,6 +2783,8 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info)
       }
    }
    fflush(stderr);
+   if (g_log_path[0]) fprintf(stderr, "[crash] log saved to %s\n", g_log_path);
+   log_tee_drain();
    return EXCEPTION_CONTINUE_SEARCH;
 }
 /* First chance: a fault inside JIT code has no unwind data, so the OS cannot
@@ -2755,6 +2859,7 @@ static void host_timer_resolution(void)
 /* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
 int wmain(int argc, wchar_t *wide_argv[])
 {
+   log_tee_start(argc, wide_argv);
    SetUnhandledExceptionFilter(crash_filter);
    AddVectoredExceptionHandler(0, crash_veh);
    host_timer_resolution();

@@ -86,6 +86,9 @@ jobs:
           else { "lunaria still running after ${{ inputs.seconds }}s" | Tee-Object out\result.txt; Get-Process lunaria -ErrorAction SilentlyContinue | Stop-Process -Force }
           "peak commit (ram + page file charge): ${maxCommit} MB, peak ram in use: ${maxWs} MB" | Tee-Object -Append out\result.txt
           Get-ChildItem out\shots | Measure-Object | ForEach-Object { "screenshots: $($_.Count)" } | Tee-Object -Append out\result.txt
+          $logFile = Join-Path $exe.DirectoryName 'lunaria-last-run.log'
+          if (Test-Path $logFile) { Copy-Item $logFile out\; "log file: $([math]::Round((Get-Item $logFile).Length / 1KB)) KB, stderr capture: $([math]::Round((Get-Item out\lunaria-stderr.log).Length / 1KB)) KB" | Tee-Object -Append out\result.txt }
+          else { "log file: MISSING (lunaria-last-run.log next to the exe)" | Tee-Object -Append out\result.txt }
           Select-String -Path out\lunaria-stderr.log -Pattern "init_host_egl|fastmem|fatal|abort|crash|exception|first guest frame" |
             Select-Object -First 60 | ForEach-Object { $_.Line } | Tee-Object out\highlights.txt
 
