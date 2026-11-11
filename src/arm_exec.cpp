@@ -34436,6 +34436,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (is_copy)
                     if (auto *q = ctx.mem.ptr(is_copy)) *q = 1;  /* JNI_TRUE */
                 g_array_copies[addr] = bytes;
+                /* A heap offset: a64 needs the guest base on it, like GetStringUTFChars. */
+                g_svc_retptr = true;
                 ret32(addr);
             } else {
                 GuestVA buf = (GuestVA)r2;   /* the token arm_malloc handed out */
@@ -34533,6 +34535,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (is_copy)
             if (auto *q = ctx.mem.ptr(is_copy)) *q = 1;   /* JNI_TRUE */
         g_array_copies[addr] = bytes;
+        g_svc_retptr = true;   /* a64: rebase the heap offset */
         ret32(addr);
         break;
     }
