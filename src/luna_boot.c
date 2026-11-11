@@ -1727,7 +1727,13 @@ static int launcher_form(char *path, size_t capacity,
             usleep(20000);
 #endif
         } else {
-            glfwWaitEventsTimeout(.02);
+            /* Wait only for what is left of a 60 Hz frame.  A flat 20 ms wait
+             * came on top of the render and the vsync wait in eglSwapBuffers,
+             * so the form ran at ~45-50 fps and felt laggy (Windows, 12-11). */
+            const uint64_t spent = luna_os_monotonic_ns() - last_frame;
+            const uint64_t period = UINT64_C(16666667);
+            if (spent < period) glfwWaitEventsTimeout((double)(period - spent) / 1e9);
+            else glfwPollEvents();
         }
     }
     if (pick_store.active) {
