@@ -188,7 +188,30 @@ static bool shared_system_apk(const char *guest_path, const char *host)
        stat(shared, &st) != 0 || st.st_size <= 22)
       return false;
    (void)unlink(host);
-   return luna_file_symlink(shared, host) == 0;
+   if (luna_file_symlink(shared, host) == 0) return true;
+   /* Windows grants an unprivileged symlink only in Developer Mode.  Without
+    * it this failed silently and the app kept the 22-byte stub, so Google's
+    * own library read Play services as unsigned and said SERVICE_INVALID even
+    * after the person installed the real one (Aloa, LDoE, 14-11).  A hard link
+    * needs no privilege and the data root is one volume; copy as the last
+    * resort. */
+   if (luna_file_link(shared, host) == 0) {
+      fprintf(stderr, "[packages] %s: real system APK hard-linked (no symlink right)\n", guest_path);
+      return true;
+   }
+   FILE *in = fopen(shared, "rb"), *out = in ? fopen(host, "wb") : NULL;
+   bool ok = in && out;
+   static char buf[1 << 16];
+   size_t n;
+   while (ok && (n = fread(buf, 1, sizeof buf, in)) > 0)
+      ok = fwrite(buf, 1, n, out) == n;
+   if (in && ferror(in)) ok = false;
+   if (in) fclose(in);
+   if (out && fclose(out)) ok = false;
+   if (!ok) (void)unlink(host);
+   fprintf(stderr, "[packages] %s: real system APK %s\n", guest_path,
+           ok ? "copied (no symlink or hard link)" : "could not be linked or copied");
+   return ok;
 }
 
 /* A package's APK, as far as anything outside its own installer can tell, is a
