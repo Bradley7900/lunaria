@@ -706,9 +706,55 @@ size_t luna_os_page_size(void)
    return si.dwPageSize ? si.dwPageSize : 4096u;
 }
 
+/* MADV_DONTNEED / MADV_FREE on [first, last]: give the pages back.
+ * Linux promises zero-filled pages on the next touch of a private anonymous
+ * mapping.  MEM_DECOMMIT gives exactly that: inside a lazy range the next
+ * touch faults into lazy_veh, which commits fresh zero pages; outside one the
+ * range is committed again straight away (still zero, still no RAM until
+ * touched).  Only private read/write memory is released; anything else
+ * (file views, code, guard pages) keeps its pages, as before. */
+static int memory_release(uintptr_t first, uintptr_t last)
+{
+   int released = 0, kept = 0;
+   AcquireSRWLockExclusive(&lazy_lock);
+   for (uintptr_t at = first; at <= last;) {
+      MEMORY_BASIC_INFORMATION mi;
+      if (!VirtualQuery((void *)at, &mi, sizeof mi)) break;
+      uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize - 1;
+      if (end > last) end = last;
+      const size_t n = end - at + 1;
+      if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE &&
+          mi.Protect == PAGE_READWRITE) {
+         const int lazy = lazy_find(at) >= 0 && lazy_find(end) >= 0;
+         if (VirtualFree((void *)at, n, MEM_DECOMMIT)) {
+            if (!lazy && !VirtualAlloc((void *)at, n, MEM_COMMIT, PAGE_READWRITE)) {
+               ReleaseSRWLockExclusive(&lazy_lock);
+               fprintf(stderr, "[mem] DONTNEED re-commit failed at %p (+%zu), error %lu\n",
+                       (void *)at, n, (unsigned long)GetLastError());
+               errno = ENOMEM; return -1;
+            }
+            released = 1;
+         } else {
+            memset((void *)at, 0, n);   /* committed RW: no fault, no lock re-entry */
+            kept = 1;
+         }
+      } else if (mi.State == MEM_COMMIT) {
+         kept = 1;
+      }
+      /* MEM_RESERVE inside a lazy range was never touched: already zero. */
+      if (end == last) break;
+      at = end + 1;
+   }
+   ReleaseSRWLockExclusive(&lazy_lock);
+   static volatile LONG said;
+   if (released && !InterlockedExchange(&said, 1))
+      fprintf(stderr, "[mem] DONTNEED gives pages back to Windows (decommit)\n");
+   (void)kept;
+   return 0;
+}
+
 int luna_os_memory_advise(void *addr, size_t len, int advice)
 {
-   luna_lazy_ensure(addr, len);
    switch (advice) {
    case 0: case 1: case 2: case 3: case 4: case 8:
    case 9: case 10: case 11: case 12: case 13: case 14: case 15:
@@ -721,10 +767,18 @@ int luna_os_memory_advise(void *addr, size_t len, int advice)
    if (!len) return 0;
    if (len - 1 > UINTPTR_MAX - first) { errno = ENOMEM; return -1; }
    uintptr_t last = first + len - 1;
+   /* No luna_lazy_ensure here: advice must never commit memory.  It used to,
+    * so every DONTNEED Unity sent over a freed 512 MiB heap block committed
+    * the whole block and then refused to release it - Lunaria grew to 4.8 GB
+    * on an 8 GB laptop with the guest told it had 2 GB.  A reserved page of a
+    * lazy range counts as mapped (it is, to the guest). */
+   int all_committed = 1;
    for (uintptr_t cursor = first;;) {
       MEMORY_BASIC_INFORMATION info;
-      if (!VirtualQuery((void *)cursor, &info, sizeof info) || info.State != MEM_COMMIT) {
-         errno = ENOMEM; return -1;
+      if (!VirtualQuery((void *)cursor, &info, sizeof info)) { errno = ENOMEM; return -1; }
+      if (info.State != MEM_COMMIT) {
+         if (info.State != MEM_RESERVE || lazy_find(cursor) < 0) { errno = ENOMEM; return -1; }
+         all_committed = 0;
       }
       uintptr_t end = (uintptr_t)info.BaseAddress + info.RegionSize - 1;
       if (end >= last) break;
@@ -732,11 +786,13 @@ int luna_os_memory_advise(void *addr, size_t len, int advice)
    }
    /* Access-pattern advice is a hint; Windows keeps its own paging policy. */
    if (advice <= 2) return 0;
-   if (advice != 3) {
-      /* DiscardVirtualMemory does not promise zero-filled anonymous pages,
-       * so it cannot implement Linux MADV_DONTNEED. Preserve the mapping. */
-      errno = ENOTSUP; return -1;
+   if (advice == 4 || advice == 8) {
+      if (getenv("LUNARIA_DONTNEED_KEEP")) { errno = ENOTSUP; return -1; }
+      return memory_release(first, last);
    }
+   if (advice != 3) { errno = ENOTSUP; return -1; }
+   /* WILLNEED over untouched lazy pages would only pull in zero pages. */
+   if (!all_committed) return 0;
    struct memory_range { void *address; SIZE_T size; } range = { addr, len };
    typedef BOOL (WINAPI *prefetch_fn)(HANDLE, ULONG_PTR, struct memory_range *, ULONG);
    prefetch_fn prefetch = (prefetch_fn)(uintptr_t)GetProcAddress(
