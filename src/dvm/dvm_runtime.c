@@ -4870,32 +4870,14 @@ static dvm_ref make_stack_element(struct dvm *vm, const struct dvm_method *m)
 
 /* The live interpreter stack, innermost first, as java.lang.Thread reports
  * it.  `skip` drops the frames belonging to the reporting call itself. */
-/* How many frames a Throwable's or Thread's stack trace keeps (innermost
- * first).  Java objects here are never collected, and a trace costs one
- * StackTraceElement plus two strings per frame: LDoE's analytics SDK threw
- * ~5000 StackOverflowErrors every 10 s, each thousands of frames deep, and
- * that alone grew Lunaria by ~1.2 GB per 10 s until an 8 GB laptop froze.
- * SDKs read the top few frames.  LUNARIA_DVM_TRACE_MAX=N, 0 = no limit. */
-static int stack_trace_cap(int n)
-{
-   static int cap = -1;
-   if (cap < 0) {
-      const char *e = getenv("LUNARIA_DVM_TRACE_MAX");
-      cap = e && *e ? atoi(e) : 128;
-      if (cap < 0) cap = 0;
-   }
-   return cap && n > cap ? cap : n;
-}
-
 static dvm_ref current_stack_trace(struct dvm *vm, int skip)
 {
    int n = vm->ncallstack - skip;
    if (n < 0) n = 0;
-   const int keep = stack_trace_cap(n);
    dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/lang/StackTraceElement;",
-                               (uint32_t)keep);
+                               (uint32_t)n);
    dvm_ref *slots = arr ? dvm_array_data(vm, arr) : NULL;
-   for (int i = 0; slots && i < keep; ++i)
+   for (int i = 0; slots && i < n; ++i)
       slots[i] = make_stack_element(vm, vm->callstack[n - 1 - i]);
    return arr;
 }
@@ -4906,16 +4888,15 @@ static dvm_ref current_stack_trace(struct dvm *vm, int skip)
 static dvm_ref current_thread_stack_trace(struct dvm *vm)
 {
    const int n = vm->ncallstack;
-   const int keep = stack_trace_cap(n);
    dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/lang/StackTraceElement;",
-                               (uint32_t)keep + 2u);
+                               (uint32_t)n + 2u);
    dvm_ref *slots = arr ? dvm_array_data(vm, arr) : NULL;
    if (!slots) return arr;
    slots[0] = make_stack_element_named(
       vm, "dalvik/system/VMStack", "getThreadStackTrace");
    slots[1] = make_stack_element_named(
       vm, "java/lang/Thread", "getStackTrace");
-   for (int i = 0; i < keep; ++i)
+   for (int i = 0; i < n; ++i)
       slots[i + 2] = make_stack_element(vm, vm->callstack[n - 1 - i]);
    return arr;
 }
