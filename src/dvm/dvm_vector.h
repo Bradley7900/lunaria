@@ -492,6 +492,7 @@ static const struct rt_method rt_array_list[]={
    M("addAll","(Ljava/util/Collection;)Z",array_list_add_all),M("addAll","(ILjava/util/Collection;)Z",array_list_add_all),
    M("removeAll","(Ljava/util/Collection;)Z",array_list_remove_all),M("retainAll","(Ljava/util/Collection;)Z",array_list_remove_all),
    M("forEach","(Ljava/util/function/Consumer;)V",array_list_function),
+   M("stream","()Ljava/util/stream/Stream;",collection_stream),
    M("replaceAll","(Ljava/util/function/UnaryOperator;)V",array_list_function),
    M("removeIf","(Ljava/util/function/Predicate;)Z",array_list_function),
    M("sort","(Ljava/util/Comparator;)V",array_list_sort),

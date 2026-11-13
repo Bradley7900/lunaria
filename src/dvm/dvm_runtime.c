@@ -16242,7 +16242,11 @@ static bool list_hashCode(struct dvm *vm, dvm_ref self, const union dvm_value *a
 
 static bool list_sublist(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
 
+#include "dvm_stream.h"
+
 static const struct rt_method rt_list_methods[] = {
+   M("stream", "()Ljava/util/stream/Stream;", collection_stream),
+   M("parallelStream", "()Ljava/util/stream/Stream;", collection_stream),
    M("toString", "()Ljava/lang/String;", list_toString),
    M("subList", "(II)Ljava/util/List;", list_sublist),
    M("equals", "(Ljava/lang/Object;)Z", list_equals),
@@ -17836,6 +17840,8 @@ static bool arrays_toString(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_method rt_arrays[] = {
+   SM("stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;", stream_static),
+   SM("stream", "([Ljava/lang/Object;II)Ljava/util/stream/Stream;", stream_static),
    SM("toString", "([Z)Ljava/lang/String;", arrays_toString),
    SM("toString", "([B)Ljava/lang/String;", arrays_toString),
    SM("toString", "([S)Ljava/lang/String;", arrays_toString),
@@ -80502,6 +80508,12 @@ static const struct rt_class rt_classes[] = {
    { "Ljava/net/URLEncoder;", "Ljava/lang/Object;", rt_urlencoder, NULL, NULL },
    { "Ljava/net/URLDecoder;", "Ljava/lang/Object;", rt_urldecoder, NULL, NULL },
    { "Ljava/util/Arrays;", "Ljava/lang/Object;", rt_arrays, NULL, NULL },
+   { "Ljava/util/stream/BaseStream;", "Ljava/lang/Object;", NULL, NULL, NULL, NULL, true },
+   { "Ljava/util/stream/Stream;", "Ljava/lang/Object;", rt_stream_statics, NULL, rt_stream_iface_base, NULL, true },
+   { "Ljava/util/stream/Collector;", "Ljava/lang/Object;", NULL, NULL, NULL, NULL, true },
+   { "Ljava/util/stream/Collectors;", "Ljava/lang/Object;", rt_collectors, NULL, NULL },
+   { "Llunaria/util/ListStream;", "Ljava/lang/Object;", rt_list_stream, rt_list_stream_fields, rt_list_stream_ifaces },
+   { "Llunaria/util/SimpleCollector;", "Ljava/lang/Object;", NULL, rt_simple_collector_fields, rt_simple_collector_ifaces },
    { "Ljava/util/UUID;", "Ljava/lang/Object;", rt_uuid, rt_uuid_fields, NULL },
    { "Landroid/os/Parcel;", "Ljava/lang/Object;", rt_parcel_methods, NULL, NULL },
    { "Landroid/os/BaseBundle;", "Ljava/lang/Object;", rt_bundle, NULL, NULL },
