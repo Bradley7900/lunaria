@@ -1051,6 +1051,12 @@ uint64_t luna_os_peak_rss_kb(void)
    return getrusage(RUSAGE_SELF, &usage) == 0 ? (uint64_t)usage.ru_maxrss / 1024 : 0;
 }
 
+int luna_os_mem_breakdown(char *out, size_t out_len)
+{
+   if (out && out_len) out[0] = 0;
+   return -1;
+}
+
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
 {
    uint64_t total = 0;

@@ -1638,6 +1638,9 @@ static inline void luna_timer_destroy(struct luna_posix_timers *s)
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes);
 /* Peak host resident memory, in Android/Linux's KiB units. */
 uint64_t luna_os_peak_rss_kb(void);
+/* One line of where the RAM is right now (Windows: working set by owner).
+ * Returns -1 and leaves out empty where the OS has no such view. */
+int luna_os_mem_breakdown(char *out, size_t out_len);
 int luna_os_disk_info(const char *path, uint64_t *total_bytes,
                       uint64_t *free_bytes, uint64_t *block_size);
 

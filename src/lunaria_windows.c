@@ -1215,6 +1215,103 @@ uint64_t luna_os_peak_rss_kb(void)
       ? (uint64_t)usage.PeakWorkingSetSize / 1024 : 0;
 }
 
+/* Where the RAM is right now: the working set split by what owns the pages.
+ * Commit is not RAM, so this walks the working set itself (QueryWorkingSet)
+ * and files each resident page under the region VirtualQuery says it is in.
+ * guest = the guest's own heap reservation, blocks = the other lazy ranges
+ * (Unity's 512 MiB heap blocks), jit = private executable pages (translated
+ * code), host = other private pages (our heap, the Java VM, ANGLE/driver),
+ * dll = loaded images, files = mapped files and sections. */
+struct ws_region { uintptr_t lo, hi; unsigned char kind; };
+enum { WS_GUEST, WS_BLOCKS, WS_JIT, WS_HOST, WS_DLL, WS_FILES, WS_KINDS };
+
+static int ws_region_cmp(const void *k, const void *e)
+{
+   const uintptr_t a = *(const uintptr_t *)k;
+   const struct ws_region *r = (const struct ws_region *)e;
+   return a < r->lo ? -1 : a >= r->hi ? 1 : 0;
+}
+
+int luna_os_mem_breakdown(char *out, size_t out_len)
+{
+   if (!out || !out_len) return -1;
+   out[0] = 0;
+   uintptr_t guest_lo = 0, guest_hi = 0;
+   for (LONG i = 0; i < lazy_count; ++i)
+      if (lazy_ranges[i].lo && (!guest_lo || lazy_ranges[i].lo < guest_lo)) {
+         guest_lo = lazy_ranges[i].lo; guest_hi = lazy_ranges[i].hi;
+      }
+   size_t cap = 4096, n = 0;
+   struct ws_region *rs = (struct ws_region *)malloc(cap * sizeof *rs);
+   if (!rs) return -1;
+   SYSTEM_INFO si; GetSystemInfo(&si);
+   for (uintptr_t at = (uintptr_t)si.lpMinimumApplicationAddress;
+        at < (uintptr_t)si.lpMaximumApplicationAddress;) {
+      MEMORY_BASIC_INFORMATION mi;
+      if (!VirtualQuery((void *)at, &mi, sizeof mi)) break;
+      const uintptr_t lo = (uintptr_t)mi.BaseAddress, hi = lo + mi.RegionSize;
+      if (hi <= at) break;
+      if (mi.State == MEM_COMMIT) {
+         unsigned char k;
+         if (mi.Type == MEM_IMAGE) k = WS_DLL;
+         else if (mi.Type == MEM_MAPPED) k = WS_FILES;
+         else if (lo >= guest_lo && lo < guest_hi) k = WS_GUEST;
+         else if (lazy_find(lo) >= 0) k = WS_BLOCKS;
+         else if (mi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) k = WS_JIT;
+         else k = WS_HOST;
+         if (n == cap) {
+            struct ws_region *g = (struct ws_region *)realloc(rs, (cap *= 2) * sizeof *rs);
+            if (!g) { free(rs); return -1; }
+            rs = g;
+         }
+         rs[n].lo = lo; rs[n].hi = hi; rs[n].kind = k; ++n;
+      }
+      at = hi;
+   }
+   /* Room for every resident page plus some growth while we look. */
+   PROCESS_MEMORY_COUNTERS pmc; memset(&pmc, 0, sizeof pmc); pmc.cb = sizeof pmc;
+   GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
+   size_t entries = pmc.WorkingSetSize / si.dwPageSize + 65536;
+   PSAPI_WORKING_SET_INFORMATION *ws = NULL;
+   for (int tries = 0; tries < 3; ++tries) {
+      const size_t bytes = sizeof(ULONG_PTR) + entries * sizeof(PSAPI_WORKING_SET_BLOCK);
+      ws = (PSAPI_WORKING_SET_INFORMATION *)VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE,
+                                                         PAGE_READWRITE);
+      if (!ws) break;
+      if (QueryWorkingSet(GetCurrentProcess(), ws, (DWORD)bytes)) break;
+      const DWORD err = GetLastError();
+      const size_t need = ws->NumberOfEntries;
+      VirtualFree(ws, 0, MEM_RELEASE); ws = NULL;
+      if (err != ERROR_BAD_LENGTH) break;
+      entries = need + 65536;
+   }
+   uint64_t mb[WS_KINDS] = {0}, other = 0;
+   if (ws) {
+      for (ULONG_PTR i = 0; i < ws->NumberOfEntries; ++i) {
+         const uintptr_t a = (uintptr_t)ws->WorkingSetInfo[i].VirtualPage * si.dwPageSize;
+         const struct ws_region *r = (const struct ws_region *)
+            bsearch(&a, rs, n, sizeof *rs, ws_region_cmp);
+         if (r) mb[r->kind] += si.dwPageSize; else other += si.dwPageSize;
+      }
+      VirtualFree(ws, 0, MEM_RELEASE);
+   }
+   free(rs);
+   if (!ws && !mb[WS_HOST]) {
+      snprintf(out, out_len, "working set unavailable (error %lu)", (unsigned long)GetLastError());
+      return -1;
+   }
+   snprintf(out, out_len,
+            "now %llu MB in RAM: guest heap %llu, unity blocks %llu, jit %llu, host %llu, "
+            "dlls %llu, files %llu, other %llu (MB); commit %llu MB",
+            (unsigned long long)(pmc.WorkingSetSize >> 20),
+            (unsigned long long)(mb[WS_GUEST] >> 20), (unsigned long long)(mb[WS_BLOCKS] >> 20),
+            (unsigned long long)(mb[WS_JIT] >> 20), (unsigned long long)(mb[WS_HOST] >> 20),
+            (unsigned long long)(mb[WS_DLL] >> 20), (unsigned long long)(mb[WS_FILES] >> 20),
+            (unsigned long long)(other >> 20), (unsigned long long)(pmc.PagefileUsage >> 20));
+   return 0;
+}
+
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
 {
    MEMORYSTATUSEX st;

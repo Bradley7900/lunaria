@@ -722,6 +722,9 @@ static void perf_tick(void)
                  (unsigned long long)(peak_kb / 1024),
                  (unsigned long long)(avail >> 20), (unsigned long long)(total >> 20),
                  avail < total / 10 ? " (LOW - the PC is likely swapping)" : "");
+      char where[320];
+      if (luna_os_mem_breakdown(where, sizeof where) == 0 && where[0])
+         fprintf(stderr, "[perf]   ram %s\n", where);
    }
    {
       uint64_t a32[3];
