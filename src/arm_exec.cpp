@@ -32784,6 +32784,85 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                             (unsigned long long)it->second.first);
                 }
             }
+            /* DexClassLoader / PathClassLoader / BaseDexClassLoader /
+             * DelegateLastClassLoader(String dexPath, ...) built from native
+             * code: this NewObject reaches the jvm wrapper, never the dvm's
+             * own <init> (dexcl_init), so the dex the guest just wrote was
+             * never opened and every loadClass on it threw.  Firebase C++
+             * writes cache/app_resources_lib.jar and loads
+             * com/google/firebase/app/internal/cpp/Log from it; without it
+             * Firebase App never initialises (Aloa's LDoE, 14-11). */
+            if (cn && ctor_args[0].l &&
+                (!strcmp(cn, "dalvik/system/DexClassLoader") ||
+                 !strcmp(cn, "dalvik.system.DexClassLoader") ||
+                 !strcmp(cn, "dalvik/system/PathClassLoader") ||
+                 !strcmp(cn, "dalvik.system.PathClassLoader") ||
+                 !strcmp(cn, "dalvik/system/BaseDexClassLoader") ||
+                 !strcmp(cn, "dalvik.system.BaseDexClassLoader") ||
+                 !strcmp(cn, "dalvik/system/DelegateLastClassLoader") ||
+                 !strcmp(cn, "dalvik.system.DelegateLastClassLoader"))) {
+                const char *dp = jvm->native.GetStringUTFChars(
+                    env, (jstring)ctor_args[0].l, nullptr);
+                if (dp && *dp) {
+                    static std::mutex loaded_mx;
+                    static std::set<std::string> loaded;
+                    const char *apk = lunaria_env("ANDROID_APK_FILE");
+                    const char *code = lunaria_env("ANDROID_PACKAGE_CODE_PATH");
+                    std::string all(dp);
+                    size_t at = 0;
+                    while (at <= all.size()) {
+                        size_t end = all.find(':', at);
+                        if (end == std::string::npos) end = all.size();
+                        std::string one = all.substr(at, end - at);
+                        at = end + 1;
+                        if (one.empty() ||
+                            (apk && one == apk) || (code && one == code))
+                            continue;
+                        char mapped[PATH_MAX];
+                        const char *host = arm_exec_map_guest_path(
+                            one.c_str(), mapped, sizeof mapped);
+                        if (!host) continue;
+                        {
+                            std::lock_guard<std::mutex> lk(loaded_mx);
+                            if (!loaded.insert(host).second) continue;
+                        }
+                        unsigned char magic[4] = {0};
+                        if (FILE *f = luna_file_fopen(host, "rb")) {
+                            (void)!fread(magic, 1, sizeof magic, f);
+                            fclose(f);
+                        }
+                        int added = 0;
+                        if (magic[0] == 'P' && magic[1] == 'K') {
+                            for (int n = 1; n < 100; ++n) {
+                                char entry[32];
+                                if (n == 1) snprintf(entry, sizeof entry, "classes.dex");
+                                else snprintf(entry, sizeof entry, "classes%d.dex", n);
+                                size_t len = 0;
+                                unsigned char *d = arm_exec_zip_read(host, entry, &len);
+                                if (!d) break;
+                                if (dvm_jni_add_dex_memory(d, len, host)) ++added;
+                                free(d);
+                            }
+                        } else if (!memcmp(magic, "dex\n", 4)) {
+                            std::vector<uint8_t> bytes;
+                            if (FILE *f = luna_file_fopen(host, "rb")) {
+                                uint8_t buf[65536];
+                                size_t got;
+                                while ((got = fread(buf, 1, sizeof buf, f)) > 0)
+                                    bytes.insert(bytes.end(), buf, buf + got);
+                                fclose(f);
+                            }
+                            if (!bytes.empty() &&
+                                dvm_jni_add_dex_memory(bytes.data(), bytes.size(), host))
+                                ++added;
+                        }
+                        fprintf(stderr, "[arm_jni] %s: %s -> %d dex file(s) loaded\n",
+                                cn, host, added);
+                    }
+                }
+                if (dp)
+                    jvm->native.ReleaseStringUTFChars(env, (jstring)ctor_args[0].l, dp);
+            }
         }
         {
             const char *cn = ((uintptr_t)AS_CLASS(r1) <= 65536u && r1)
