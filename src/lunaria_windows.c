@@ -416,6 +416,52 @@ void luna_lazy_ensure(const void *addr, size_t len)
    }
 }
 
+/* RAM cap: a Windows job object limits how much memory Lunaria may commit,
+ * so a game that keeps growing ends Lunaria instead of swapping the whole PC
+ * into a freeze (a player's 8 GB laptop locked up once).  Default 60% of
+ * the PC's RAM; LUNARIA_MAX_RAM_MB=N sets it, 0 turns it off. */
+static uint64_t ram_cap_mb;
+
+int luna_os_mem_breakdown(char *out, size_t out_len);
+
+static void ram_cap_init(void)
+{
+   MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
+   const uint64_t total_mb = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys >> 20 : 0;
+   uint64_t mb = total_mb * 6 / 10;
+   const char *v = getenv("LUNARIA_MAX_RAM_MB");
+   if (v && *v) mb = strtoull(v, NULL, 10);
+   if (!mb) { fprintf(stderr, "[mem] ram cap off\n"); return; }
+   if (mb < 1024) mb = 1024;
+   HANDLE job = CreateJobObjectW(NULL, NULL);
+   JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+   memset(&li, 0, sizeof li);
+   li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+   li.ProcessMemoryLimit = (SIZE_T)(mb << 20);
+   if (!job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) ||
+       !AssignProcessToJobObject(job, GetCurrentProcess())) {
+      fprintf(stderr, "[mem] ram cap not set (error %lu)\n", (unsigned long)GetLastError());
+      if (job) CloseHandle(job);
+      return;
+   }
+   ram_cap_mb = mb;
+   fprintf(stderr, "[mem] ram cap %llu MB of %llu MB (LUNARIA_MAX_RAM_MB, 0 = off)\n",
+           (unsigned long long)mb, (unsigned long long)total_mb);
+}
+
+static void ram_cap_hit(uintptr_t a)
+{
+   static volatile LONG once;
+   if (InterlockedExchange(&once, 1)) { Sleep(INFINITE); }
+   char where[320];
+   if (luna_os_mem_breakdown(where, sizeof where) != 0) where[0] = 0;
+   fprintf(stderr, "[mem] RAM CAP HIT: the game wanted more than %llu MB (at %p). "
+           "Lunaria is closing so the PC does not freeze. %s\n",
+           (unsigned long long)ram_cap_mb, (void *)a, where);
+   fflush(stderr); fflush(stdout);
+   ExitProcess(3);
+}
+
 static LONG CALLBACK lazy_veh(EXCEPTION_POINTERS *e)
 {
    const EXCEPTION_RECORD *r = e->ExceptionRecord;
@@ -426,9 +472,11 @@ static LONG CALLBACK lazy_veh(EXCEPTION_POINTERS *e)
    if (i < 0) return EXCEPTION_CONTINUE_SEARCH;
    MEMORY_BASIC_INFORMATION mi;
    if (!VirtualQuery((void *)a, &mi, sizeof mi)) return EXCEPTION_CONTINUE_SEARCH;
-   if (mi.State == MEM_RESERVE)
-      return lazy_commit(i, a, 1) ? EXCEPTION_CONTINUE_EXECUTION
-                                  : EXCEPTION_CONTINUE_SEARCH;
+   if (mi.State == MEM_RESERVE) {
+      if (lazy_commit(i, a, 1)) return EXCEPTION_CONTINUE_EXECUTION;
+      if (ram_cap_mb) ram_cap_hit(a);
+      return EXCEPTION_CONTINUE_SEARCH;
+   }
    /* Two threads can fault on the same reserved chunk: one commits it while
     * the other's fault is still being dispatched, and the second then finds
     * the page committed.  Its access was valid, so retry it.  Wait for any
@@ -467,6 +515,7 @@ static void *lazy_reserve(void *want, size_t len, int exact)
    if (lazy_state == 0) {
       const char *v = getenv("LUNARIA_LAZY_COMMIT");
       lazy_state = v && v[0] == '0' ? -1 : 1;
+      ram_cap_init();
       if (lazy_state > 0 && !AddVectoredExceptionHandler(1, lazy_veh)) lazy_state = -1;
       fprintf(stderr, "[mem] lazy commit %s\n", lazy_state > 0 ? "on" : "off");
    }
