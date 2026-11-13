@@ -1266,6 +1266,10 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
 
    if (g_throw_want_stack && vm) {
       g_throw_want_stack = false;
+      const size_t room = luna_os_stack_remaining();
+      fprintf(stderr, "[dvm]   sample throw: %s \"%s\", java depth %d, host stack left %s%zu KB\n",
+              class_name, msg, vm->depth, room == SIZE_MAX ? "unknown " : "",
+              room == SIZE_MAX ? (size_t)0 : room / 1024);
       fprintf(stderr, "[dvm]   the loop, innermost first:\n");
       for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 10;
            --i, ++shown) {

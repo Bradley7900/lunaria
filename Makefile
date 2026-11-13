@@ -196,6 +196,12 @@ LUNARIA_LIBDIRS =
 # Windows needs UCRT for per-thread locales and UTF-8 conversion.
 WINDOWS_CRT_FLAGS ?= -mcrtdll=ucrt
 CPPFLAGS += $(WINDOWS_CRT_FLAGS)
+# 16 MiB stack reserve for the exe; threads made without an explicit size
+# (the arm64 engine workers, the pump) inherit it.  Reserve, not RAM: pages
+# commit only as they are used.  The 1 MiB default left Java code entered
+# from the pump/engine threads ~150 interpreted calls, and LDoE's AppMetrica
+# overflowed there ~500 times a second, retrying forever.
+WINDOWS_STACK_FLAGS = -Wl,--stack,16777216   # exe link only (LDFLAGS also reaches the ELF guest builds)
 # Target Windows 10+. llvm-mingw still defaults to an older _WIN32_WINNT, which
 # hides GetCurrentThreadStackLimits, FileDispositionInfoEx, and
 # EnumDynamicTimeZoneInformation used by lunaria_windows.c.
@@ -801,7 +807,7 @@ $(LUNARIA_BIN): $(HOST_EXPORT) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OB
 endif
 
 $(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs)
-	$(CXX) -std=c++20 $(WINDOWS_CRT_FLAGS) $(WINDOWS_ENTRY_FLAGS) $(OPTFLAGS) $(HOST_EXPORT) \
+	$(CXX) -std=c++20 $(WINDOWS_CRT_FLAGS) $(WINDOWS_ENTRY_FLAGS) $(WINDOWS_STACK_FLAGS) $(OPTFLAGS) $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
 	    $(TEXCACHE_OBJS) $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
