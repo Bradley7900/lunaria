@@ -2494,12 +2494,47 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    luna_file_info info;
    if (luna_file_infoat(LUNA_AT_FDCWD, input, &info, 0))
       return -1;
-   uint64_t hash = hash_bytes(UINT64_C(14695981039346656037), input, strlen(input));
-   hash = hash_bytes(hash, &info.size, sizeof info.size);
+   /* Keyed on what the archive IS, not where it sits: size, modified time and
+    * the last 64 KiB, which hold the zip central directory (every entry's CRC).
+    * The path used to be part of the key, so moving or renaming a 1.5 GB game
+    * unpacked all of it again into a second copy (Aloa, 14-11). */
+   uint64_t hash = hash_bytes(UINT64_C(14695981039346656037), &info.size, sizeof info.size);
    hash = hash_bytes(hash, &info.modified, sizeof info.modified);
+   {
+      FILE *tail = open_file(input, "rb");
+      if (tail) {
+         static unsigned char buf[65536];
+         const uint64_t size = (uint64_t)info.size;
+         const uint64_t at = size > sizeof buf ? size - sizeof buf : 0;
+         if (!seek_file(tail, at)) {
+            const size_t got = fread(buf, 1, sizeof buf, tail);
+            hash = hash_bytes(hash, buf, got);
+         }
+         fclose(tail);
+      }
+   }
    char key[64];
-   snprintf(key, sizeof key, "native-v1-%016" PRIx64, hash);
-   if (path_join(cache, sizeof cache, cache_root, key) || mkdirs(cache) || path_join(pkgdir, sizeof pkgdir, cache, "pkg") || path_join(inst, sizeof inst, cache, "inst") || path_join(ready, sizeof ready, cache, ".ready"))
+   snprintf(key, sizeof key, "native-v2-%016" PRIx64, hash);
+   if (path_join(cache, sizeof cache, cache_root, key))
+      return -1;
+   {  /* A cache unpacked under the old path-based key is the same archive if it
+       * is still at that path: adopt it rather than unpack 1.5 GB again. */
+      char old_cache[APK_PATH], old_ready[APK_PATH];
+      uint64_t old = hash_bytes(UINT64_C(14695981039346656037), input, strlen(input));
+      old = hash_bytes(old, &info.size, sizeof info.size);
+      old = hash_bytes(old, &info.modified, sizeof info.modified);
+      char old_key[64];
+      snprintf(old_key, sizeof old_key, "native-v1-%016" PRIx64, old);
+      if (!path_join(old_cache, sizeof old_cache, cache_root, old_key) &&
+          !path_join(old_ready, sizeof old_ready, old_cache, ".ready") &&
+          exists(old_ready) && !exists(cache)) {
+         if (luna_file_rename(old_cache, cache))
+            fprintf(stderr, "[apk] could not adopt the old cache %s\n", old_cache);
+         else
+            fprintf(stderr, "[apk] cache: adopted %s as %s\n", old_key, key);
+      }
+   }
+   if (mkdirs(cache) || path_join(pkgdir, sizeof pkgdir, cache, "pkg") || path_join(inst, sizeof inst, cache, "inst") || path_join(ready, sizeof ready, cache, ".ready"))
       return -1;
    bool hit = exists(ready) && !env_true("LUNARIA_NO_CACHE");
    fprintf(stderr, "[apk] Preparing %s%s\n", input, hit ? " (cached)" : "");
