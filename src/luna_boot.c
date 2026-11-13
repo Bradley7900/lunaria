@@ -1515,6 +1515,33 @@ static const char pick_css_extra[] =
     "#launcher-card .bar{background:rgba(14,16,19,0.98);border-top-color:#262b31;}"
     "#launcher-card #continue{background:#0b8fe0;color:#ffffff;border-color:#0b8fe0;}";
 
+/* "Play again": packages opened before, from lunaria-recent.txt via apk.c. */
+#define RECENT_SHOWN 8
+static char g_recent[RECENT_SHOWN][4096];
+static size_t g_recent_n;
+static char g_recent_shown[RECENT_SHOWN][4096];   /* the ones that still exist, in button order */
+static size_t g_recent_shown_n;
+
+void luna_launcher_set_recent(const char **paths, size_t count)
+{
+    g_recent_n = 0;
+    for (size_t i = 0; i < count && g_recent_n < RECENT_SHOWN; i++)
+        if (paths[i] && strlen(paths[i]) < sizeof g_recent[0])
+            strcpy(g_recent[g_recent_n++], paths[i]);
+}
+
+static void pick_recent(LunaElement *element)
+{
+    for (size_t i = 0; i < g_recent_shown_n; i++) {
+        char id[32]; snprintf(id, sizeof id, "recent%zu", i);
+        if (luna_element_at(luna_get_element_by_id(id)) == element) {
+            /* the same route as a dropped file: validated, then opened */
+            snprintf(dropped, sizeof dropped, "%s", g_recent_shown[i]);
+            return;
+        }
+    }
+}
+
 static int launcher_form(char *path, size_t capacity,
                          luna_launcher_setting *settings, size_t count,
                          const char *package, const char *title, const char *note)
@@ -1528,7 +1555,12 @@ static int launcher_form(char *path, size_t capacity,
     /* luna-ui's file dialog is part of the document, hidden until Browse. */
     const char *dialog_html = luna_file_dialog_overlay_html();
     const char *dialog_css = luna_file_dialog_css();
-    size_t html_size = 8192 + count * 768 + strlen(dialog_html);
+    size_t html_size = 8192 + count * 768 + strlen(dialog_html) + RECENT_SHOWN * 96;
+    g_recent_shown_n = 0;
+    if (!package && !title)
+        for (size_t i = 0; i < g_recent_n; i++)
+            if (pick_acceptable(g_recent[i]))
+                strcpy(g_recent_shown[g_recent_shown_n++], g_recent[i]);
     for (size_t i = 0; i < count; ++i) {
         if (settings[i].heading) html_size += 32 + strlen(settings[i].heading);
         if (!settings[i].choices) continue;
@@ -1552,6 +1584,12 @@ static int launcher_form(char *path, size_t capacity,
         "</div><div class=\"mark\">LUNARIA</div>"
         "<div class=\"card\" id=\"launcher-card\"><div class=\"main\"><h1 id=\"launcher-title\"></h1>"
         "<p class=\"sub\" id=\"launcher-sub\"></p>");
+    if (g_recent_shown_n) {
+        at += (size_t)snprintf(html + at, html_size - at, "<div class=\"lbl\">Play again</div>");
+        for (size_t i = 0; i < g_recent_shown_n; i++)
+            at += (size_t)snprintf(html + at, html_size - at,
+                "<button class=\"google recent\" id=\"recent%zu\"></button>", i);
+    }
     if (!package) {
         at += (size_t)snprintf(html + at, html_size - at,
             "<button class=\"drop\" id=\"drop\">Drop a package file here or click to browse…</button>");
@@ -1635,6 +1673,16 @@ static int launcher_form(char *path, size_t capacity,
     luna_set_text(luna_get_element_by_id("launcher-sub"), package ? package : "Choose an APK, XAPK, APKS or AAB package.");
     if (!package) {
         luna_set_on_click(luna_get_element_by_id("drop"), pick_browse);
+    }
+    for (size_t i = 0; i < g_recent_shown_n; i++) {
+        char id[32], label[300];
+        snprintf(id, sizeof id, "recent%zu", i);
+        const char *name = g_recent_shown[i];
+        for (const char *p = name; *p; p++) if (*p == '/' || *p == '\\') name = p + 1;
+        snprintf(label, sizeof label, "Play  %.280s", name);
+        int node = luna_get_element_by_id(id);
+        luna_set_text(node, label);
+        luna_set_on_click(node, pick_recent);
     }
     if (!package && !title) {
         pick_store.count=0;

@@ -88,6 +88,9 @@ typedef struct luna_launcher_setting {
 #define LUNA_LAUNCHER_GOOGLE 2
 int luna_launcher_pick(char *path, size_t capacity,
                        luna_launcher_setting *settings, size_t count);
+/* Packages opened before, newest first: luna_launcher_pick shows each that
+ * still exists as a Play button.  Copied; call before luna_launcher_pick. */
+void luna_launcher_set_recent(const char **paths, size_t count);
 int luna_launcher_pick_named(char *path, size_t capacity, const char *title,
                              const char *note);
 void luna_launcher_end(int keep_window);

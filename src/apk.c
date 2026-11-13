@@ -1222,6 +1222,70 @@ static int absolute_path(const char *path, char *out, size_t cap)
    return path_join(out, cap, cwd, path);
 #endif
 }
+/* ---- lunaria-recent.txt: packages opened before, newest first, one per line.
+ * It sits next to lunaria.conf so the launcher can offer them again with a
+ * Play button instead of a fresh drag-and-drop every time. */
+#define RECENT_MAX 8
+static int conf_default_path(char *out, size_t cap);
+static int recent_file(char *out, size_t cap)
+{
+   char conf[APK_PATH];
+   if (conf_default_path(conf, sizeof conf)) return -1;
+   char *cut = strrchr(conf, '/'), *back = strrchr(conf, '\\');
+   if (back > cut) cut = back;
+   if (!cut) return -1;
+   *cut = 0;
+   return path_join(out, cap, conf, "lunaria-recent.txt");
+}
+
+static size_t recent_load(char out[][APK_PATH], size_t max)
+{
+   char file[APK_PATH], line[APK_PATH];
+   size_t n = 0;
+   if (recent_file(file, sizeof file)) return 0;
+   FILE *f = open_file(file, "rb");
+   if (!f) return 0;
+   while (n < max && fgets(line, sizeof line, f)) {
+      line[strcspn(line, "\r\n")] = 0;
+      if (line[0]) memcpy(out[n++], line, strlen(line) + 1);
+   }
+   fclose(f);
+   return n;
+}
+
+static bool recent_is_package(const char *path)
+{
+   static const char *const ext[] = {".apk", ".xapk", ".apks", ".aab"};
+   const size_t len = strlen(path);
+   for (size_t i = 0; i < sizeof ext / sizeof ext[0]; i++) {
+      const size_t el = strlen(ext[i]);
+      if (len <= el) continue;
+      size_t k = 0;
+      while (k < el && tolower((unsigned char)path[len - el + k]) == ext[i][k]) k++;
+      if (k == el) return true;
+   }
+   return false;
+}
+
+/* Puts the package this run opens at the top of the list.  Best effort: a
+ * read-only folder only loses the convenience. */
+static void recent_remember(int argc, const char **argv)
+{
+   const char *pkg = NULL;
+   for (int i = 1; i < argc; i++)
+      if (argv[i] && argv[i][0] != '-' && recent_is_package(argv[i])) pkg = argv[i];
+   static char list[RECENT_MAX][APK_PATH];
+   char abs[APK_PATH], file[APK_PATH];
+   if (!pkg || absolute_path(pkg, abs, sizeof abs) || recent_file(file, sizeof file)) return;
+   const size_t n = recent_load(list, RECENT_MAX);
+   FILE *f = open_file(file, "wb");
+   if (!f) return;
+   fprintf(f, "%s\n", abs);
+   for (size_t i = 0, kept = 1; i < n && kept < RECENT_MAX; i++)
+      if (strcmp(list[i], abs)) { fprintf(f, "%s\n", list[i]); kept++; }
+   fclose(f);
+}
+
 static char *trim(char *s)
 {
    while (isspace((unsigned char) * s))
@@ -2230,6 +2294,11 @@ static int launcher_ask(int *argc, const char ***argv)
          conf_get(conf, fields[i].key, settings[i].value, sizeof settings[i].value);
       strcpy(before[i], settings[i].value);
    }
+   static char recent[RECENT_MAX][APK_PATH];
+   const char *recent_ptr[RECENT_MAX];
+   const size_t nrecent = recent_load(recent, RECENT_MAX);
+   for (size_t i = 0; i < nrecent; i++) recent_ptr[i] = recent[i];
+   luna_launcher_set_recent(recent_ptr, nrecent);
    const int picked = luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]);
    if (picked != 0 && picked != LUNA_LAUNCHER_GOOGLE)
       return 1;
@@ -2287,6 +2356,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
          return asked > 0 ? 1 : -1;
       }
    }
+   recent_remember(*argc, *argv);
    restart_remember(*argc, *argv);
    bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
    bool system_install = false, google_setup = false;
