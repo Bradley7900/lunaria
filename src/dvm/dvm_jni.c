@@ -1106,7 +1106,7 @@ static jvalue va_next(va_list *ap, const char *desc)
 static size_t dvm_build_split_arrays(struct dvm *vm, dvm_ref *out_names,
                                      dvm_ref *out_dirs)
 {
-   const char *splits = getenv("ANDROID_SPLIT_APKS");
+   const char *splits = luna_env_long("ANDROID_SPLIT_APKS");
    size_t n = 0;
    for (const char *p = splits; p && *p; ) {
       const char *end = strchr(p, ';');
@@ -1920,7 +1920,7 @@ static struct dvm *vm_get(void)
    const char *base_apk = getenv("ANDROID_APK_FILE");
    if (base_apk && *base_apk) {
       n = dvm_add_apk_archive(g_vm, base_apk, lunaria_android_apk_path());
-      const char *splits = getenv("ANDROID_SPLIT_APKS");
+      const char *splits = luna_env_long("ANDROID_SPLIT_APKS");
       for (const char *p = splits; n >= 0 && p && *p; ) {
          const char *end = strchr(p, ';');
          if (!end) end = p + strlen(p);

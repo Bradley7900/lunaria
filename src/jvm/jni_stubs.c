@@ -1314,7 +1314,7 @@ static int lunaria_split_name_compare(const void *left, const void *right)
 static jobjectArray
 lunaria_application_info_splits(JNIEnv *env, int names)
 {
-   const char *table = getenv("ANDROID_SPLIT_APKS");
+   const char *table = luna_env_long("ANDROID_SPLIT_APKS");
    size_t capacity = 0, count = 0;
    for (const char *p = table; p && *p; ) {
       const char *end = strchr(p, ';');

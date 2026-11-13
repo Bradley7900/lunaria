@@ -175,13 +175,13 @@ static void aa_future_result(struct dvm *vm, dvm_ref future, dvm_ref result)
          (void)am_vcall(vm, e, "getMessage", "()Ljava/lang/String;", NULL, 0, &text);
          fprintf(stderr, "[accounts] the sign-in screen cannot be started: %s\n", text.l ? dvm_string_utf8(vm, text.l) : "(no message)");
          if (getenv("LUNARIA_TRACE_ACCOUNTS")) {
-            const char *rows = getenv("ANDROID_ACTIVITY_FILTERS"), *at = rows ? strstr(rows, "UNPACKING_REDIRECT") : NULL;
+            const char *rows = luna_env_long("ANDROID_ACTIVITY_FILTERS"), *at = rows ? strstr(rows, "UNPACKING_REDIRECT") : NULL;
             if (at) {
                const char *from = at;
                while (from > rows && from[-1] != '\n') --from;
                const char *to = strchr(at, '\n');
                fprintf(stderr, "[accounts] filter row: %.*s\n", (int)(to ? to - from : strlen(from)), from);
-               const char *acts = getenv("ANDROID_ACTIVITIES"), *row = acts ? strstr(acts, "UnpackingRedirectActivity") : NULL;
+               const char *acts = luna_env_long("ANDROID_ACTIVITIES"), *row = acts ? strstr(acts, "UnpackingRedirectActivity") : NULL;
                if (row) {
                   const char *end = strchr(row, '\n');
                   fprintf(stderr, "[accounts] activity row: %.*s\n", (int)(end ? end - row : strlen(row)), row);

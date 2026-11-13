@@ -1153,6 +1153,36 @@ static int env_set(const char *key, const char *value, bool overwrite)
 {
    return luna_os_setenv(key, value, overwrite);
 }
+/* A manifest table for the environment.  Windows refuses one variable longer
+ * than 32767 characters (_putenv_s: EINVAL), and Play services' tables are
+ * several times that: env_set failed, apk_prepare took `goto done` without a
+ * word, and the Google services install stopped right after copying base.apk
+ * (Aloa, 14-11).  An over-long value goes to a file in `dir` and the variable
+ * names it; readers use luna_env_long(). */
+static int env_set_table(const char *key, const char *value, const char *dir)
+{
+#ifdef _WIN32
+   const size_t limit = 30000;
+#else
+   const size_t limit = (size_t)-1;
+#endif
+   const size_t n = strlen(value);
+   if (strlen(key) + n + 2 < limit) {
+      if (!env_set(key, value, true)) return 0;
+      return apk_error("cannot set %s (%zu characters): %s", key, n, strerror(errno));
+   }
+   char path[APK_PATH], ref[APK_PATH + 32];
+   if (snprintf(path, sizeof path, "%s/.lunaria-env-%s", dir, key) >= (int)sizeof path)
+      return apk_error("%s: path too long", key);
+   FILE *f = open_file(path, "wb");
+   if (!f) return apk_error("cannot write %s: %s", path, strerror(errno));
+   const bool ok = fwrite(value, 1, n, f) == n;
+   if (fclose(f) || !ok) return apk_error("cannot write %s", path);
+   snprintf(ref, sizeof ref, "%s%s", LUNA_ENV_FILE_PREFIX, path);
+   fprintf(stderr, "[apk] %s is %zu characters: kept in %s\n", key, n, path);
+   if (env_set(key, ref, true)) return apk_error("cannot set %s: %s", key, strerror(errno));
+   return 0;
+}
 static int env_default(const char *key, const char *value)
 {
    const char *old = getenv(key);
@@ -2708,7 +2738,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    snprintf(relative, sizeof relative, "lib/%s", arch);
    if (path_join(libdir, sizeof libdir, inst, relative) || mkdirs(libdir) || path_join(staged_apk, sizeof staged_apk, inst, "base.apk") || materialize(base, staged_apk))
       goto done;
-   if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set("ANDROID_SPLIT_APKS", text_get(&split_list), true))
+   if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set_table("ANDROID_SPLIT_APKS", text_get(&split_list), inst))
       goto done;
    /* `am start -n`: the component named here is launched instead of the manifest's launcher. */
    const char *forced_activity = getenv("LUNARIA_LAUNCH_ACTIVITY");
@@ -2736,7 +2766,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
    };
    for (size_t i = 0; i < sizeof metadata / sizeof metadata[0]; i++) {
       if (*metadata[i].value) {
-         if (env_set(metadata[i].key, metadata[i].value, true))
+         if (env_set_table(metadata[i].key, metadata[i].value, inst))
             goto done;
       } else
          luna_os_unsetenv(metadata[i].key);

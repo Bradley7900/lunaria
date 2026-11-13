@@ -816,3 +816,45 @@ int luna_android_fs_prepare(const char *root)
     * that binding, including the parent directory and not only app children. */
    return 0;
 }
+
+/* See lunaria_os.h.  A handful of keys, read from many threads: a small table
+ * under a mutex, entries never freed (a pointer handed out stays valid). */
+const char *luna_env_long(const char *key)
+{
+   const char *v = getenv(key);
+   const size_t plen = sizeof LUNA_ENV_FILE_PREFIX - 1;
+   if (!v || strncmp(v, LUNA_ENV_FILE_PREFIX, plen)) return v;
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   static struct { char key[64]; char path[1024]; char *value; } cache[24];
+   const char *path = v + plen, *result = NULL;
+   pthread_mutex_lock(&lock);
+   size_t i = 0;
+   for (; i < sizeof cache / sizeof cache[0] && cache[i].value; ++i)
+      if (!strcmp(cache[i].key, key) && !strcmp(cache[i].path, path)) { result = cache[i].value; break; }
+   if (!result) {
+      char *text = NULL;
+      FILE *f = luna_file_fopen(path, "rb");
+      if (f) {
+         if (!fseek(f, 0, SEEK_END)) {
+            const long n = ftell(f);
+            if (n >= 0 && !fseek(f, 0, SEEK_SET) && (text = malloc((size_t)n + 1))) {
+               if (fread(text, 1, (size_t)n, f) == (size_t)n) text[n] = 0;
+               else { free(text); text = NULL; }
+            }
+         }
+         fclose(f);
+      }
+      if (!text) fprintf(stderr, "[env] %s: cannot read %s\n", key, path);
+      else {
+         /* A full table keeps working: the newest value replaces the oldest
+          * slot's pointer only in the table (the old string is not freed). */
+         if (i == sizeof cache / sizeof cache[0]) i = 0;
+         snprintf(cache[i].key, sizeof cache[i].key, "%s", key);
+         snprintf(cache[i].path, sizeof cache[i].path, "%s", path);
+         cache[i].value = text;
+      }
+      result = text ? text : "";
+   }
+   pthread_mutex_unlock(&lock);
+   return result;
+}

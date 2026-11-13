@@ -1848,7 +1848,7 @@ static bool context_get_package_name(struct dvm *vm, dvm_ref self,
  * ANDROID_REQUESTED_PERMISSIONS, so answer from it. */
 static bool manifest_has_permission(const char *want)
 {
-   const char *list = getenv("ANDROID_REQUESTED_PERMISSIONS");
+   const char *list = luna_env_long("ANDROID_REQUESTED_PERMISSIONS");
    if (!want || !*want || !list) return false;
    const size_t n = strlen(want);
    for (const char *p = list; *p;) {

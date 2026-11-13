@@ -407,6 +407,19 @@ enum {
    LUNA_PC_SYMLINK_MAX=13, LUNA_PC_CHOWN_RESTRICTED=14, LUNA_PC_NO_TRUNC=15,
    LUNA_PC_VDISABLE=16, LUNA_PC_ASYNC_IO=17, LUNA_PC_PRIO_IO=18, LUNA_PC_SYNC_IO=19
 };
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* getenv() for the manifest tables (ANDROID_SERVICES, ...).  Windows caps one
+ * environment variable at 32767 characters and Play services' tables are far
+ * longer, so apk.c stores an over-long value in a file and the variable holds
+ * LUNA_ENV_FILE_PREFIX + its path; this follows it.  The result stays valid
+ * for the life of the process. */
+#define LUNA_ENV_FILE_PREFIX "@lunaria-env-file:"
+const char *luna_env_long(const char *key);
+#ifdef __cplusplus
+}
+#endif
 #ifdef _WIN32
 #define LUNA_FILE_CLOEXEC _O_NOINHERIT
 #define LUNA_FILE_SYNC 0x10000000

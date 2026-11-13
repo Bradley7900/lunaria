@@ -687,7 +687,7 @@ int lunaria_android_package_install(const char *name, uint32_t uid, const char *
 
 static int holds_permission(const char *want)
 {
-   const char *list = getenv("ANDROID_REQUESTED_PERMISSIONS");
+   const char *list = luna_env_long("ANDROID_REQUESTED_PERMISSIONS");
    size_t n = strlen(want);
    if (!list) return 0;
    for (const char *p = list; *p;) {
@@ -740,9 +740,9 @@ int lunaria_android_package_visible(const struct lunaria_android_package *record
     * an activity.  Settings has a MAIN activity on Android; the framework and
     * provider packages do not become visible merely because MAIN was queried. */
    if (!strcmp(record->name, "com.android.settings") &&
-       csv_has(getenv("ANDROID_QUERY_ACTIONS"), "android.intent.action.MAIN"))
+       csv_has(luna_env_long("ANDROID_QUERY_ACTIONS"), "android.intent.action.MAIN"))
       return 1;
-   if (csv_has(getenv("ANDROID_QUERY_PACKAGES"), record->name)) return 1;
+   if (csv_has(luna_env_long("ANDROID_QUERY_PACKAGES"), record->name)) return 1;
    return 0;
 }
 

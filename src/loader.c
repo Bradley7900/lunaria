@@ -1427,7 +1427,7 @@ dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
 static int
 start_manifest_providers(struct jvm *jvm, jobject context)
 {
-   const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
+   const char *encoded = luna_env_long("ANDROID_CONTENT_PROVIDERS");
    if (!encoded || !*encoded) return 0;
    const char *package=getenv("ANDROID_PACKAGE_NAME");
    const char *process=getenv("ANDROID_PROCESS_NAME");

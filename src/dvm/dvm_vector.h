@@ -652,7 +652,7 @@ static bool activity_filter_matches(struct dvm *vm, dvm_ref intent,
    dvm_get_field(vm,intent,"categories","Ljava/util/Set;",&categories);
    dvm_get_field(vm,intent,"data","Landroid/net/Uri;",&data);
    dvm_get_field(vm,intent,"type","Ljava/lang/String;",&type);
-   const char *text=getenv("ANDROID_ACTIVITY_FILTERS");
+   const char *text=luna_env_long("ANDROID_ACTIVITY_FILTERS");
    char *copy=text ? strdup(text) : NULL;
    bool matched=false;
    for (char *p=copy, *row; p && (row=luna_strsep(&p,"\n"));) {
@@ -695,7 +695,7 @@ static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,
       dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cc);
       if (!cp.l || !cc.l || strcmp(dvm_string_utf8(vm,cp.l),package)) RETL(list);
    }
-   const char *text=getenv("ANDROID_ACTIVITIES");
+   const char *text=luna_env_long("ANDROID_ACTIVITIES");
    char *copy=text ? strdup(text) : NULL;
    int flags=nargs>1 ? ARG(1).i : 0;
    for (char *p=copy,*row; p && (row=luna_strsep(&p,"\n"));) {

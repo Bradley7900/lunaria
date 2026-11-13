@@ -48073,7 +48073,7 @@ static bool pm_resolveProvider(struct dvm *vm,dvm_ref self,
    const char *wanted=dvm_string_utf8(vm,ARG(0).l);
    if (!wanted) RETL(0);
    struct luna_providers providers;
-   if (luna_providers_open(&providers,getenv("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
+   if (luna_providers_open(&providers,luna_env_long("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
    dvm_ref result=0;uint32_t flags=(uint32_t)ARG(1).i;
    for(size_t i=0;i<providers.count;++i) {
       struct luna_provider *row=&providers.items[i];
@@ -48092,7 +48092,7 @@ static bool pm_queryContentProviders(struct dvm *vm,dvm_ref self,
    /* A null process requests all known providers; uid then has no effect. */
    if (process && ARG(1).i!=(int32_t)arm_exec_guest_uid()) RETL(0);
    struct luna_providers providers;
-   if (luna_providers_open(&providers,getenv("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
+   if (luna_providers_open(&providers,luna_env_long("ANDROID_CONTENT_PROVIDERS"),getenv("ANDROID_PACKAGE_NAME"))<0) RETL(0);
    dvm_ref result=0;union dvm_value ignored={0};bool good=true;
    /* luna_providers_open sorts by descending initOrder, stably on ties. */
    for(size_t i=0;i<providers.count;++i) {
@@ -48159,7 +48159,7 @@ static bool pm_getServiceInfo(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, ARG(0).l, "pkg", "Ljava/lang/String;", &pkg);
    (void)dvm_get_field(vm, ARG(0).l, "cls", "Ljava/lang/String;", &cls);
    const char *package = dvm_string_utf8(vm, pkg.l), *name = dvm_string_utf8(vm, cls.l);
-   const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = getenv("ANDROID_SERVICES");
+   const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = luna_env_long("ANDROID_SERVICES");
    struct lunaria_android_package record;
    if (!package || !name || !current || strcmp(package, current) ||
        !lunaria_android_package_find(package, &record)) goto missing;
@@ -48212,7 +48212,7 @@ static bool pm_getReceiverInfo(struct dvm *vm, dvm_ref self,
    (void)dvm_get_field(vm, ARG(0).l, "pkg", "Ljava/lang/String;", &pkg);
    (void)dvm_get_field(vm, ARG(0).l, "cls", "Ljava/lang/String;", &cls);
    const char *package = dvm_string_utf8(vm, pkg.l), *name = dvm_string_utf8(vm, cls.l);
-   const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = getenv("ANDROID_RECEIVERS");
+   const char *current = getenv("ANDROID_PACKAGE_NAME"), *table = luna_env_long("ANDROID_RECEIVERS");
    struct lunaria_android_package record;
    if (!package || !name || !current || strcmp(package, current) ||
        !lunaria_android_package_find(package, &record)) goto missing;
@@ -48708,7 +48708,7 @@ static dvm_ref pm_package_info(struct dvm *vm,
       self && !strcmp(self, record->name) ? NULL : record->source_dir);
 
    const char *encoded_permissions = self && !strcmp(self, record->name)
-                                   ? getenv("ANDROID_REQUESTED_PERMISSIONS") : NULL;
+                                   ? luna_env_long("ANDROID_REQUESTED_PERMISSIONS") : NULL;
    if (encoded_permissions && *encoded_permissions) {
       char *copy = strdup(encoded_permissions);
       uint32_t count = 1;
@@ -48974,7 +48974,7 @@ static bool pm_queryIntentServices(struct dvm *vm, dvm_ref self,
 {
    (void)self;
    dvm_ref list = coll_new_list(vm, "Ljava/util/ArrayList;");
-   const char *table = getenv("ANDROID_SERVICES");
+   const char *table = luna_env_long("ANDROID_SERVICES");
    if (!list || nargs < 1 || !ARG(0).l || !table) RETL(list);
    char *rows = strdup(table), *scan = rows, *row;
    if (!rows) { dvm__throw(vm, "java/lang/OutOfMemoryError", "service lookup"); return false; }
@@ -59528,7 +59528,7 @@ static const struct rt_method rt_input_method_manager[] = {
 static bool legacy_http_enabled(void)
 {
  if(lunaria_app_target_sdk()<28)return true;
- const char *libraries=getenv("ANDROID_USES_LIBRARIES");
+ const char *libraries=luna_env_long("ANDROID_USES_LIBRARIES");
  for(const char *p=libraries;p && *p;){const char *end=strchr(p,'\n');size_t length=end ? (size_t)(end-p) : strlen(p);
   if(length==strlen("org.apache.http.legacy") && !memcmp(p,"org.apache.http.legacy",length))return true;
   p=end ? end+1 : NULL;
@@ -74992,7 +74992,7 @@ static bool manifest_broadcast(struct dvm *vm,dvm_ref context,dvm_ref intent,boo
    *explicit=component!=0;if(!component)return true;
    const char *package=dvm_string_utf8(vm,pending_field(vm,component,"pkg","Ljava/lang/String;"));
    const char *name=dvm_string_utf8(vm,pending_field(vm,component,"cls","Ljava/lang/String;"));
-   const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=getenv("ANDROID_RECEIVERS");
+   const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=luna_env_long("ANDROID_RECEIVERS");
    if(!package || !name || !current || strcmp(package,current) || !table)return true;
    char full[768];int length=snprintf(full,sizeof full,"%s%s",name[0]=='.' ? package : "",name);
    if(length<0 || (size_t)length>=sizeof full)return true;
@@ -75126,7 +75126,7 @@ void dvm_deliver_boot_completed(struct dvm *vm)
       /* The framework's periodic check-in trigger: the system fires it at boot, and
        * Play services' trigger receiver starts the device registration from it. */
       "android.server.checkin.CHECKIN" };
-   const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=getenv("ANDROID_RECEIVERS");
+   const char *current=getenv("ANDROID_PACKAGE_NAME"),*table=luna_env_long("ANDROID_RECEIVERS");
    if(!vm || !current || !table || !g_process_application)return;
    for(size_t a=0;a<sizeof actions/sizeof *actions;++a){
       dvm_ref intent=new_intent(vm,actions[a]);

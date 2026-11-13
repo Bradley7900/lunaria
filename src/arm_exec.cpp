@@ -19554,7 +19554,7 @@ static void arsc_ensure_loaded() {
             arsc_read_pool(g_arsc.data() + hs, g_arsc.size() - hs, g_arsc_strings);
     }
     arsc_index_build(g_arsc.data(), g_arsc.size(), &g_arsc_index);
-    const char *splits = lunaria_env("ANDROID_SPLIT_APKS");
+    const char *splits = luna_env_long("ANDROID_SPLIT_APKS");
     struct arsc_source **tail = &g_arsc_splits;
     for (const char *p = splits; p && *p;) {
         const char *end = strchr(p, ';');
@@ -21850,7 +21850,7 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
                     const char *want = fname + 6;
                     size_t wlen = strlen(want);
                     if (wlen > 4 && !strcmp(want + wlen - 4, ".apk")) wlen -= 4;
-                    const char *list = lunaria_env("ANDROID_SPLIT_APKS");
+                    const char *list = luna_env_long("ANDROID_SPLIT_APKS");
                     for (const char *e = list; e && *e; ) {
                         const char *bar = strchr(e, '|');
                         const char *sep = strchr(e, ';');
