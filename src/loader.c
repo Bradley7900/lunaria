@@ -2949,6 +2949,13 @@ int wmain(int argc, wchar_t *wide_argv[])
       }
    }
    int result = lunaria_main(argc, (const char **)argv);
+   /* The run is over and has said "exiting"; end the process here.  Returning
+    * runs the CRT's atexit handlers and static destructors while the guest's
+    * threads are still alive, and one of them waited forever: a player closing
+    * the window got "Not Responding" with [memwatch] still ticking, and had to
+    * end it from Task Manager.  Nothing left is worth tearing down for. */
+   log_tee_drain();
+   TerminateProcess(GetCurrentProcess(), (UINT)result);
    for (int i = 0; i < argc; i++) free(argv[i]);
    free(argv); return result;
 }
