@@ -668,6 +668,62 @@ static void frame_stage_report(double window, unsigned long long frames)
    for (int i = 0; i < FRAME_STAGE_LAST; ++i) g_frame_stage_ns[i] = 0;
 }
 
+/* Pump frames so far, for the memory watch thread (which must not depend on
+ * the pump: a player's window froze at the game's 42% while RAM climbed, and
+ * the perf report - run from the pump - went silent for exactly that part). */
+static volatile uint64_t g_pump_frames;
+
+/* [memwatch]: every LUNARIA_MEMWATCH_S seconds (default 5, 0 = off), from its
+ * own thread: where the RAM is, GPU memory, PC free RAM, and whether the main
+ * loop is stuck.  Started as soon as the log is up, so it covers APK prep. */
+static void *memwatch_thread(void *arg)
+{
+   const double every = *(const double *)arg;
+   struct timespec t0;
+   clock_gettime(CLOCK_MONOTONIC, &t0);
+   uint64_t last_frames = 0;
+   double stuck = 0;
+   for (;;) {
+      struct timespec nap = { (time_t)every, (long)((every - (double)(time_t)every) * 1e9) };
+      nanosleep(&nap, NULL);
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      const double t = (double)(ts.tv_sec - t0.tv_sec) + (double)(ts.tv_nsec - t0.tv_nsec) * 1e-9;
+      const uint64_t frames = g_pump_frames;
+      if (frames && frames == last_frames) stuck += every; else stuck = 0;
+      last_frames = frames;
+      char where[320];
+      if (luna_os_mem_breakdown(where, sizeof where) != 0) where[0] = 0;
+      uint64_t vram = 0, shared = 0, budget = 0, total = 0, avail = 0;
+      char gpu[96] = "";
+      if (luna_os_gpu_mem_mb(&vram, &shared, &budget) == 0)
+         snprintf(gpu, sizeof gpu, " | gpu vram %llu of %llu MB, shared %llu MB",
+                  (unsigned long long)vram, (unsigned long long)budget, (unsigned long long)shared);
+      char pc[64] = "";
+      if (luna_os_mem_info(&total, &avail) == 0 && total)
+         snprintf(pc, sizeof pc, " | PC free %llu of %llu MB",
+                  (unsigned long long)(avail >> 20), (unsigned long long)(total >> 20));
+      char loop[64];
+      if (!frames) snprintf(loop, sizeof loop, "starting up");
+      else if (stuck > 0) snprintf(loop, sizeof loop, "frame %llu, MAIN LOOP STUCK %.0fs",
+                                   (unsigned long long)frames, stuck);
+      else snprintf(loop, sizeof loop, "frame %llu", (unsigned long long)frames);
+      fprintf(stderr, "[memwatch] t=%.0fs %s | %s%s%s\n", t, loop, where, gpu, pc);
+   }
+   return NULL;
+}
+
+static void memwatch_start(void)
+{
+   static double every = -1.0;
+   if (every >= 0.0) return;
+   const char *e = getenv("LUNARIA_MEMWATCH_S");
+   every = e && *e ? atof(e) : 5.0;
+   if (!(every >= 0.5)) { every = 0.0; return; }
+   pthread_t th;
+   if (pthread_create(&th, NULL, memwatch_thread, &every) == 0) pthread_detach(th);
+}
+
 static void perf_tick(void)
 {
    static double every = -1.0;      /* -1: not configured, 0: disabled */
@@ -680,6 +736,8 @@ static void perf_tick(void)
    const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 
    ++frames;
+   g_pump_frames = frames;
+   memwatch_start();
    if (every < 0.0) {
       const char *e = getenv("LUNARIA_PERF_S");
       every = e && *e ? atof(e) : 10.0;
@@ -2675,6 +2733,7 @@ static void log_tee_start(int argc, wchar_t **argv)
    if (t) CloseHandle(t);
    atexit(log_tee_drain);
    fprintf(stderr, "[log] this run is also saved to %s\n", g_log_path);
+   memwatch_start();
 }
 
 static void crash_module(const void *addr, char *name, size_t cap, uintptr_t *base)

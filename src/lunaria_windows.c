@@ -67,6 +67,7 @@ static int file_status_nonblock(int fd, HANDLE handle, int enabled, int set);
 #include <tlhelp32.h>
 #define PSAPI_VERSION 2
 #include <psapi.h>
+#include <dxgi1_4.h>
 
 /* Invalid guest descriptors are recoverable EBADF errors. UCRT's default
  * invalid-parameter handler aborts instead; change only this thread for the
@@ -1359,6 +1360,49 @@ int luna_os_mem_breakdown(char *out, size_t out_len)
             (unsigned long long)(mb[WS_DLL] >> 20), (unsigned long long)(mb[WS_FILES] >> 20),
             (unsigned long long)(other >> 20), (unsigned long long)(pmc.PagefileUsage >> 20));
    return 0;
+}
+
+/* This process's GPU memory per DXGI (Windows 10+): dedicated VRAM in use and
+ * shared system memory in use, summed over hardware adapters.  When VRAM is
+ * full the driver spills into shared memory, which is ordinary RAM. */
+/* Own copies so no dxguid import library is needed. */
+static const GUID luna_iid_factory1 = {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
+static const GUID luna_iid_adapter3 = {0x645967a4, 0x1392, 0x4310, {0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd}};
+
+int luna_os_gpu_mem_mb(uint64_t *vram_mb, uint64_t *shared_mb, uint64_t *vram_budget_mb)
+{
+   *vram_mb = *shared_mb = *vram_budget_mb = 0;
+   static HMODULE dxgi;
+   typedef HRESULT (WINAPI *create_fn)(REFIID, void **);
+   static create_fn create;
+   if (!dxgi) {
+      dxgi = LoadLibraryW(L"dxgi.dll");
+      if (dxgi) create = (create_fn)(uintptr_t)GetProcAddress(dxgi, "CreateDXGIFactory1");
+   }
+   if (!create) return -1;
+   IDXGIFactory1 *f = NULL;
+   if (FAILED(create(&luna_iid_factory1, (void **)&f)) || !f) return -1;
+   int any = 0;
+   IDXGIAdapter1 *a = NULL;
+   for (UINT i = 0; f->lpVtbl->EnumAdapters1(f, i, &a) == S_OK; ++i) {
+      DXGI_ADAPTER_DESC1 d;
+      IDXGIAdapter3 *a3 = NULL;
+      if (SUCCEEDED(a->lpVtbl->GetDesc1(a, &d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+          SUCCEEDED(a->lpVtbl->QueryInterface(a, &luna_iid_adapter3, (void **)&a3)) && a3) {
+         DXGI_QUERY_VIDEO_MEMORY_INFO local, shared;
+         if (SUCCEEDED(a3->lpVtbl->QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+             SUCCEEDED(a3->lpVtbl->QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
+            *vram_mb += local.CurrentUsage >> 20;
+            *vram_budget_mb += local.Budget >> 20;
+            *shared_mb += shared.CurrentUsage >> 20;
+            any = 1;
+         }
+         a3->lpVtbl->Release(a3);
+      }
+      a->lpVtbl->Release(a);
+   }
+   f->lpVtbl->Release(f);
+   return any ? 0 : -1;
 }
 
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)

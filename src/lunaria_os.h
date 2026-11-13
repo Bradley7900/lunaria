@@ -1641,6 +1641,8 @@ uint64_t luna_os_peak_rss_kb(void);
 /* One line of where the RAM is right now (Windows: working set by owner).
  * Returns -1 and leaves out empty where the OS has no such view. */
 int luna_os_mem_breakdown(char *out, size_t out_len);
+/* This process's GPU memory (Windows: DXGI). -1 where unknown. */
+int luna_os_gpu_mem_mb(uint64_t *vram_mb, uint64_t *shared_mb, uint64_t *vram_budget_mb);
 int luna_os_disk_info(const char *path, uint64_t *total_bytes,
                       uint64_t *free_bytes, uint64_t *block_size);
 

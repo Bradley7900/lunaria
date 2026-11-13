@@ -1051,6 +1051,12 @@ uint64_t luna_os_peak_rss_kb(void)
    return getrusage(RUSAGE_SELF, &usage) == 0 ? (uint64_t)usage.ru_maxrss / 1024 : 0;
 }
 
+int luna_os_gpu_mem_mb(uint64_t *vram_mb, uint64_t *shared_mb, uint64_t *vram_budget_mb)
+{
+   *vram_mb = *shared_mb = *vram_budget_mb = 0;
+   return -1;
+}
+
 int luna_os_mem_breakdown(char *out, size_t out_len)
 {
    if (out && out_len) out[0] = 0;
