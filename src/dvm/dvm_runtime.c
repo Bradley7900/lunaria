@@ -28822,11 +28822,27 @@ static void json_write_string(struct dvm *vm, const char *s,
    bytes_append(b, "\"", 1);
 }
 
+/* True when `c` is `name` or extends it.  org.json is subclassed in the wild
+ * (AppMetrica's Bb extends JSONObject), and org.json's own writer tests
+ * `instanceof JSONObject`, never the exact class.  An exact-name test sent a
+ * subclass to the toString() fallback below, whose toString() is this same
+ * builtin: json_write -> toString -> json_write, in C, until the host stack ran
+ * out.  LDoE threw that StackOverflowError ~500 times a second, and with no GC
+ * every retry's objects stayed, filling an 8 GB laptop. */
+static bool json_class_is(const struct dvm_class *c, const char *name)
+{
+   for (; c; c = c->super)
+      if (c->name && !strcmp(c->name, name)) return true;
+   return false;
+}
+
 static void json_write(struct dvm *vm, dvm_ref v, struct rt_bytes *b)
 {
    if (!v || v == json_null(vm)) { bytes_append(b, "null", 4); return; }
    struct dvm_class *c = dvm_object_class(vm, v);
    const char *n = c ? c->name : "";
+   if (json_class_is(c, "org/json/JSONArray")) n = "org/json/JSONArray";
+   else if (json_class_is(c, "org/json/JSONObject")) n = "org/json/JSONObject";
    const char *s = dvm_string_utf8(vm, v);
    if (s) { json_write_string(vm, s, b); return; }
 
@@ -29151,8 +29167,7 @@ static bool jo_getBoolean(struct dvm *vm, dvm_ref self,
  * shape, so a mismatch is a missing value rather than a coercion. */
 static dvm_ref json_typed(struct dvm *vm, dvm_ref v, const char *name)
 {
-   struct dvm_class *c = v ? dvm_object_class(vm, v) : NULL;
-   return (c && !strcmp(c->name, name)) ? v : 0;
+   return v && json_class_is(dvm_object_class(vm, v), name) ? v : 0;
 }
 
 static bool jo_optJSONObject(struct dvm *vm, dvm_ref self,
