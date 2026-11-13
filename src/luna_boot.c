@@ -1198,7 +1198,7 @@ static DWORD WINAPI win_pick_thread(LPVOID unused)
             if (win_pick_title[0]) dialog->lpVtbl->SetTitle(dialog, win_pick_title);
             if (!win_pick_folder_mode) {
                 COMDLG_FILTERSPEC types[] = {
-                    { L"Android packages", L"*.apk;*.xapk;*.apks;*.aab;*.so" },
+                    { L"Android packages", L"*.apk;*.xapk;*.apks;*.apkm;*.aab;*.so" },
                     { L"All files", L"*.*" },
                 };
                 dialog->lpVtbl->SetFileTypes(dialog, 2, types);
@@ -1296,7 +1296,7 @@ static void pick_open_dialog(int field)
         config.title = "Open an application";
         config.initial_path = start[0] ? start : NULL;
         config.filter_name = "Android packages";
-        config.filter_patterns = "*.apk *.xapk *.apks *.aab *.so";
+        config.filter_patterns = "*.apk *.xapk *.apks *.apkm *.aab *.so";
     }
 #ifdef _WIN32
     /* state 4 = the Windows dialog failed and asked for the built-in one */
@@ -1347,7 +1347,7 @@ static int pick_clean(const char *in, char *out, size_t capacity)
 
 static int pick_acceptable(const char *path)
 {
-    static const char *const kinds[] = { ".apk", ".xapk", ".apks", ".aab", ".so" };
+    static const char *const kinds[] = { ".apk", ".xapk", ".apks", ".apkm", ".aab", ".so" };
     const size_t len = strlen(path);
     luna_file_info info;
     if (luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0)) return 0;

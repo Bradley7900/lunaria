@@ -1285,7 +1285,7 @@ static size_t recent_load(char out[][APK_PATH], size_t max)
 
 static bool recent_is_package(const char *path)
 {
-   static const char *const ext[] = {".apk", ".xapk", ".apks", ".aab"};
+   static const char *const ext[] = {".apk", ".xapk", ".apks", ".apkm", ".aab"};
    const size_t len = strlen(path);
    for (size_t i = 0; i < sizeof ext / sizeof ext[0]; i++) {
       const size_t el = strlen(ext[i]);
@@ -2481,7 +2481,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
       argument = (*argv)[at];
    }
-   bool container = suffix(argument, ".xapk") || suffix(argument, ".apks");
+   bool container = suffix(argument, ".xapk") || suffix(argument, ".apks") || suffix(argument, ".apkm");
    if (!container && !suffix(argument, ".apk") && !suffix(argument, ".aab")) {
       if (at != 1)
          return apk_error("APK options require an APK archive");
@@ -3005,21 +3005,27 @@ int luna_apk_restart_archive(const char *archive)
    return archive && *archive ? apk_restart_with(NULL, archive) : -1;
 }
 
-/* Package name of an .apk (binary manifest) or .xapk (manifest.json). */
+/* Package name of an .apk (binary manifest), an .xapk (manifest.json,
+ * "package_name") or an APKMirror .apkm (info.json, "pname").  An .apkm has
+ * no top-level manifest, so without info.json the Google button skipped the
+ * Play Store bundle Aloa downloaded (14-11). */
 static bool update_archive_package(const char *path, char *pkg, size_t cap)
 {
    struct zip z;
    if (zip_open(&z, path)) return false;
    bool ok = false;
    size_t n = 0;
+   const char *key = "\"package_name\"";
    unsigned char *json = zip_memory(&z, "manifest.json", &n);
+   if (!json && !zip_find(&z, "AndroidManifest.xml") && (json = zip_memory(&z, "info.json", &n)))
+      key = "\"pname\"";
    if (json) {
       char *text = malloc(n + 1);
       if (text) {
          memcpy(text, json, n);
          text[n] = '\0';
-         const char *k = strstr(text, "\"package_name\"");
-         const char *q = k ? strchr(k + 14, '"') : NULL;
+         const char *k = strstr(text, key);
+         const char *q = k ? strchr(k + strlen(key), '"') : NULL;
          const char *e = q ? strchr(q + 1, '"') : NULL;
          if (e && (size_t)(e - q - 1) < cap) {
             memcpy(pkg, q + 1, (size_t)(e - q - 1));
@@ -3069,7 +3075,7 @@ int luna_apk_find_update(const char *package, char *out, size_t cap)
       luna_directory_entry *ent;
       while ((ent = luna_directory_read(dir))) {
          const char *name = ent->d_name;
-         if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks")) continue;
+         if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks") && !suffix(name, ".apkm")) continue;
          char path[APK_PATH], pkg[256];
          snprintf(path, sizeof path, "%s/%s", dirs[d], name);
          if (luna_file_stat_follow(path, &st) != 0 || st.st_mtime <= best) continue;
@@ -3296,7 +3302,7 @@ static int google_find_download(const char *root, char *out, size_t cap, char *p
          luna_directory_entry *ent;
          while ((ent = luna_directory_read(dir))) {
             const char *name = ent->d_name;
-            if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks")) continue;
+            if (!suffix(name, ".apk") && !suffix(name, ".xapk") && !suffix(name, ".apks") && !suffix(name, ".apkm")) continue;
             char path[APK_PATH], pkg[256];
             struct stat st;
             snprintf(path, sizeof path, "%s/%s", dirs[d], name);
