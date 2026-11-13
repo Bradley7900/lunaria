@@ -2647,6 +2647,10 @@ static int g_log_console_fd = -1;
 static FILE *g_log_file;
 static char g_log_path[MAX_PATH * 3];
 
+/* Bumped by the tee thread each time it has written a chunk out and is about
+ * to block in ReadFile again; read by log_tee_drain(). */
+static volatile LONG g_log_chunks;
+
 static DWORD WINAPI log_tee_thread(LPVOID unused)
 {
    (void)unused;
@@ -2655,22 +2659,32 @@ static DWORD WINAPI log_tee_thread(LPVOID unused)
    while (ReadFile(g_log_pipe_read, buf, sizeof buf, &n, NULL) && n) {
       if (g_log_console_fd >= 0) (void)_write(g_log_console_fd, buf, n);
       if (g_log_file) { fwrite(buf, 1, n, g_log_file); fflush(g_log_file); }
+      InterlockedIncrement(&g_log_chunks);
    }
    return 0;
 }
 
 /* Waits (up to ~1 s) until the thread has copied everything written so far.
- * Called on exit and from the crash report, so the last lines reach the file. */
+ * Called on exit and from the crash report, so the last lines reach the file.
+ *
+ * It must not touch the pipe itself.  The read end is a synchronous handle
+ * with the tee thread parked in ReadFile on it, and Windows serialises
+ * synchronous I/O per handle: PeekNamedPipe waited for that ReadFile, which
+ * returns only when someone logs again ([memwatch], every 5 s), up to 100
+ * times.  Closing LDoE's window sat "Not Responding" in here for minutes.
+ * So it watches the thread instead: the chunk counter goes quiet for 50 ms
+ * once the pipe is empty and the thread is back in ReadFile. */
 static void log_tee_drain(void)
 {
    if (!g_log_pipe_read) return;
    fflush(stdout); fflush(stderr);
-   for (int i = 0; i < 100; i++) {
-      DWORD avail = 0;
-      if (!PeekNamedPipe(g_log_pipe_read, NULL, 0, NULL, &avail, NULL) || !avail) break;
+   LONG seen = g_log_chunks;
+   for (int quiet = 0, i = 0; quiet < 5 && i < 100; i++) {
       Sleep(10);
+      const LONG now = g_log_chunks;
+      quiet = now == seen ? quiet + 1 : 0;
+      seen = now;
    }
-   Sleep(20);   /* the last ReadFile's bytes: read from the pipe, still being written */
 }
 
 static bool log_open_in(const wchar_t *dir)
