@@ -2651,14 +2651,84 @@ static char g_log_path[MAX_PATH * 3];
  * to block in ReadFile again; read by log_tee_drain(). */
 static volatile LONG g_log_chunks;
 
+/* The console gets its own thread, fed from a ring that drops when full.
+ *
+ * A console write can block indefinitely: clicking in the console window
+ * starts a QuickEdit selection, which pauses all output to it until Esc or
+ * Enter (and a busy conhost does the same for shorter spells).  When the tee
+ * thread wrote to the console itself it stopped reading the pipe, the 64 KiB
+ * pipe filled, and every thread that logs (System.out under the VM lock,
+ * [memwatch], prefs) blocked in WriteFile: the whole game froze on the logo
+ * while ram and the window looked fine.  Caught by stack sampling 14-11, the
+ * tee thread itself in ZwWriteFile.  Now the file is written first and never
+ * waits on the console; the console just misses what did not fit. */
+#define LOG_CON_RING (1u << 20)
+static char *g_con_ring;
+static size_t g_con_head, g_con_tail;   /* bytes produced / consumed, monotonic */
+static size_t g_con_dropped;
+static CRITICAL_SECTION g_con_lock;
+static HANDLE g_con_event;
+
+static void log_console_push(const char *buf, size_t n)
+{
+   EnterCriticalSection(&g_con_lock);
+   const size_t space = LOG_CON_RING - (g_con_head - g_con_tail);
+   const size_t take = n < space ? n : space;
+   for (size_t done = 0; done < take; ) {
+      const size_t at = (g_con_head + done) % LOG_CON_RING;
+      size_t len = LOG_CON_RING - at;
+      if (len > take - done) len = take - done;
+      memcpy(g_con_ring + at, buf + done, len);
+      done += len;
+   }
+   g_con_head += take;
+   g_con_dropped += n - take;
+   LeaveCriticalSection(&g_con_lock);
+   SetEvent(g_con_event);
+}
+
+static DWORD WINAPI log_console_thread(LPVOID unused)
+{
+   (void)unused;
+   for (;;) {
+      WaitForSingleObject(g_con_event, INFINITE);
+      for (;;) {
+         EnterCriticalSection(&g_con_lock);
+         const size_t pending = g_con_head - g_con_tail;
+         const size_t at = g_con_tail % LOG_CON_RING;
+         size_t dropped = 0;
+         if (!pending) { dropped = g_con_dropped; g_con_dropped = 0; }
+         LeaveCriticalSection(&g_con_lock);
+         if (!pending) {
+            if (dropped) {
+               char note[160];
+               const int k = snprintf(note, sizeof note, "[log] %zu bytes not shown here while the console was paused; "
+                                      "lunaria-last-run.log has all of it\n", dropped);
+               if (k > 0) (void)_write(g_log_console_fd, note, (unsigned)k);
+            }
+            break;
+         }
+         /* The unread region is never overwritten by the producer, so it is
+          * read without the lock. */
+         size_t len = LOG_CON_RING - at;
+         if (len > pending) len = pending;
+         (void)_write(g_log_console_fd, g_con_ring + at, (unsigned)len);
+         EnterCriticalSection(&g_con_lock);
+         g_con_tail += len;
+         LeaveCriticalSection(&g_con_lock);
+      }
+   }
+   return 0;
+}
+
 static DWORD WINAPI log_tee_thread(LPVOID unused)
 {
    (void)unused;
    char buf[8192];
    DWORD n;
    while (ReadFile(g_log_pipe_read, buf, sizeof buf, &n, NULL) && n) {
-      if (g_log_console_fd >= 0) (void)_write(g_log_console_fd, buf, n);
       if (g_log_file) { fwrite(buf, 1, n, g_log_file); fflush(g_log_file); }
+      if (g_con_ring) log_console_push(buf, n);
       InterlockedIncrement(&g_log_chunks);
    }
    return 0;
@@ -2743,6 +2813,14 @@ static void log_tee_start(int argc, wchar_t **argv)
    setvbuf(stdout, NULL, _IONBF, 0);
    setvbuf(stderr, NULL, _IONBF, 0);
    g_log_pipe_read = rd;
+   if (g_log_console_fd >= 0) {
+      InitializeCriticalSection(&g_con_lock);
+      g_con_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+      char *ring = g_con_event ? malloc(LOG_CON_RING) : NULL;
+      HANDLE c = ring ? CreateThread(NULL, 0, log_console_thread, NULL, 0, NULL) : NULL;
+      if (c) { CloseHandle(c); g_con_ring = ring; }
+      else free(ring);   /* no console thread: the file still gets everything */
+   }
    HANDLE t = CreateThread(NULL, 0, log_tee_thread, NULL, 0, NULL);
    if (t) CloseHandle(t);
    atexit(log_tee_drain);
