@@ -1270,13 +1270,17 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
       fprintf(stderr, "[dvm]   sample throw: %s \"%s\", java depth %d, host stack left %s%zu KB\n",
               class_name, msg, vm->depth, room == SIZE_MAX ? "unknown " : "",
               room == SIZE_MAX ? (size_t)0 : room / 1024);
+      /* Walk the live frame chain, not vm->callstack: that array keeps only
+       * the OUTERMOST frames once it is full, so a 5557-deep recursion printed
+       * its first ten callers with no repeats and read as "not a loop". */
       fprintf(stderr, "[dvm]   the loop, innermost first:\n");
-      for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 10;
-           --i, ++shown) {
-         const struct dvm_method *f = vm->callstack[i];
-         if (!f) continue;
-         fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
-                 f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+      int shown = 0;
+      for (const struct dvm_call_frame *f = vm->invoke_frame; f && shown < 10;
+           f = f->previous) {
+         const struct dvm_method *fm = f->method;
+         if (!fm) continue;
+         fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown++,
+                 fm->cls ? fm->cls->name : "?", fm->name, fm->sig ? fm->sig : "");
       }
    }
 
