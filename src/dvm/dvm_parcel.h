@@ -1237,7 +1237,11 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
    bool done = false;
    struct timespec w0, w1;
    clock_gettime(CLOCK_MONOTONIC, &w0);
-   for (int waited = 0; waited < BINDER_WAIT_MS && !done; ++waited) {
+   /* Bounded by the clock: usleep(1000) sleeps 1.5-2 ms on Windows, so a
+    * count of 15000 sleeps was 26 s there, not the 15 s meant. */
+   for (long waited = 0; waited < BINDER_WAIT_MS && !done;
+        clock_gettime(CLOCK_MONOTONIC, &w1),
+        waited = (long)(w1.tv_sec - w0.tv_sec) * 1000L + (w1.tv_nsec - w0.tv_nsec) / 1000000L) {
       binder_pump_once();
       pthread_mutex_lock(&g_binder_lock); done = wait->done; pthread_mutex_unlock(&g_binder_lock);
       if (!done) usleep(1000);
@@ -1315,7 +1319,11 @@ int dvm_binder_request(struct dvm *vm, const char *package, const char *magic,
    bool done = false;
    struct timespec w0, w1;
    clock_gettime(CLOCK_MONOTONIC, &w0);
-   for (int waited = 0; waited < BINDER_WAIT_MS && !done; ++waited) {
+   /* Bounded by the clock: usleep(1000) sleeps 1.5-2 ms on Windows, so a
+    * count of 15000 sleeps was 26 s there, not the 15 s meant. */
+   for (long waited = 0; waited < BINDER_WAIT_MS && !done;
+        clock_gettime(CLOCK_MONOTONIC, &w1),
+        waited = (long)(w1.tv_sec - w0.tv_sec) * 1000L + (w1.tv_nsec - w0.tv_nsec) / 1000000L) {
       binder_pump_once();
       pthread_mutex_lock(&g_binder_lock); done = wait->done; pthread_mutex_unlock(&g_binder_lock);
       if (!done) usleep(1000);
