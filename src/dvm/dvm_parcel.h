@@ -1213,6 +1213,11 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
    }
    if (oneway) { *result = true; return true; }
    const unsigned depth = dvm_gil_unlock_all(vm);
+   /* The execution lock too, as dvm_gil_wait() does: a call from guest JNI
+    * holds it, and keeping it for the whole wait (15 s at worst) stops every
+    * guest thread and the frame pump with them.  Retaken after GIL, in lock
+    * order. */
+   const unsigned ael = arm_lock_unlock_all();
    bool done = false;
    for (int waited = 0; waited < BINDER_WAIT_MS && !done; ++waited) {
       binder_pump_once();
@@ -1220,6 +1225,7 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
       if (!done) usleep(1000);
    }
    dvm_gil_relock(vm, depth);
+   arm_lock_relock(ael);
    if (!done) {
       binder_pending_drop(wait);
       dvm__throw(vm, "android/os/DeadObjectException", "Binder transaction timed out");
@@ -1281,6 +1287,11 @@ int dvm_binder_request(struct dvm *vm, const char *package, const char *magic,
    free(m);
    if (rc < 0) { binder_pending_drop(wait); return rc; }
    const unsigned depth = dvm_gil_unlock_all(vm);
+   /* The execution lock too, as dvm_gil_wait() does: a call from guest JNI
+    * holds it, and keeping it for the whole wait (15 s at worst) stops every
+    * guest thread and the frame pump with them.  Retaken after GIL, in lock
+    * order. */
+   const unsigned ael = arm_lock_unlock_all();
    bool done = false;
    for (int waited = 0; waited < BINDER_WAIT_MS && !done; ++waited) {
       binder_pump_once();
@@ -1288,6 +1299,7 @@ int dvm_binder_request(struct dvm *vm, const char *package, const char *magic,
       if (!done) usleep(1000);
    }
    dvm_gil_relock(vm, depth);
+   arm_lock_relock(ael);
    if (!done) { binder_pending_drop(wait); return -ETIMEDOUT; }
    *status = wait->status;
    *payload = wait->payload; *payload_size = wait->payload_size;

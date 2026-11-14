@@ -342,6 +342,37 @@ static int row_exists(const char *name)
    return 0;
 }
 
+/* A row whose APK is a real one the user installed (Play services from the
+ * launcher's Google button) reports that APK's own version.  The table's
+ * number is only a placeholder for the 22-byte stub: Play services clients
+ * compare it against the minimum they were built for, and an old placeholder
+ * reads as "Google Play services out of date" (SERVICE_VERSION_UPDATE_REQUIRED)
+ * even with a current one installed. */
+static void ledger_real_version(struct ledger_row *row)
+{
+   char host[PATH_MAX];
+   struct stat st;
+   if ((size_t)snprintf(host, sizeof host, "%s%s", guest_root(), row->source_dir)
+       >= sizeof host)
+      return;
+   if (stat(host, &st) != 0 || st.st_size <= 22) return;
+   int32_t code = 0;
+   char name[160] = "";
+   const int got = arm_exec_apk_file_version(row->source_dir, &code, name, sizeof name);
+   if ((got & 1) && code > 0) row->record.version_code = code;
+   if ((got & 2) && name[0]) {
+      char *copy = strdup(name);
+      if (copy) {
+         free(row->version_name);
+         row->version_name = copy;
+         row->record.version_name = copy;
+      }
+   }
+   if (got)
+      fprintf(stderr, "[packages] %s: installed APK is version %s / %d\n",
+              row->name, row->record.version_name, row->record.version_code);
+}
+
 /* One ledger line:  <package> [uid] [flags] [sourceDir]
  *
  * flags is a comma-separated subset of {system, queryable, updated} or "-".
@@ -455,6 +486,7 @@ static void ledger_add_line(const char *line, size_t len)
    ++g_nrows;
 
    ledger_materialise(row->source_dir);
+   ledger_real_version(row);
 }
 
 static void ledger_add_text(const char *text)

@@ -20588,6 +20588,61 @@ extern "C" void arm_exec_apk_version(int32_t *code, const char **name) {
                                                  : g_apk_version_name.c_str();
 }
 
+/* versionCode / versionName of another APK on disk (a system package the
+ * user installed, e.g. Play services), read from its <manifest> element.
+ * Returns a bit set: 1 = code found, 2 = name found. */
+extern "C" int arm_exec_apk_file_version(const char *apk, int32_t *code,
+                                         char *name, size_t name_size) {
+    size_t len = 0;
+    uint8_t *buf = apk ? arm_exec_zip_read(apk, "AndroidManifest.xml", &len) : nullptr;
+    if (!buf) return 0;
+    int found = 0;
+    std::vector<std::string> strings;
+    if (len >= 16 && axml_load_strings(buf, len, strings)) {
+        size_t i = 8;
+        while (i + 8 <= len) {
+            uint16_t ct; uint32_t cs;
+            memcpy(&ct, buf + i, 2);
+            memcpy(&cs, buf + i + 4, 4);
+            if (cs < 8 || i + cs > len) break;
+            if (ct == 0x0102u && i + 30 <= len) {
+                int32_t name_idx; uint16_t attr_start, attr_size, attr_count;
+                memcpy(&name_idx, buf + i + 20, 4);
+                memcpy(&attr_start, buf + i + 24, 2);
+                memcpy(&attr_size, buf + i + 26, 2);
+                memcpy(&attr_count, buf + i + 28, 2);
+                const bool manifest = name_idx >= 0 && (size_t)name_idx < strings.size() &&
+                                      strings[(size_t)name_idx] == "manifest";
+                if (manifest && attr_size >= 20) {
+                    const size_t base = i + 16 + attr_start;
+                    for (uint16_t a = 0; a < attr_count; ++a) {
+                        const size_t ao = base + (size_t)a * attr_size;
+                        if (ao + 20 > len) break;
+                        int32_t an_idx; uint32_t dval;
+                        memcpy(&an_idx, buf + ao + 4, 4);
+                        const uint8_t typ = buf[ao + 15];
+                        memcpy(&dval, buf + ao + 16, 4);
+                        if (an_idx < 0 || (size_t)an_idx >= strings.size()) continue;
+                        const std::string &an = strings[(size_t)an_idx];
+                        if (an == "versionCode" && typ == 0x10) {
+                            if (code) *code = (int32_t)dval;
+                            found |= 1;
+                        } else if (an == "versionName" && typ == 0x03 &&
+                                   dval < strings.size() && name && name_size) {
+                            snprintf(name, name_size, "%s", strings[dval].c_str());
+                            found |= 2;
+                        }
+                    }
+                }
+                break; /* <manifest> is the root element */
+            }
+            i += cs;
+        }
+    }
+    free(buf);
+    return found;
+}
+
 /* The audio output the emulator presents.  AudioManager.getProperty() in the
  * bytecode VM answers from here, because an app that reads its buffer size
  * from Java and then feeds the OpenSL ES pump has to be told the size that

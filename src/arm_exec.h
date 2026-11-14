@@ -507,6 +507,9 @@ void arm_exec_audio_output_params(int32_t *frames_per_buffer, int32_t *rate);
 /* The package version from the <manifest> element (PackageInfo.versionCode /
  * versionName).  Never yields 0 or NULL — see the definition. */
 void arm_exec_apk_version(int32_t *code, const char **name);
+/* versionCode / versionName of an APK file on the host (1 = code, 2 = name). */
+int arm_exec_apk_file_version(const char *apk, int32_t *code,
+                              char *name, size_t name_size);
 /* Who this process is, as Android would answer it.
  *
  * One process has one pid and one uid, and every API that reports them has to
