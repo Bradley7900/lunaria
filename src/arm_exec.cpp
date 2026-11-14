@@ -8493,6 +8493,44 @@ static uint32_t g_watch_flag_last = 0;
 // semaphore counters keyed by guest sem_t VA
 static std::map<GuestVA, int32_t> g_sems;
 
+/* Who posted and who took a semaphore, for the one case that needs it: a
+ * thread that polls sem_getvalue forever.  Boehm's stop-the-world waits for
+ * its ack semaphore to read EXACTLY the number of threads it signalled and
+ * only resends to threads it believes have not answered, so one ack too many
+ * (or one lost) spins the collector with no signal sent and no thread
+ * waiting -- the Kefir logo hang seen 14-11 on ldoe32.  The history says which
+ * thread posted or took what; called under the execution lock. */
+struct SemEvent { GuestVA sva; uint32_t tid; int32_t delta, after; uint64_t lr; };
+static SemEvent g_sem_history[64];
+static unsigned g_sem_history_n;
+
+static void sem_history_note(GuestVA sva, int32_t delta, int32_t after, uint64_t lr)
+{
+    g_sem_history[g_sem_history_n++ % 64u] = { sva, g_current_tid, delta, after, lr };
+}
+
+static void sem_poll_note(GuestVA sva, int32_t value, uint64_t lr)
+{
+    static thread_local GuestVA last_sva;
+    static thread_local uint32_t polls;
+    static unsigned said;
+    if (sva != last_sva) { last_sva = sva; polls = 0; }
+    if (++polls != 3000u || said >= 6u) return;
+    ++said;
+    fprintf(stderr, "[sem] tid=%u has polled sem 0x%llx 3000 times (value %d, lr=0x%llx); "
+            "its last posts/takes, oldest first:\n", g_current_tid,
+            (unsigned long long)sva, value, (unsigned long long)lr);
+    const unsigned n = g_sem_history_n < 64u ? g_sem_history_n : 64u;
+    for (unsigned i = 0; i < n; ++i) {
+        const SemEvent &e = g_sem_history[(g_sem_history_n - n + i) % 64u];
+        if (e.sva != sva) continue;
+        fprintf(stderr, "[sem]   %s by tid=%u -> %d (lr=0x%llx)\n",
+                e.delta > 0 ? "post" : "take", e.tid, e.after,
+                (unsigned long long)e.lr);
+    }
+}
+
+
 // Signal handler table is declared with the synthetic /proc implementation:
 // both sigaction and /proc/status expose the same process-wide dispositions.
 /* Linux signal numbers the emulator raises on the guest's behalf. */
@@ -9967,6 +10005,7 @@ static void arm_signal_resume_sem(ArmExecCtx &ctx, ArmThread &t,
         auto it = g_sems.find(sva);
         if (it != g_sems.end() && it->second > 0) {
             --it->second;
+            sem_history_note(sva, -1, it->second, 0);
             t.waiting_sem = 0;
             t.sem_skip_passes = 0;
             t.sem_timed = false;
@@ -10108,6 +10147,7 @@ static void sem_wake_parked(GuestVA sva, uint32_t max_wake)
         if (!tp || tp->finished || tp->waiting_sem != sva)
             continue;
         --sit->second;
+        sem_history_note(sva, -1, sit->second, 0);
         tp->waiting_sem = 0;
         tp->sem_skip_passes = 0;
         tp->sem_timed = false;
@@ -35481,6 +35521,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_SEM_POST: {
         GuestVA sva = argp(0);
         ++g_sems[sva];
+        sem_history_note(sva, 1, g_sems[sva], lr);
         sem_wake_parked(sva, 1u);
         sched_pass_notify();
         if (lunaria_env("LUNARIA_TRACE_SEM")) {
@@ -35496,12 +35537,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32(0); break;
     case SVC_SEM_GETVALUE: {
         GuestVA sva = argp(0);
-        if (argp(1)) ctx.mem.write32(argp(1), (uint32_t)(g_sems.count(sva) ? g_sems[sva] : 0));
+        const int32_t value = g_sems.count(sva) ? g_sems[sva] : 0;
+        if (argp(1)) ctx.mem.write32(argp(1), (uint32_t)value);
+        sem_poll_note(sva, value, lr);
         ret32(0); break;
     }
     case SVC_SEM_TRYWAIT: {
         int32_t &c = g_sems[argp(0)];
-        if (c > 0) { --c; ret32(0); break; }
+        if (c > 0) { --c; sem_history_note(argp(0), -1, c, lr); ret32(0); break; }
         uint32_t eva = errno_va(ctx, g_current_tid);
         if (eva) ctx.mem.write32(eva, 11 /* EAGAIN */);
         ret32(~0u);
@@ -35540,7 +35583,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         if (ctx_innermost_is_cb()) {
             int32_t &count = g_sems[sva];
-            if (count > 0) { --count; ret32(0); break; }
+            if (count > 0) { --count; sem_history_note(sva, -1, count, lr); ret32(0); break; }
             /* A callback owns a separate JIT/stack. Halt that context until
              * a post supplies a token, without parking its borrowed tid. */
             g_cb_lock_wait.kind = CbLockWait::Sem;
@@ -35576,7 +35619,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
         }
         int32_t &c = g_sems[sva];
-        if (c > 0) { --c; ret32(0); break; }
+        if (c > 0) { --c; sem_history_note(argp(0), -1, c, lr); ret32(0); break; }
         if (g_current_tid != 0) {
             if (timed && host_mono_ns() >= sem_until_ns) {
                 if (uint32_t eva = errno_va(ctx, g_current_tid))
@@ -56506,6 +56549,7 @@ static void schedule_threads(uint64_t slice) {
                 t.sem_timed && host_mono_ns() >= t.sem_until_ns;
             if (it != g_sems.end() && it->second > 0) {
                 --it->second;
+                sem_history_note(sva, -1, it->second, 0);
                 t.regs[0]   = 0;
                 t.regs64[0] = 0;
             } else if (sem_timed_out) {
@@ -66144,7 +66188,7 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
         const bool expired = g_cb_lock_wait.timed &&
                              host_mono_ns() >= g_cb_lock_wait.deadline_ns;
         if (!posted && !expired) return false;
-        if (posted) --it->second;
+        if (posted) { --it->second; sem_history_note(mva, -1, it->second, 0); }
         else if (uint32_t eva = errno_va(ctx, g_current_tid))
             ctx.mem.write32(eva, guest_errno_word(ETIMEDOUT));
         g_cb_resume_result = posted ? 0u : UINT64_MAX;
