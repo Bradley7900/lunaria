@@ -66029,9 +66029,13 @@ static void heap_boost_owner(uint64_t owner) {
  * the game freezes on the Kefir logo (seen 14-11, tid 76, sig 30 never taken). */
 static bool cb_wait_takes_signals(CbLockWait::Kind kind)
 {
-    return kind == CbLockWait::Futex || kind == CbLockWait::Sem ||
-           kind == CbLockWait::Mu || kind == CbLockWait::Rd ||
-           kind == CbLockWait::Wr;
+    /* Every kind, not only these: a wait left in place while the handler runs
+     * is granted under it, and the grant writes its result (0) into x0 -- the
+     * handler's signal number.  Boehm then aborts with "Bad signal in
+     * suspend_handler" (sleep and condition waits did this, intermittently,
+     * from ldoe15 on).  Sleep and condition waits are saved and resumed like a
+     * mutex wait: the handler runs, then the same wait carries on. */
+    return kind != CbLockWait::Idle;
 }
 
 static void cb_lock_wait_reset(void)
