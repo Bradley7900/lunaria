@@ -1,0 +1,5 @@
+/* MPL-2.0. The exe icon (Explorer, taskbar). GLFW loads the icon named
+ * GLFW_ICON from the module for every window it creates, so this one
+ * resource also gives the launcher and game windows their icon.
+ * Regenerate lunaria.ico: python3 scripts/make-icon-win.py scripts/lunaria.ico */
+GLFW_ICON ICON "lunaria.ico"

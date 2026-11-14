@@ -202,6 +202,16 @@ CPPFLAGS += $(WINDOWS_CRT_FLAGS)
 # from the pump/engine threads ~150 interpreted calls, and LDoE's AppMetrica
 # overflowed there ~500 times a second, retrying forever.
 WINDOWS_STACK_FLAGS = -Wl,--stack,16777216   # exe link only (LDFLAGS also reaches the ELF guest builds)
+# The moon icon (scripts/lunaria.rc), compiled by the windres next to $(CC).
+WINDOWS_RES_OBJ = $(BUILD_DIR)/lunaria_res.o
+HOST_WINDRES = $(shell \
+	cc=$$(command -v $(firstword $(CC))); \
+	bindir=$$(dirname "$$cc"); \
+	pref=$$(basename "$$cc"); pref=$${pref%g++}; pref=$${pref%gcc}; pref=$${pref%clang++}; pref=$${pref%clang}; \
+	for cand in "$${pref}windres" llvm-windres windres; do \
+		[ -x "$$bindir/$$cand" ] && { echo "$$bindir/$$cand"; exit 0; }; \
+	done; \
+	command -v llvm-windres || echo windres)
 # Target Windows 10+. llvm-mingw still defaults to an older _WIN32_WINNT, which
 # hides GetCurrentThreadStackLimits, FileDispositionInfoEx, and
 # EnumDynamicTimeZoneInformation used by lunaria_windows.c.
@@ -806,7 +816,12 @@ $(HOST_EXPORT): scripts/windows-exports.py $(LUNARIA_OBJECTS) $(HOST_DL_LIBS) $(
 $(LUNARIA_BIN): $(HOST_EXPORT) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OBJECTS)
 endif
 
-$(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs)
+ifneq ($(WINDOWS_RES_OBJ),)
+$(WINDOWS_RES_OBJ): scripts/lunaria.rc scripts/lunaria.ico | $(BUILD_DIR)
+	"$(HOST_WINDRES)" -I scripts -i scripts/lunaria.rc -o $@
+endif
+
+$(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs) $(WINDOWS_RES_OBJ)
 	$(CXX) -std=c++20 $(WINDOWS_CRT_FLAGS) $(WINDOWS_ENTRY_FLAGS) $(WINDOWS_STACK_FLAGS) $(OPTFLAGS) $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
@@ -815,7 +830,7 @@ $(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs)
 	    $(WINDOWS_STUB_OBJECTS) \
 	    $(HOST_DL_LIBS) -lpthread $(HOST_JVM_LIB) \
 	    $(HOST_WINDOW_LIBS) $(HOST_GL_LIBS) $(HOST_Z_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) \
-	    $(HOST_AUDIO_LIBS) $(HOST_NATIVE_LIBS) -o $@
+	    $(HOST_AUDIO_LIBS) $(HOST_NATIVE_LIBS) $(WINDOWS_RES_OBJ) -o $@
 
 install-bin: $(bins)
 	install -Dm755 $(bins) -t "$(DESTDIR)$(PREFIX)$(BINDIR)"
