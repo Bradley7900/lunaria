@@ -47369,9 +47369,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uint32_t target_tid = r0;
         int      sig        = (int)r1;
         static int pkill_log = 0;
-        if (pkill_log++ < 40)
-            fprintf(stderr, "[pthread_kill] target=0x%08x sig=%d lr=0x%08x\n",
-                    target_tid, sig, lr);
+        if (pkill_log++ < 400) {
+            /* Who the sender is by every measure: the scheduler's tid, this
+             * host thread's Java identity, the callback depth, and the
+             * pthread_self() word the guest reads from its TLS.  A collector
+             * that signals its own thread under another identity waits for
+             * itself forever (Kefir logo freeze, 14-11). */
+            uint32_t self_word = 0;
+            if (ctx.is_arm64 && a64_has_private_tls(g_tpidr_el0_val))
+                self_word = ctx.mem.read32((GuestVA)(g_tpidr_el0_val + TLS64_SELF_OFF));
+            fprintf(stderr, "[pthread_kill] target=%u sig=%d sender=%u java-host=%u "
+                    "cb=%d self=%u lr=0x%08x\n", target_tid, sig, g_current_tid,
+                    g_dvm_guest_tid, g_cb_depth, self_word, lr);
+        }
 
         /* A pthread-directed signal belongs to the target's architectural
          * context.  Calling its handler here, on the sender's SVC stack, is a
@@ -66010,6 +66020,20 @@ static void heap_boost_owner(uint64_t owner) {
     sched_yield();
 }
 
+/* Which callback waits a signal may interrupt.  A futex or semaphore wait
+ * returns EINTR or restarts; a mutex or rwlock wait runs the handler and then
+ * goes on waiting, as on Linux, where those waits are futexes the kernel
+ * restarts.  The mutex case is the one Boehm's stop-the-world needs: a Java
+ * thread inside nativeRender that blocks on the allocation lock the collector
+ * holds must still ack the suspend signal, or the collector waits forever and
+ * the game freezes on the Kefir logo (seen 14-11, tid 76, sig 30 never taken). */
+static bool cb_wait_takes_signals(CbLockWait::Kind kind)
+{
+    return kind == CbLockWait::Futex || kind == CbLockWait::Sem ||
+           kind == CbLockWait::Mu || kind == CbLockWait::Rd ||
+           kind == CbLockWait::Wr;
+}
+
 static void cb_lock_wait_reset(void)
 {
     g_cb_lock_wait = {};
@@ -66022,8 +66046,7 @@ static void cb_signal_suspend_wait(ArmExecCtx &ctx, ArmSignalFrameState &frame)
 {
     (void)ctx;
     if (!g_cb_depth || g_cb_lock_wait.from_slice ||
-        (g_cb_lock_wait.kind != CbLockWait::Futex &&
-         g_cb_lock_wait.kind != CbLockWait::Sem)) return;
+        !cb_wait_takes_signals(g_cb_lock_wait.kind)) return;
     frame.callback_wait_slot = g_cb_depth - 1;
     g_cb_signal_wait[g_main_signal_depth] = *cb_wait_slot();
     if (g_cb_lock_wait.kind == CbLockWait::Futex)
@@ -66495,8 +66518,7 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
                 lock_abandon = true;
                 break;
             }
-            if ((g_cb_lock_wait.kind == CbLockWait::Futex ||
-                 g_cb_lock_wait.kind == CbLockWait::Sem) &&
+            if (cb_wait_takes_signals(g_cb_lock_wait.kind) &&
                 cb.take_main_signal()) break;
             if (cb_lock_wait_try_grant(ctx)) break;
             if (trace_wait && host_mono_ns() >= wait_trace_at) {
