@@ -1321,8 +1321,7 @@ static void gms_prewarm(void)
    struct luna_process_pool *pool=package_pool(gms);
    if(!pool)return;
    int rc=luna_process_pool_warm(pool,gms);
-   fprintf(stderr,"[service-broker] prewarm %s: %s
-",gms,rc ? strerror(-rc) : "started");
+   fprintf(stderr,"[service-broker] prewarm %s: %s\n",gms,rc ? strerror(-rc) : "started");
 }
 
 static bool process_exit_status(int *status)
