@@ -391,6 +391,9 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns);
 unsigned dvm_gil_enter_from_guest(struct dvm *vm);
 void     dvm_gil_leave_to_guest(struct dvm *vm, unsigned cookie);
 void dvm_gil_notify(void);
+/* Wake every VM wait so a parked Java thread can take a signal
+ * sent to its Android identity (arm_exec_dvm_take_signals). */
+void dvm_signal_kick(void);
 void dvm_gil_notify_for(uintptr_t channel);
 void dvm_gil_notify_one_for(uintptr_t channel);
 

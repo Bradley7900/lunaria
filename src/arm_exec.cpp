@@ -28919,8 +28919,10 @@ static uint32_t posix_timer_signal_target(const struct luna_posix_timer *timer)
 }
 static void posix_timer_raise(ArmExecCtx &ctx,uint32_t tid,int sig)
 {
-    if(tid<4096 && tid>=256 && g_dvm_native_stacks[tid].attached)
+    if(tid<4096 && tid>=256 && g_dvm_native_stacks[tid].attached) {
         g_dvm_pending_signals[tid].fetch_or(UINT64_C(1)<<(sig-1),std::memory_order_release);
+        dvm_signal_kick();
+    }
     else guest_raise_signal(ctx,tid,sig);
 }
 static void posix_timer_poll(ArmExecCtx &ctx)
@@ -47312,7 +47314,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uint32_t target_tid = r0;
         int      sig        = (int)r1;
         static int pkill_log = 0;
-        if (pkill_log++ < 20)
+        if (pkill_log++ < 40)
             fprintf(stderr, "[pthread_kill] target=0x%08x sig=%d lr=0x%08x\n",
                     target_tid, sig, lr);
 
@@ -47335,8 +47337,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 break;
             }
             if (target_tid < 4096 && g_dvm_native_stacks[target_tid].attached) {
-                if (sig) g_dvm_pending_signals[target_tid].fetch_or(
-                    1ull << (unsigned)(sig - 1), std::memory_order_release);
+                if (sig) {
+                    g_dvm_pending_signals[target_tid].fetch_or(
+                        1ull << (unsigned)(sig - 1), std::memory_order_release);
+                    static unsigned dvm_kill_log;
+                    if (dvm_kill_log++ < 24u)
+                        fprintf(stderr, "[pthread_kill] Java thread target=%u sig=%d "
+                                "sender=%u\n", target_tid, sig, g_current_tid);
+                    /* A parked Java thread takes it in its wait loop. */
+                    dvm_signal_kick();
+                }
                 ret32(0);
                 break;
             }
@@ -57304,6 +57314,95 @@ extern "C" void arm_exec_dvm_thread_detach(void)
         g_tpidrro_el0_val = 0;
         if (!g_a64_is_pump && !g_a64_is_worker) a64_release_thread_engine();
     }
+}
+
+/* A signal sent to a DVM worker's Android identity.  The sender only sets a
+ * bit (SVC_PTHREAD_KILL); the worker takes it at its next SVC boundary
+ * (take_main_signal).  A Java thread parked in the VM -- Object.wait, a
+ * Looper poll, Thread.sleep -- runs no guest code and so never reaches one,
+ * while on Android the kernel would interrupt that wait and run the handler.
+ * Boehm's stop-the-world (il2cpp) is the case that matters: it sends its
+ * suspend signal to every thread that ever entered managed code, Java
+ * callback threads included, then polls its ack semaphore until each one
+ * answers.  One parked Java thread froze the game on the Kefir logo.
+ *
+ * So the VM's blocking waits call this when woken (dvm_signal_kick) and run
+ * the handler here, on the parked thread's own identity and stack, as a
+ * callback.  The handler's sigsuspend returns EINTR at once for a DVM
+ * identity, and Boehm loops on it until the restart signal, so the thread
+ * stays inside the handler for exactly the stop-the-world window. */
+extern "C" int arm_exec_dvm_signal_pending(void)
+{
+    const uint32_t tid = g_dvm_guest_tid;
+    if (!g_ctx || !g_ctx->is_arm64 || !tid || tid >= 256) return 0;
+    if (!g_dvm_native_stacks[tid].attached) return 0;
+    const uint64_t pend = g_dvm_pending_signals[tid].load(std::memory_order_acquire);
+    return (pend & ~signal_mask_load(tid)) ? 1 : 0;
+}
+
+extern "C" int arm_exec_dvm_take_signals(void)
+{
+    static thread_local bool busy = false;
+    static thread_local GuestVA si = 0, uc = 0;
+    if (busy || !arm_exec_dvm_signal_pending()) return 0;
+    const uint32_t tid = g_dvm_guest_tid;
+    auto &pending = g_dvm_pending_signals[tid];
+    int taken = 0;
+    for (int guard = 0; guard < 8 && !g_process_stopping.load(std::memory_order_relaxed); ++guard) {
+        GuestVA handler = 0;
+        int sig = 0;
+        uint64_t old_mask = 0;
+        {
+            ArmLockGuard g;
+            old_mask = signal_mask_load(tid);
+            const uint64_t bits = pending.load(std::memory_order_acquire) & ~old_mask;
+            if (!bits) break;
+            sig = (int)__builtin_ctzll(bits) + 1;
+            const uint64_t bit = 1ull << (unsigned)(sig - 1);
+            pending.fetch_and(~bit, std::memory_order_acq_rel);
+            handler = signal_handler_load(guest_pid(), sig);
+            if (handler == 0u) {            /* SIG_DFL */
+                if (guest_signal_default(sig) == SIGDEF_TERM ||
+                    guest_signal_default(sig) == SIGDEF_CORE) {
+                    fprintf(stderr, "Fatal signal %d (%s), code 0 (SI_USER) in "
+                            "tid %u (parked Java thread) - default action is "
+                            "to terminate\n", sig, guest_signal_name(sig), tid);
+                    arm_exec_request_quit();
+                }
+                continue;
+            }
+            if (handler == 1u) continue;    /* SIG_IGN */
+            const GuestSigAction sa = signal_action_load(guest_pid(), sig);
+            uint64_t mask = old_mask | sa.mask;
+            if (!(sa.flags & GUEST_SA_NODEFER)) mask |= bit;
+            signal_mask_store(tid, mask);
+            if (!si || !uc) {
+                const uint32_t sib = arm_malloc(*g_ctx, (uint32_t)A64_SIGINFO_SIZE);
+                const uint32_t ucb = arm_malloc(*g_ctx, (uint32_t)A64_UCONTEXT_SIZE);
+                if (!sib || !ucb) { signal_mask_store(tid, old_mask); break; }
+                si = a64_guest_va(sib);
+                uc = a64_guest_va(ucb);
+            }
+            a64_guest_memset(g_ctx->mem, si, 0, A64_SIGINFO_SIZE);
+            a64_guest_memset(g_ctx->mem, uc, 0, A64_UCONTEXT_SIZE);
+            g_ctx->mem.write32(si, (uint32_t)sig);          /* si_signo */
+            g_ctx->mem.write32(si + 8u, (uint32_t)-6);      /* SI_TKILL */
+            g_ctx->mem.write32(si + 16u, guest_pid());      /* si_pid */
+        }
+        if (handler < 0x100000000ull && !a64_is_guest_va(handler))
+            handler = a64_guest_va((BackingOffset)(uint32_t)handler);
+        static std::atomic<unsigned> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 24u)
+            fprintf(stderr, "[signal] parked Java thread tid=%u takes sig %d "
+                    "(handler 0x%llx)\n", tid, sig, (unsigned long long)handler);
+        GuestArg args[3] = { guest_arg_j((uint64_t)sig), guest_arg_j(si), guest_arg_j(uc) };
+        busy = true;
+        call_guest_abi64(*g_ctx, handler, args, 3, 'v', nullptr);
+        busy = false;
+        { ArmLockGuard g; signal_mask_store(tid, old_mask); }
+        ++taken;
+    }
+    return taken;
 }
 
 /* One emulated audio callback thread cannot execute two callbacks at once.

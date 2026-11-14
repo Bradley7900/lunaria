@@ -4488,6 +4488,35 @@ static void dvm_waitdump(int sig)
 }
 #endif
 
+/* Signals for parked Java threads (arm_exec_dvm_take_signals).  The waits
+ * below re-check after every wake-up, take any signal with g_gil.m released,
+ * and go back to waiting with the same deadline: on Android a signal runs its
+ * handler and the interrupted wait carries on. */
+extern int arm_exec_dvm_signal_pending(void) __attribute__((weak));
+extern int arm_exec_dvm_take_signals(void) __attribute__((weak));
+
+static bool dvm_sig_pending(void)
+{
+   return arm_exec_dvm_signal_pending && arm_exec_dvm_signal_pending();
+}
+
+/* Called with g_gil.m held; returns with it held. */
+static void dvm_sig_take_unlocked(void)
+{
+   pthread_mutex_unlock(&g_gil.m);
+   if (arm_exec_dvm_take_signals) (void)arm_exec_dvm_take_signals();
+   pthread_mutex_lock(&g_gil.m);
+}
+
+void dvm_signal_kick(void)
+{
+   pthread_mutex_lock(&g_gil.m);
+   pthread_cond_broadcast(&g_gil_change);
+   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next)
+      pthread_cond_signal(&w->cv);
+   pthread_mutex_unlock(&g_gil.m);
+}
+
 void dvm_gil_notify(void)
 {
    pthread_mutex_lock(&g_gil.m);
@@ -4704,6 +4733,7 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms)
    if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
    pthread_mutex_lock(&g_gil.m);
    while (g_gil_change_seq == seen && !dvm_is_stopping(vm)) {
+      if (dvm_sig_pending()) { dvm_sig_take_unlocked(); continue; }
       int rc = pthread_cond_timedwait(&g_gil_change, &g_gil.m, &ts);
       if (rc != 0) break;
    }
@@ -4781,6 +4811,7 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
 
    pthread_mutex_lock(&g_gil.m);
    while (!w.ready && !dvm_is_stopping(vm)) {
+      if (dvm_sig_pending()) { dvm_sig_take_unlocked(); continue; }
       int rc = ns == UINT64_MAX ? pthread_cond_wait(&w.cv, &g_gil.m)
                                : pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
       if (rc != 0) break;
