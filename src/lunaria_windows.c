@@ -2533,7 +2533,34 @@ int luna_file_rename(const char *from, const char *to)
    wchar_t *source = luna_file_wide(from), *target = luna_file_wide(to);
    if (!source || !target) { free(source); free(target); return -1; }
    BOOL ok = MoveFileExW(source, target, MOVEFILE_REPLACE_EXISTING);
-   DWORD error = GetLastError(); free(source); free(target);
+   DWORD error = GetLastError();
+   /* POSIX rename replaces a target that somebody still has open; MoveFileEx
+    * refuses (access denied / sharing violation).  Play services writes
+    * <file>.tmp and renames it over <file> while <file> is open, and lost
+    * its trusted-time store that way on Aloa's PC 14-11.  Windows 10 1809+
+    * has the POSIX behaviour as a rename flag, as the unlink above uses. */
+   if (!ok && (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION)) {
+      HANDLE handle = CreateFileW(source, DELETE | SYNCHRONIZE,
+         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+      if (handle != INVALID_HANDLE_VALUE) {
+         const size_t bytes = wcslen(target) * sizeof(wchar_t);
+         struct { DWORD flags; HANDLE root; DWORD length; WCHAR name[1]; } *info;
+         const size_t size = offsetof(__typeof__(*info), name) + bytes + sizeof(WCHAR);
+         info = calloc(1, size);
+         if (info) {
+            info->flags = 0x1 | 0x2; /* FILE_RENAME_FLAG_REPLACE_IF_EXISTS | _POSIX_SEMANTICS */
+            info->length = (DWORD)bytes;
+            memcpy(info->name, target, bytes);
+            ok = SetFileInformationByHandle(handle,
+                    (FILE_INFO_BY_HANDLE_CLASS)22 /* FileRenameInfoEx */, info, (DWORD)size);
+            if (!ok) error = GetLastError();
+            free(info);
+         }
+         CloseHandle(handle);
+      }
+   }
+   free(source); free(target);
    return ok ? 0 : luna_file_error(error);
 }
 int luna_file_unlink(const char *path)
@@ -3109,9 +3136,22 @@ int luna_file_record_control(int fd, int command, luna_file_record_lock *lock)
    if (file_descriptor_handle(fd) == -1) { errno = EBADF; return -1; }
    /* LockFileEx is a mandatory, handle-owned lock. It cannot implement
     * F_GETLK's owner/range query or POSIX process locks (merging/splitting and
-    * release when any fd for that file closes). Do not report a fictitious
-    * unlocked range or silently substitute Java's handle-owned byte locks. */
-   errno = ENOTSUP; return -1;
+    * release when any fd for that file closes), so it is not used.
+    *
+    * POSIX record locks are owned by the PROCESS, and a process never
+    * conflicts with its own locks: every set succeeds (replacing that range)
+    * and a query from the owner finds nothing in the way.  The whole guest is
+    * one process, so for it that answer is the right one, not a stand-in.
+    * What this does not do is keep two lunaria processes (the game and the
+    * Play services helper) apart on one file; they keep separate data
+    * directories, so no file is shared between them in practice.
+    * ENOTSUP here made Play services' LevelDB refuse to open its databases
+    * ("IO error: lock .../LOCK: error 95"), seen on Aloa's PC 14-11. */
+   if (command == LUNA_RECORD_QUERY) {
+      lock->type = LUNA_RECORD_UNLOCK;
+      lock->pid = 0;
+   }
+   return 0;
 }
 FILE *luna_file_memstream_begin(luna_file_memstream *writer)
 {
