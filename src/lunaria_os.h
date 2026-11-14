@@ -2053,6 +2053,8 @@ struct luna_process_pool *luna_process_pool_open_host(const char *executable,con
 int luna_process_pool_running(struct luna_process_pool *,const char *name);
 /* Send to an existing host PID; never start a replacement process. */
 int luna_process_pool_send_to_host(struct luna_process_pool *,uint32_t host_pid,const void *data,size_t size);
+/* Start the host named `name` without sending it anything (no-op if alive). */
+int luna_process_pool_warm(struct luna_process_pool *,const char *name);
 int luna_process_pool_send(struct luna_process_pool *,const char *process,
                             const void *,size_t,uint32_t *guest_pid);
 /* A reply callback may enqueue another message, including to another VM.

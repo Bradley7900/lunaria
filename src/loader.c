@@ -1304,6 +1304,27 @@ static void component_pool_install(struct dvm *vm,int is_a64)
    dvm_binder_set_pump(component_pool_tick);
 }
 
+/* Start Play services' main process as the game starts (15-11, Aloa's log:
+ * started on the game's first call at 70 s, ready at 116 s; three calls gave
+ * up after 15 s each and one held the main thread for 8 s).  Its Application
+ * starts the moment the host is spawned, so it boots alongside the game.
+ * LUNARIA_GMS_PREWARM=0 goes back to starting it on first use. */
+static void gms_prewarm(void)
+{
+   const char *gms="com.google.android.gms";
+   const char *off=getenv("LUNARIA_GMS_PREWARM");
+   if(off && !strcmp(off,"0"))return;
+   const char *self=getenv("ANDROID_PACKAGE_NAME");
+   if(self && !strcmp(self,gms))return;
+   struct lunaria_android_package record;
+   if(!lunaria_android_package_find(gms,&record) || !record.source_dir)return;
+   struct luna_process_pool *pool=package_pool(gms);
+   if(!pool)return;
+   int rc=luna_process_pool_warm(pool,gms);
+   fprintf(stderr,"[service-broker] prewarm %s: %s
+",gms,rc ? strerror(-rc) : "started");
+}
+
 static bool process_exit_status(int *status)
 {
    if (dvm_jni_process_exited(status)) return true;
@@ -2348,6 +2369,7 @@ main(int argc, const char *argv[])
          a64_preload_platform_libs();
 
       if(!service_process)component_pool_install(dvm_jni_vm(),is_a64);
+      if(!service_process)gms_prewarm();
       int ret = service_process ? run_service_process(&jvm,is_a64,3) : run_dex_activity(&jvm, is_a64);
       if(g_component_pool){
          dvm_service_set_submit(dvm_jni_vm(),NULL,NULL);

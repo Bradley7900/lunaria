@@ -1179,6 +1179,20 @@ static pthread_mutex_t g_binder_pump_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_
 #else
 static pthread_mutex_t g_binder_pump_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 #endif
+/* Keep the window answering while a call waits (15-11, Aloa's "not responding"):
+ * a Binder call from the main thread into Play services, still starting up, sat
+ * 8 s in the loop below without anyone reading the window's messages, and
+ * Windows greys a window out after 5 s of that.  The same poll a paused guest
+ * runs: it only acts on the window's own thread, and every lock is dropped. */
+static void binder_window_poll(struct timespec *last)
+{
+   struct timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   if ((now.tv_sec - last->tv_sec) * 1000L + (now.tv_nsec - last->tv_nsec) / 1000000L < 100) return;
+   *last = now;
+   arm_exec_pause_poll();
+}
+
 static void binder_pump_once(void)
 {
    if (!g_binder_pump || pthread_mutex_trylock(&g_binder_pump_lock)) return;
@@ -1237,12 +1251,14 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
    bool done = false;
    struct timespec w0, w1;
    clock_gettime(CLOCK_MONOTONIC, &w0);
+   struct timespec wp = w0;
    /* Bounded by the clock: usleep(1000) sleeps 1.5-2 ms on Windows, so a
     * count of 15000 sleeps was 26 s there, not the 15 s meant. */
    for (long waited = 0; waited < BINDER_WAIT_MS && !done;
         clock_gettime(CLOCK_MONOTONIC, &w1),
         waited = (long)(w1.tv_sec - w0.tv_sec) * 1000L + (w1.tv_nsec - w0.tv_nsec) / 1000000L) {
       binder_pump_once();
+      binder_window_poll(&wp);
       pthread_mutex_lock(&g_binder_lock); done = wait->done; pthread_mutex_unlock(&g_binder_lock);
       if (!done) usleep(1000);
    }
@@ -1319,12 +1335,14 @@ int dvm_binder_request(struct dvm *vm, const char *package, const char *magic,
    bool done = false;
    struct timespec w0, w1;
    clock_gettime(CLOCK_MONOTONIC, &w0);
+   struct timespec wp = w0;
    /* Bounded by the clock: usleep(1000) sleeps 1.5-2 ms on Windows, so a
     * count of 15000 sleeps was 26 s there, not the 15 s meant. */
    for (long waited = 0; waited < BINDER_WAIT_MS && !done;
         clock_gettime(CLOCK_MONOTONIC, &w1),
         waited = (long)(w1.tv_sec - w0.tv_sec) * 1000L + (w1.tv_nsec - w0.tv_nsec) / 1000000L) {
       binder_pump_once();
+      binder_window_poll(&wp);
       pthread_mutex_lock(&g_binder_lock); done = wait->done; pthread_mutex_unlock(&g_binder_lock);
       if (!done) usleep(1000);
    }

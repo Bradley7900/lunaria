@@ -286,6 +286,18 @@ static void reap(struct luna_process_pool *pool)
       link=&child->next;
    }
 }
+/* Start the host for `name` now, without a message (15-11: Play services takes
+ * ~45 s to come up interpreted, and starting it on the first call made the
+ * game's calls during that time give up). Returns 0 when one is running. */
+int luna_process_pool_warm(struct luna_process_pool *pool,const char *name)
+{
+   if(!pool || !name || !*name || strlen(name)>NAME_MAX_BYTES)return -EINVAL;
+   pthread_mutex_lock(&pool->lock);
+   struct child *child=pool->children;
+   while(child){child_poll(child);if(!child->dead && !strcmp(child->name,name))break;child=child->next;}
+   int rc=child ? 0 : spawn_child(pool,name,&child);
+   pthread_mutex_unlock(&pool->lock);return rc;
+}
 int luna_process_pool_send(struct luna_process_pool *pool,const char *name,const void *data,size_t size,uint32_t *pid)
 {
    if(!pool || !name || !*name || strlen(name)>NAME_MAX_BYTES || (!data && size))return -EINVAL;
@@ -900,6 +912,18 @@ static void reap(struct luna_process_pool *pool)
       link=&child->next;
    }
 }
+/* Start the host for `name` now, without a message (15-11: Play services takes
+ * ~45 s to come up interpreted, and starting it on the first call made the
+ * game's calls during that time give up). Returns 0 when one is running. */
+int luna_process_pool_warm(struct luna_process_pool *pool,const char *name)
+{
+   if(!pool || !name || !*name || strlen(name)>NAME_MAX_BYTES)return -EINVAL;
+   pthread_mutex_lock(&pool->lock);
+   struct child *child=pool->children;
+   while(child){child_poll(child);if(!child->dead && !strcmp(child->name,name))break;child=child->next;}
+   int rc=child ? 0 : spawn_child(pool,name,&child);
+   pthread_mutex_unlock(&pool->lock);return rc;
+}
 int luna_process_pool_send(struct luna_process_pool *pool,const char *name,const void *data,size_t size,uint32_t *pid)
 {
    if(!pool || !name || !*name || strlen(name)>NAME_MAX_BYTES || (!data && size))return -EINVAL;
@@ -1029,6 +1053,8 @@ int luna_process_pool_running(struct luna_process_pool *p,const char *n)
 { (void)p;(void)n;return 0; }
 int luna_process_pool_send_to_host(struct luna_process_pool *p,uint32_t h,const void *d,size_t s)
 { (void)p;(void)h;(void)d;(void)s;return -ENOSYS; }
+int luna_process_pool_warm(struct luna_process_pool *p,const char *n)
+{ (void)p;(void)n;return -ENOSYS; }
 int luna_process_pool_send(struct luna_process_pool *p,const char *n,const void *d,size_t s,uint32_t *g)
 { (void)p;(void)n;(void)d;(void)s;(void)g;return -ENOSYS; }
 int luna_process_pool_tick(struct luna_process_pool *p,luna_process_reply_fn f,void *u)
