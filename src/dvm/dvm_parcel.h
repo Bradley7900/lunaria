@@ -1186,6 +1186,22 @@ static void binder_pump_once(void)
    pthread_mutex_unlock(&g_binder_pump_lock);
 }
 
+/* A wait that took long is the first thing to look at when the game stops:
+ * the frame pump answers Binder calls on its own thread, and while it waits
+ * nothing it drives (GL-owning guest threads included) runs. */
+static void binder_wait_report(const char *what, long code, bool done,
+                               const struct timespec *w0, const struct timespec *w1)
+{
+   const long ms = (long)(w1->tv_sec - w0->tv_sec) * 1000L +
+                   (w1->tv_nsec - w0->tv_nsec) / 1000000L;
+   if (done && ms < 500) return;
+   static unsigned said;
+   if (said++ >= 64u) return;
+   fprintf(stderr, "[binder] %s %ld on the %s thread: %s after %ld ms\n",
+           what, code, dvm_on_main_thread() ? "main" : "a background",
+           done ? "answered" : "NO ANSWER, gave up", ms);
+}
+
 /* The transaction half of a BinderProxy: build LBT1 and, unless one-way, wait. */
 bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_ref data,
                                dvm_ref reply, int32_t flags, bool *result)
@@ -1219,11 +1235,15 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
     * order. */
    const unsigned ael = arm_lock_unlock_all();
    bool done = false;
+   struct timespec w0, w1;
+   clock_gettime(CLOCK_MONOTONIC, &w0);
    for (int waited = 0; waited < BINDER_WAIT_MS && !done; ++waited) {
       binder_pump_once();
       pthread_mutex_lock(&g_binder_lock); done = wait->done; pthread_mutex_unlock(&g_binder_lock);
       if (!done) usleep(1000);
    }
+   clock_gettime(CLOCK_MONOTONIC, &w1);
+   binder_wait_report("call code", (long)code, done, &w0, &w1);
    dvm_gil_relock(vm, depth);
    arm_lock_relock(ael);
    if (!done) {
@@ -1293,11 +1313,15 @@ int dvm_binder_request(struct dvm *vm, const char *package, const char *magic,
     * order. */
    const unsigned ael = arm_lock_unlock_all();
    bool done = false;
+   struct timespec w0, w1;
+   clock_gettime(CLOCK_MONOTONIC, &w0);
    for (int waited = 0; waited < BINDER_WAIT_MS && !done; ++waited) {
       binder_pump_once();
       pthread_mutex_lock(&g_binder_lock); done = wait->done; pthread_mutex_unlock(&g_binder_lock);
       if (!done) usleep(1000);
    }
+   clock_gettime(CLOCK_MONOTONIC, &w1);
+   binder_wait_report(magic, (long)body_size, done, &w0, &w1);
    dvm_gil_relock(vm, depth);
    arm_lock_relock(ael);
    if (!done) { binder_pending_drop(wait); return -ETIMEDOUT; }

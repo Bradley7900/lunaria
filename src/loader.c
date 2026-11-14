@@ -709,6 +709,16 @@ static void *memwatch_thread(void *arg)
                                    (unsigned long long)frames, stuck);
       else snprintf(loop, sizeof loop, "frame %llu", (unsigned long long)frames);
       fprintf(stderr, "[memwatch] t=%.0fs %s | %s%s%s\n", t, loop, where, gpu, pc);
+      /* The stall dump runs from the frame loop, so a loop that is itself
+       * stuck never writes one.  This thread still runs: dump from here,
+       * at 20 s and then every 60 s while it stays stuck. */
+      static double dumped_at = -1.0;
+      if (stuck < every) dumped_at = -1.0;
+      else if (stuck >= 20.0 && (dumped_at < 0.0 || stuck - dumped_at >= 60.0)) {
+         dumped_at = stuck;
+         fprintf(stderr, "[memwatch] main loop stuck %.0fs: dumping guest threads\n", stuck);
+         arm64_exec_svc_ring_dump();
+      }
    }
    return NULL;
 }
