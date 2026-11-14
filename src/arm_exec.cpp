@@ -47446,11 +47446,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * Share file I/O and kernel signal operations with raw svc#0, then
          * translate the kernel's -errno to libc -1/errno. In particular the
          * action/mask here use the kernel structure, not libc's sigaction. */
+        /* getrandom (A64 278, A32 384) too: BoringSSL (Conscrypt, inside Play
+         * services' ProviderInstaller) calls it through syscall(), and on
+         * ENOSYS falls back to open("/dev/urandom"), which a Windows host does
+         * not have -- it then perror()s and abort()s the calling thread. */
         if ((ctx.is_arm64 && (nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
-                              nr==131u || nr==134u || nr==135u)) ||
+                              nr==131u || nr==134u || nr==135u || nr==278u)) ||
             (!ctx.is_arm64 && (nr==95u || nr==133u || nr==207u || nr==3u || nr==4u || nr==6u || nr==184u ||
                                nr==90u || nr==91u || nr==125u || nr==192u ||
-                               nr==37u || nr==174u || nr==175u || nr==268u))) {
+                               nr==37u || nr==174u || nr==175u || nr==268u || nr==384u))) {
             const auto saved_args=g_svc_args64;
             auto kernel_regs=regs;
             GuestVA arguments[6];
