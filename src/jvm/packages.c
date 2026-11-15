@@ -188,6 +188,14 @@ static bool shared_system_apk(const char *guest_path, const char *host)
        stat(shared, &st) != 0 || st.st_size <= 22)
       return false;
    (void)unlink(host);
+#ifdef _WIN32
+   /* Hard link first on Windows.  With Developer Mode on, the symlink below
+    * succeeds, but the guest never resolved the real APK through it: no
+    * "installed APK is version" line and Google's library still said
+    * SERVICE_INVALID with Play services 26.44.32 installed (sourama's PC,
+    * 15-11).  Aloa's PC, without the symlink right, got the hard link and saw it. */
+   if (luna_file_link(shared, host) == 0) return true;
+#endif
    if (luna_file_symlink(shared, host) == 0) return true;
    /* Windows grants an unprivileged symlink only in Developer Mode.  Without
     * it this failed silently and the app kept the 22-byte stub, so Google's
