@@ -1068,6 +1068,7 @@ static void pick_select_label(size_t i)
 
 static void pick_select_close(int panel)
 {
+    luna_remove_class(panel, "open");
     luna_add_class(panel, "hidden");
     luna_update_element_style(panel);
     luna_pop_focus_trap(panel);
@@ -1112,6 +1113,9 @@ static void pick_select_toggle(LunaElement *element)
         snprintf(style, sizeof style, "max-height:%.0fpx;overflow:auto;", available > 44 ? available : 44);
         luna_dom_set_attr(panel, "style", style);
         luna_remove_class(panel, "hidden");
+        /* .open carries the drop-in animation; a fresh class each time is what
+         * restarts the keyframes (an unchanged animation keeps its old clock). */
+        luna_add_class(panel, "open");
         luna_update_element_style(panel);
         snprintf(id, sizeof id, "set%zu", i);
         luna_dom_set_attr(luna_get_element_by_id(id), "aria-expanded", "true");
@@ -1477,6 +1481,14 @@ static const char pick_css_extra[] =
     "#launcher-card .select_option{box-sizing:border-box;height:34px;padding:8px;cursor:pointer;}"
     "#launcher-card .select_option:hover,#launcher-card .select_option:focus{background:#e3f1fb;}"
     "#launcher-card .select-panel.hidden{display:none;}"
+    /* Aloa 15-11: the dropdown "has no animation". It drops in (or rises, when
+     * it opens upwards) and fades, and the arrow turns over while it is open. */
+    "@keyframes selectdrop{0%{opacity:0;transform:translateY(-8px);}100%{opacity:1;transform:translateY(0px);}}"
+    "@keyframes selectrise{0%{opacity:0;transform:translateY(8px);}100%{opacity:1;transform:translateY(0px);}}"
+    "#launcher-card .select-panel.open{animation:selectdrop 160ms ease-out;}"
+    "#launcher-card .select-panel.open.opens-up{animation:selectrise 160ms ease-out;}"
+    "#launcher-card .select-box[aria-expanded=true]::after{top:18px;transform:rotate(225deg);}"
+
     "#launcher-card .hint{margin:0 0 2px 0;font-size:12px;color:#6f8ca2;}"
     "#launcher-card #error{color:#c0392b;margin:10px 0 0 0;min-height:18px;font-size:13px;}"
     "#launcher-card .store-result{display:block;width:100%;padding:9px 12px;margin:4px 0;text-align:left;font-size:13px;}"
@@ -1513,7 +1525,21 @@ static const char pick_css_extra[] =
     "#launcher-card .hint,#launcher-card .bar .note{color:#8a949e;}"
     "#launcher-card #error{color:#ff6b5b;}"
     "#launcher-card .bar{background:rgba(14,16,19,0.98);border-top-color:#262b31;}"
-    "#launcher-card #continue{background:#0b8fe0;color:#ffffff;border-color:#0b8fe0;}";
+    "#launcher-card #continue{background:#0b8fe0;color:#ffffff;border-color:#0b8fe0;}"
+    /* Aloa 15-11: "the bar feels bland". It gets a lit accent edge and depth,
+     * and the controls answer the pointer: fields light their border, buttons
+     * ease their colour, Continue lifts. Last, so it wins over the dark rules. */
+    "#launcher-card .cell .select-box,#launcher-card .cell input,#launcher-card .row input"
+    "{transition:border-color 140ms,background 140ms;}"
+    "#launcher-card .cell .select-box:hover,#launcher-card .cell .select-box[aria-expanded=true],"
+    "#launcher-card .cell input:focus,#launcher-card .row input:focus{border-color:#0b8fe0;}"
+    "#launcher-card button{transition:background 140ms,border-color 140ms,transform 140ms;}"
+    "#launcher-card button.recent:hover,#launcher-card button.recent:focus{border-color:#0b8fe0;color:#ffffff;}"
+    "#launcher-card .bar{background:linear-gradient(to bottom,rgba(24,28,34,0.98) 0%,rgba(11,13,16,0.98) 100%);"
+    "border-top:1px solid rgba(11,143,224,0.45);}"
+    "#launcher-card #continue{transition:background 140ms,border-color 140ms,transform 140ms;}"
+    "#launcher-card #continue:hover,#launcher-card #continue:focus"
+    "{background:#2aa6f2;border-color:#2aa6f2;transform:translateY(-2px);}";
 
 /* "Play again": packages opened before, from lunaria-recent.txt via apk.c. */
 #define RECENT_SHOWN 8

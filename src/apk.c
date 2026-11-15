@@ -1297,6 +1297,20 @@ static bool recent_is_package(const char *path)
    return false;
 }
 
+/* Google's own packages (Play services, Play Store, Services Framework) are
+ * system parts, not something to play: dropping the Play services APK on the
+ * launcher put it under "Play again" with a Play button (Aloa, 15-11). */
+static bool update_archive_package(const char *path, char *pkg, size_t cap);
+static bool recent_is_google(const char *path)
+{
+   static const char *const google[] = {"com.google.android.gms", "com.android.vending", "com.google.android.gsf"};
+   char pkg[256];
+   if (!update_archive_package(path, pkg, sizeof pkg)) return false;
+   for (size_t i = 0; i < sizeof google / sizeof google[0]; i++)
+      if (!strcmp(pkg, google[i])) return true;
+   return false;
+}
+
 /* Puts the package this run opens at the top of the list.  Best effort: a
  * read-only folder only loses the convenience. */
 static void recent_remember(int argc, const char **argv)
@@ -1306,7 +1320,7 @@ static void recent_remember(int argc, const char **argv)
       if (argv[i] && argv[i][0] != '-' && recent_is_package(argv[i])) pkg = argv[i];
    static char list[RECENT_MAX][APK_PATH];
    char abs[APK_PATH], file[APK_PATH];
-   if (!pkg || absolute_path(pkg, abs, sizeof abs) || recent_file(file, sizeof file)) return;
+   if (!pkg || recent_is_google(pkg) || absolute_path(pkg, abs, sizeof abs) || recent_file(file, sizeof file)) return;
    const size_t n = recent_load(list, RECENT_MAX);
    FILE *f = open_file(file, "wb");
    if (!f) return;
@@ -2326,8 +2340,11 @@ static int launcher_ask(int *argc, const char ***argv)
    }
    static char recent[RECENT_MAX][APK_PATH];
    const char *recent_ptr[RECENT_MAX];
-   const size_t nrecent = recent_load(recent, RECENT_MAX);
-   for (size_t i = 0; i < nrecent; i++) recent_ptr[i] = recent[i];
+   const size_t nloaded = recent_load(recent, RECENT_MAX);
+   size_t nrecent = 0;
+   /* lists written before Google packages were left out still hold them */
+   for (size_t i = 0; i < nloaded; i++)
+      if (!recent_is_google(recent[i])) recent_ptr[nrecent++] = recent[i];
    luna_launcher_set_recent(recent_ptr, nrecent);
    const int picked = luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]);
    if (picked != 0 && picked != LUNA_LAUNCHER_GOOGLE)
