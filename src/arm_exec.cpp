@@ -9746,12 +9746,19 @@ static void sched_pass_notify(void)
 static std::map<GuestVA, uint32_t> g_futex_wake_tokens;
 // LUNARIA_TRACE_FUTEX_ADDR=hexaddr: full WAIT/WAKE/park/unpark trace for one
 // futex word (uaddr-filtered so it stays quiet).
+// A leading '~' matches the low 24 bits only: heap arenas move the high bits
+// between runs, so a word found in one run's dump has a different address in
+// the next, while its offset inside the arena does not (Unity's GfxDevice
+// worker word sat at ...1120d0 in three runs out of three).
+static GuestVA g_ftrace_mask = ~(GuestVA)0;
 static bool ftrace_addr(GuestVA uaddr) {
     static GuestVA a = []{
         const char *e = lunaria_env("LUNARIA_TRACE_FUTEX_ADDR");
-        return e ? (GuestVA)strtoull(e, nullptr, 16) : (GuestVA)0;
+        if (!e) return (GuestVA)0;
+        if (*e == '~') { g_ftrace_mask = 0xffffffu; ++e; }
+        return (GuestVA)strtoull(e, nullptr, 16) & g_ftrace_mask;
     }();
-    return a && a == uaddr;
+    return a && a == (uaddr & g_ftrace_mask);
 }
 // LUNARIA_TRACE_MUTEX_ADDR=hexaddr — every lock/unlock/park/grant on one pthread_mutex.
 static bool mtrace_addr(GuestVA va) {
