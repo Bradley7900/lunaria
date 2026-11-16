@@ -17339,6 +17339,12 @@ static float  g_look_fx, g_look_fy, g_look_ax, g_look_ay;
 static float  g_look_pdx = 0, g_look_pdy = 0;  /* motion not yet delivered */
 static bool   g_look_down = false, g_look_click = false;
 static long long g_look_last_ms = 0;
+/* The thumb comes back down as a NEW finger (28 and 26 alternate) and only
+ * after a two-frame rest. Same id straight away let a game whose frame took
+ * both the lift and the new press see one finger jump back to the anchor:
+ * the head snapped for a moment (Aloa 17-11, Exploration Craft). */
+static int g_look_id = 28;
+static long long g_look_rest_until = 0;
 extern "C" void arm_exec_pointer_capture(int on) {
     g_look_want.store(on ? 1 : 0, std::memory_order_release);
 }
@@ -17346,7 +17352,11 @@ extern "C" int arm_exec_pointer_captured(void) {
     return g_look.load(std::memory_order_acquire) ? 1 : 0;
 }
 static void look_lift() {
-    if (g_look_down) touch_contact(28, 1, g_look_fx, g_look_fy);
+    if (g_look_down) {
+        touch_contact(g_look_id, 1, g_look_fx, g_look_fy);
+        g_look_id = g_look_id == 28 ? 26 : 28;
+        g_look_rest_until = (long long)touch_now_ms() + 34;
+    }
     g_look_down = false;
 }
 static void look_set(bool on, const char *why) {
@@ -17396,26 +17406,27 @@ static void look_poll() {
         return;
     }
     g_look_last_ms = now;
+    if (!g_look_down && now < g_look_rest_until) return;   /* motion waits */
     if (!g_look_down) {
         /* Down this frame, moving from the next: a phone never reports a
          * contact's first sample already displaced, and a camera that sees
          * one treats it as a jump. The motion waits one frame. */
         g_look_fx = g_look_ax;
         g_look_fy = g_look_ay;
-        touch_contact(28, 0, g_look_fx, g_look_fy);
+        touch_contact(g_look_id, 0, g_look_fx, g_look_fy);
         g_look_down = true;
         return;
     }
     g_look_fx += g_look_pdx;
     g_look_fy += g_look_pdy;
     g_look_pdx = g_look_pdy = 0;
-    const float reach = 0.22f * (float)std::min(g_fb_w, g_fb_h);
+    const float reach = 0.30f * (float)std::min(g_fb_w, g_fb_h);
     if (std::fabs(g_look_fx - g_look_ax) > reach || std::fabs(g_look_fy - g_look_ay) > reach ||
         g_look_fx < 1 || g_look_fy < 1 || g_look_fx > g_fb_w - 2 || g_look_fy > g_fb_h - 2) {
         look_lift();   /* the thumb runs out of room and comes back */
         return;
     }
-    touch_contact(28, 2, g_look_fx, g_look_fy);
+    touch_contact(g_look_id, 2, g_look_fx, g_look_fy);
 }
 
 static void drag_flush();
