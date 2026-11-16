@@ -31698,6 +31698,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 }
             } else if (g_svc_args64[0] == kPrGetNoNewPrivs) {
                 ret64(g_guest_no_new_privs ? 1u : 0u);
+            } else if (g_svc_args64[0] == 0x59616d61ull /* PR_SET_PTRACER */) {
+                /* Android kernels build Yama in, so this succeeds there.
+                 * pairip sets it before forking its watchdog. */
+                ret64(0);
             } else {
                 ret64((uint64_t)-(int64_t)EINVAL);
             }
