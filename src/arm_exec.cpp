@@ -18823,12 +18823,15 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
          * thread that runs on without its context reads every GL limit as 0
          * and never draws. 3 s is far past the pump's frame period. */
         g_egl_guest_wants_window.store(true, std::memory_order_release);
+        /* Name the holder before retrying: the retries themselves would fill
+         * the ring (r49-3: 1202 of them pushed the holder's bind out). */
+        luna_egl_mc_dump("guest eglMakeCurrent refused, before retrying");
         const uint64_t t0 = host_mono_ns();
         int tries = 0;
         while (!ok && host_mono_ns() - t0 < 3'000'000'000ull) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             ++tries;
-            ok = eglMakeCurrent(g_egl_dpy, draw, read_s, ectx);
+            ok = (eglMakeCurrent)(g_egl_dpy, draw, read_s, ectx);
             if (!ok) retry_err = eglGetError();
         }
         fprintf(stderr, "[egl] guest eglMakeCurrent ctx=0x%x on host thread %llx "
@@ -70321,8 +70324,12 @@ extern "C" void arm64_exec_run_pending_threads(void) {
      * holds the bootstrap context with the window surface: let go here, at a
      * point where the pump holds no lock the waiting thread could need. */
     if (g_egl_guest_wants_window.load(std::memory_order_acquire) &&
-        g_egl_dpy != EGL_NO_DISPLAY && eglGetCurrentContext() == g_egl_ctx &&
-        g_egl_ctx != EGL_NO_CONTEXT) {
+        g_egl_dpy != EGL_NO_DISPLAY && eglGetCurrentContext() != EGL_NO_CONTEXT &&
+        (eglGetCurrentContext() == g_egl_ctx ||
+         (eglGetCurrentSurface(EGL_DRAW) == g_egl_surf &&
+          g_egl_bound_handle < ARM_EGL_CTXTAB_BASE))) {
+        /* The bootstrap context, or any context that is not a guest's own
+         * (the overlay's, a card's) holding the window surface here. */
         eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         egl_note_bound(0u, EGL_NO_SURFACE);
     }
