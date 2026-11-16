@@ -1268,6 +1268,24 @@ static int recent_file(char *out, size_t cap)
    return path_join(out, cap, conf, "lunaria-recent.txt");
 }
 
+/* The system packages Lunaria itself starts as helper processes, recognised
+ * by where they live rather than by reading the archive: the service broker
+ * runs them from the per-app device root (.../device-root/product/priv-app/
+ * PrebuiltGmsCore/PrebuiltGmsCore.apk), whose Play services APK has no
+ * signing block, so the package-name check below never saw them, and every
+ * game launch added PrebuiltGmsCore.apk and Phonesky.apk to "Play again"
+ * (Aloa, 17-11). Checked when the list is read too, so entries recorded
+ * before this was fixed disappear. */
+static bool recent_is_system_path(const char *path)
+{
+   static const char *const parts[] = {"device-root", "/priv-app/", "\\priv-app\\",
+                                       "PrebuiltGmsCore", "Phonesky", "GoogleServicesFramework",
+                                       "GmsCore.apk"};
+   for (size_t i = 0; i < sizeof parts / sizeof parts[0]; i++)
+      if (strstr(path, parts[i])) return true;
+   return false;
+}
+
 static size_t recent_load(char out[][APK_PATH], size_t max)
 {
    char file[APK_PATH], line[APK_PATH];
@@ -1277,7 +1295,7 @@ static size_t recent_load(char out[][APK_PATH], size_t max)
    if (!f) return 0;
    while (n < max && fgets(line, sizeof line, f)) {
       line[strcspn(line, "\r\n")] = 0;
-      if (line[0]) memcpy(out[n++], line, strlen(line) + 1);
+      if (line[0] && !recent_is_system_path(line)) memcpy(out[n++], line, strlen(line) + 1);
    }
    fclose(f);
    return n;
@@ -1320,7 +1338,7 @@ static void recent_remember(int argc, const char **argv)
       if (argv[i] && argv[i][0] != '-' && recent_is_package(argv[i])) pkg = argv[i];
    static char list[RECENT_MAX][APK_PATH];
    char abs[APK_PATH], file[APK_PATH];
-   if (!pkg || recent_is_google(pkg) || absolute_path(pkg, abs, sizeof abs) || recent_file(file, sizeof file)) return;
+   if (!pkg || recent_is_system_path(pkg) || recent_is_google(pkg) || absolute_path(pkg, abs, sizeof abs) || recent_file(file, sizeof file)) return;
    const size_t n = recent_load(list, RECENT_MAX);
    FILE *f = open_file(file, "wb");
    if (!f) return;
