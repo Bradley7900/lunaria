@@ -41944,6 +41944,81 @@ static const struct rt_method rt_build_methods[] = {
    M_END,
 };
 
+/* Context's service-name constants. javac inlines them into callers, so only
+ * reflection reads the fields, and Unity's AndroidJavaObject.GetStatic is
+ * reflection: 2 Player Games (Aloa 17-11) asked for ACTIVITY_SERVICE ~100
+ * times a session and every miss became a Java exception through Unity and
+ * Crashlytics. Values are AOSP's. */
+static const struct { const char *field, *value; } k_context_services[] = {
+   { "ACTIVITY_SERVICE", "activity" },
+   { "ALARM_SERVICE", "alarm" },
+   { "AUDIO_SERVICE", "audio" },
+   { "CLIPBOARD_SERVICE", "clipboard" },
+   { "CONNECTIVITY_SERVICE", "connectivity" },
+   { "DISPLAY_SERVICE", "display" },
+   { "DOWNLOAD_SERVICE", "download" },
+   { "INPUT_METHOD_SERVICE", "input_method" },
+   { "INPUT_SERVICE", "input" },
+   { "JOB_SCHEDULER_SERVICE", "jobscheduler" },
+   { "KEYGUARD_SERVICE", "keyguard" },
+   { "LAYOUT_INFLATER_SERVICE", "layout_inflater" },
+   { "LOCATION_SERVICE", "location" },
+   { "NOTIFICATION_SERVICE", "notification" },
+   { "POWER_SERVICE", "power" },
+   { "SENSOR_SERVICE", "sensor" },
+   { "STORAGE_SERVICE", "storage" },
+   { "TELEPHONY_SERVICE", "phone" },
+   { "UI_MODE_SERVICE", "uimode" },
+   { "USAGE_STATS_SERVICE", "usagestats" },
+   { "VIBRATOR_SERVICE", "vibrator" },
+   { "WIFI_SERVICE", "wifi" },
+   { "WINDOW_SERVICE", "window" },
+   { "BATTERY_SERVICE", "batterymanager" },
+   { "CAMERA_SERVICE", "camera" },
+   { "ACCESSIBILITY_SERVICE", "accessibility" },
+   { "ACCOUNT_SERVICE", "account" },
+   { "APP_OPS_SERVICE", "appops" },
+   { "DEVICE_POLICY_SERVICE", "device_policy" },
+   { "USER_SERVICE", "user" },
+   { "STORAGE_STATS_SERVICE", "storagestats" },
+   { "NETWORK_STATS_SERVICE", "netstats" },
+};
+static const struct rt_field rt_context_sfields[] = {
+   { "ACTIVITY_SERVICE", "Ljava/lang/String;" },
+   { "ALARM_SERVICE", "Ljava/lang/String;" },
+   { "AUDIO_SERVICE", "Ljava/lang/String;" },
+   { "CLIPBOARD_SERVICE", "Ljava/lang/String;" },
+   { "CONNECTIVITY_SERVICE", "Ljava/lang/String;" },
+   { "DISPLAY_SERVICE", "Ljava/lang/String;" },
+   { "DOWNLOAD_SERVICE", "Ljava/lang/String;" },
+   { "INPUT_METHOD_SERVICE", "Ljava/lang/String;" },
+   { "INPUT_SERVICE", "Ljava/lang/String;" },
+   { "JOB_SCHEDULER_SERVICE", "Ljava/lang/String;" },
+   { "KEYGUARD_SERVICE", "Ljava/lang/String;" },
+   { "LAYOUT_INFLATER_SERVICE", "Ljava/lang/String;" },
+   { "LOCATION_SERVICE", "Ljava/lang/String;" },
+   { "NOTIFICATION_SERVICE", "Ljava/lang/String;" },
+   { "POWER_SERVICE", "Ljava/lang/String;" },
+   { "SENSOR_SERVICE", "Ljava/lang/String;" },
+   { "STORAGE_SERVICE", "Ljava/lang/String;" },
+   { "TELEPHONY_SERVICE", "Ljava/lang/String;" },
+   { "UI_MODE_SERVICE", "Ljava/lang/String;" },
+   { "USAGE_STATS_SERVICE", "Ljava/lang/String;" },
+   { "VIBRATOR_SERVICE", "Ljava/lang/String;" },
+   { "WIFI_SERVICE", "Ljava/lang/String;" },
+   { "WINDOW_SERVICE", "Ljava/lang/String;" },
+   { "BATTERY_SERVICE", "Ljava/lang/String;" },
+   { "CAMERA_SERVICE", "Ljava/lang/String;" },
+   { "ACCESSIBILITY_SERVICE", "Ljava/lang/String;" },
+   { "ACCOUNT_SERVICE", "Ljava/lang/String;" },
+   { "APP_OPS_SERVICE", "Ljava/lang/String;" },
+   { "DEVICE_POLICY_SERVICE", "Ljava/lang/String;" },
+   { "USER_SERVICE", "Ljava/lang/String;" },
+   { "STORAGE_STATS_SERVICE", "Ljava/lang/String;" },
+   { "NETWORK_STATS_SERVICE", "Ljava/lang/String;" },
+   F_END
+};
+
 static const struct rt_field rt_build_version_sfields[] = {
    { "SDK_INT", "I" },
    { "RELEASE", "Ljava/lang/String;" },
@@ -82133,7 +82208,8 @@ static const struct rt_class rt_classes[] = {
      rt_context_wrapper, rt_context_wrapper_fields, NULL },
    { "Landroid/view/ContextThemeWrapper;", "Landroid/content/ContextWrapper;",
      rt_context_theme_wrapper, rt_context_theme_wrapper_fields, NULL },
-   { "Landroid/content/Context;", "Ljava/lang/Object;", rt_context, rt_context_fields, NULL },
+   { "Landroid/content/Context;", "Ljava/lang/Object;", rt_context, rt_context_fields, NULL,
+     rt_context_sfields },
    { "Landroid/view/autofill/AutofillId;", "Ljava/lang/Object;", rt_autofill_id, rt_autofill_id_fields, rt_iface_parcelable },
    { "Landroid/view/autofill/AutofillManager;", "Ljava/lang/Object;", rt_autofill_manager, NULL, NULL },
    { "Landroid/view/autofill/AutofillManager$AutofillCallback;", "Ljava/lang/Object;", rt_autofill_callback, NULL, NULL },
@@ -82497,6 +82573,16 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc)
             if (arr) dvm_pin(vm, arr);
          }
       }
+   }
+
+   if (!strcmp(desc, "Landroid/content/Context;") && c->sslots) {
+      for (int f = 0; f < c->nsfields; ++f)
+         for (size_t k = 0; k < sizeof k_context_services / sizeof *k_context_services; ++k)
+            if (c->sfields[f].name && !strcmp(c->sfields[f].name, k_context_services[k].field)) {
+               c->sslots[f].l = dvm_new_string(vm, k_context_services[k].value);
+               if (c->sslots[f].l) dvm_pin(vm, c->sslots[f].l);
+               c->sfields[f].access |= DEX_ACC_PUBLIC | DEX_ACC_STATIC | DEX_ACC_FINAL;
+            }
    }
 
    if (!strcmp(desc, "Landroid/os/Build$VERSION;") &&
