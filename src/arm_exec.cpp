@@ -69566,6 +69566,33 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
             fprintf(stderr, "[dvm] native %s.%s%s -> 0x%llx (%d args)\n",
                     klass, method, sig, (unsigned long long)fn, ng - 2);
     }
+    /* pairip's VM decodes every address as (enc ^ ~len) % len over the byte[]
+     * it is handed, so one wrong byte or a wrong length turns its first run into
+     * a load of a garbage pointer. Shadow Fight (Aloa 17-11) died that way, the
+     * same address every launch. Say exactly what it was given, so the bytes
+     * can be checked against the asset file in the APK. */
+    if (!strcmp(method, "executeVM") && sig[0] == '(' && sig[1] == '[' && sig[2] == 'B' &&
+        nargs >= 1 && g_ctx->jvm && args[0].l) {
+        struct jvm *jvm = g_ctx->jvm;
+        JNIEnv *env = &jvm->env;
+        const jsize len = jvm->native.GetArrayLength(env, (jarray)args[0].l);
+        jbyte *b = jvm->native.GetByteArrayElements(env, (jbyteArray)args[0].l, nullptr);
+        uint64_t h = 1469598103934665603ull;
+        char head[3 * 32 + 1] = {0};
+        for (jsize i = 0; b && i < len; ++i) {
+            h = (h ^ (uint8_t)b[i]) * 1099511628211ull;
+            if (i < 32) snprintf(head + 3 * i, 4, "%02x ", (unsigned)(uint8_t)b[i]);
+        }
+        jsize objs = -1;
+        if (nargs >= 2 && args[1].l)
+            objs = jvm->native.GetArrayLength(env, (jarray)args[1].l);
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8)
+            fprintf(stderr, "[pairip] executeVM bytecode len=%d fnv1a64=%016llx "
+                    "objects=%d head: %s\n", (int)len, (unsigned long long)h,
+                    (int)objs, head);
+        if (b) jvm->native.ReleaseByteArrayElements(env, (jbyteArray)args[0].l, b, JNI_ABORT);
+    }
 
     /* A Runnable delivered by the host pump is a Java/ART thread too, but it
      * does not pass through bytecode_thread_main().  Give that top-level
