@@ -66313,8 +66313,47 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
     }
 }
 
+/* A callback that has waited on one word for a long time is invisible to the
+ * thread dump: it borrows a tid but owns no ArmThread slot, so the 4-core
+ * Unity startup hang (16-11) showed every scheduler thread idle and the one
+ * thread that mattered, UnityMain inside pthread_cond_wait, nowhere at all.
+ * Say what it waits on, whether the word has moved since it was sampled (a
+ * signal that happened but whose WAKE was lost) and what the wake bookkeeping
+ * holds for it. Every 10 s per wait, so a stuck one keeps reporting. */
+static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
+    static thread_local GuestVA seen_va;
+    static thread_local uint8_t seen_kind;
+    static thread_local uint64_t since_ns, next_ns;
+    static std::atomic<int> reports{0};
+    const GuestVA va = g_cb_lock_wait.kind == CbLockWait::Cond
+                           ? g_cb_lock_wait.cond_va : g_cb_lock_wait.mva;
+    const uint64_t now = host_mono_ns();
+    if (va != seen_va || g_cb_lock_wait.kind != seen_kind) {
+        seen_va = va; seen_kind = g_cb_lock_wait.kind;
+        since_ns = now; next_ns = now + 5'000'000'000ull;
+        return;
+    }
+    if (now < next_ns || reports.load(std::memory_order_relaxed) >= 64) return;
+    next_ns = now + 10'000'000'000ull;
+    reports.fetch_add(1, std::memory_order_relaxed);
+    ArmLockGuard locked;
+    const uint32_t word = va && ctx.mem.ptr(va) ? ctx.mem.read32(va) : 0u;
+    auto wa = g_futex_wait_addrs.find(va);
+    fprintf(stderr, "[cbwait] tid=%u depth=%d kind=%u va=0x%llx word=0x%08x "
+            "expected=0x%08x %s mutex=0x%llx timed=%d for %.1fs tokens=%u "
+            "registered=%u scheduling=%d worker=%d\n",
+            g_current_tid, depth, (unsigned)g_cb_lock_wait.kind,
+            (unsigned long long)va, word, g_cb_lock_wait.futex_expected,
+            word != g_cb_lock_wait.futex_expected ? "MOVED" : "same",
+            (unsigned long long)g_cb_lock_wait.mva, (int)g_cb_lock_wait.timed,
+            (now - since_ns) / 1e9, futex_token_count(va),
+            wa == g_futex_wait_addrs.end() ? 0u : (unsigned)wa->second,
+            (int)g_scheduling, (int)g_a64_is_worker);
+}
+
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth) {
     if (g_cb_lock_wait.kind == CbLockWait::Idle) return;
+    cb_lock_wait_long_report(ctx, depth);
     if (!g_scheduling || (!g_a64_is_worker &&
                          (ctx.is_arm64 || g_slice_depth <= CB_MAX_DEPTH))) {
         schedule_threads(env_ticks("LUNARIA_CB_MUTEX_TICKS", 2'000'000ULL));
