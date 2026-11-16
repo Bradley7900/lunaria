@@ -8541,10 +8541,72 @@ static void gc_ev_dump(GuestVA sva)
     }
 }
 
+static std::map<GuestVA, uint64_t> g_sem_last_change_ns;
 static void sem_history_note(GuestVA sva, int32_t delta, int32_t after, uint64_t lr)
 {
     gc_ev_note(delta > 0 ? 'P' : 'T', (uint32_t)lr, after, sva);
     g_sem_history[g_sem_history_n++ % 64u] = { sva, g_current_tid, delta, after, lr };
+    g_sem_last_change_ns[sva] = host_mono_ns();
+}
+
+/* Boehm's stop-the-world (il2cpp) waits until its ack semaphore reads EXACTLY
+ * the number of threads it signalled. When a signalled thread has marked
+ * itself stopped (or restarted) but has not posted yet, and stays that way
+ * for its RETRY_INTERVAL (100 ms), Boehm decides the thread is gone and
+ * lowers its count; the post still arrives and stays in the semaphore. From
+ * then on every round reads one too many and the equality never holds: the
+ * collector polls sem_getvalue + usleep(3000) forever, the game freezes for
+ * good, and any server it talks to drops the connection. 100 ms is nothing
+ * for an emulated thread on 4 cores waiting for an execution lock that is
+ * sometimes held for most of a second (r23: GetMethodID 984 ms).
+ * In that state the collector resends nothing (every thread is marked), and
+ * no post or take touches the semaphore. A genuinely missing ack looks
+ * different: Boehm resends to that thread every 100 ms, which shows up as
+ * pthread_kill. So: one thread polling a semaphore with a positive value that
+ * has not changed for 2 s, while nobody was sent a signal for 2 s, holds one
+ * stale token; drop it and say so. LUNARIA_GC_SEM_REPAIR=0 disables. */
+static std::atomic<uint64_t> g_last_kill_ns{0};
+static std::set<GuestVA> g_sem_signal_acked;
+static bool sem_stale_token_repair(GuestVA sva, int32_t &value)
+{
+    static const bool off = [] {
+        const char *e = lunaria_env("LUNARIA_GC_SEM_REPAIR");
+        return e && *e == '0';
+    }();
+    static thread_local GuestVA watch_sva;
+    static thread_local int32_t watch_val;
+    static thread_local uint64_t watch_since;
+    static thread_local uint32_t watch_polls;
+    static unsigned repairs;
+    if (off || value <= 0 || !g_sem_signal_acked.count(sva)) {
+        watch_sva = 0;
+        return false;
+    }
+    const uint64_t now = host_mono_ns();
+    if (sva != watch_sva || value != watch_val) {
+        watch_sva = sva; watch_val = value; watch_since = now; watch_polls = 0;
+        return false;
+    }
+    ++watch_polls;
+    const uint64_t quiet = 2'000'000'000ull;
+    auto ch = g_sem_last_change_ns.find(sva);
+    const uint64_t changed = ch == g_sem_last_change_ns.end() ? 0 : ch->second;
+    if (now - watch_since < quiet || watch_polls < 100u ||
+        now - changed < quiet ||
+        now - g_last_kill_ns.load(std::memory_order_relaxed) < quiet ||
+        repairs >= 256u)
+        return false;
+    ++repairs;
+    --g_sems[sva];
+    --value;
+    sem_history_note(sva, -1, value, 0xdeadull);
+    fprintf(stderr, "[gc-fix] tid=%u has polled sem 0x%llx %u times over %.1f s at "
+            "value %d with no post, take or signal sent: dropping one stale "
+            "token (Boehm stop-the-world count), now %d (repair #%u)\n",
+            g_current_tid, (unsigned long long)sva, watch_polls,
+            (now - watch_since) / 1e9, value + 1, value, repairs);
+    watch_val = value; watch_since = now; watch_polls = 0;
+    return true;
 }
 
 static void sem_poll_note(GuestVA sva, int32_t value, uint64_t lr)
@@ -35764,6 +35826,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_SEM_POST: {
         GuestVA sva = argp(0);
         ++g_sems[sva];
+        {
+            /* Posted from inside a signal handler: a stop-the-world ack. */
+            const ArmThread *self = thread_slot_by_tid(g_current_tid);
+            if ((self && self->signal_depth) || g_main_signal_depth)
+                g_sem_signal_acked.insert(sva);
+        }
         sem_history_note(sva, 1, g_sems[sva], lr);
         sem_wake_parked(sva, 1u);
         sched_pass_notify();
@@ -35780,7 +35848,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32(0); break;
     case SVC_SEM_GETVALUE: {
         GuestVA sva = argp(0);
-        const int32_t value = g_sems.count(sva) ? g_sems[sva] : 0;
+        int32_t value = g_sems.count(sva) ? g_sems[sva] : 0;
+        (void)sem_stale_token_repair(sva, value);
         if (argp(1)) ctx.mem.write32(argp(1), (uint32_t)value);
         sem_poll_note(sva, value, lr);
         ret32(0); break;
@@ -47655,6 +47724,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         uint32_t target_tid = r0;
         int      sig        = (int)r1;
         gc_ev_note('K', target_tid, sig);
+        if (sig) g_last_kill_ns.store(host_mono_ns(), std::memory_order_relaxed);
         static int pkill_log = 0;
         if (pkill_log++ < 400) {
             /* Who the sender is by every measure: the scheduler's tid, this
