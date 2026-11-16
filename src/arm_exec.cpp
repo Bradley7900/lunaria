@@ -17187,7 +17187,9 @@ static void slide_finish() {
     g_slide_active = false;
     g_slide_overlay = false;
 }
+static void drag_flush();
 static void pinch_poll() {
+    drag_flush();
     if (g_pinch_active && touch_now_ms() >= g_pinch_until) pinch_finish();
     slide_step();
     if (g_slide_active && touch_now_ms() >= g_slide_until &&
@@ -17201,7 +17203,9 @@ static void glfw_window_close_cb(GLFWwindow *w) {
     arm_exec_request_quit();
 }
 
+static void drag_flush();
 static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
+    drag_flush();   /* the last position before the button changes */
     pinch_finish();
     slide_finish();
     double cx = 0, cy = 0;
@@ -17226,11 +17230,26 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     touch_contact(0, g_touch_down ? 0 : 1, (float)cx, (float)cy);
 }
 
+/* A drag is delivered once per frame, at the newest position, the way a
+ * phone batches a touchscreen's samples into one ACTION_MOVE per vsync.
+ * Sending every cursor callback (a gaming mouse reports up to 1000 a second)
+ * made one MotionEvent each, every one through the Java input path, and the
+ * game's camera fell behind and jumped as the backlog drained (Aloa 17-11,
+ * Exploration Craft: "moving the camera was not possible... it would glitch"). */
+static bool g_drag_pending = false;
+static float g_drag_x, g_drag_y;
+static void drag_flush() {
+    if (!g_drag_pending) return;
+    g_drag_pending = false;
+    if (g_touch_down) touch_contact(0, 2, g_drag_x, g_drag_y);
+}
 static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
     window_to_surface(&cx, &cy);
     if (luna_overlay_pointer(cx, cy, -1)) return;
     if (!g_touch_down) return;   /* touchscreen semantics: no hover events */
-    touch_contact(0, 2, (float)cx, (float)cy);
+    g_drag_x = (float)cx;
+    g_drag_y = (float)cy;
+    g_drag_pending = true;
 }
 
 /* Keep contacts alive across frames and consecutive wheel ticks, so a guest
