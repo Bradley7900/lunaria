@@ -67158,6 +67158,22 @@ static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth) {
     if (g_cb_lock_wait.kind == CbLockWait::Idle) return;
     cb_lock_wait_long_report(ctx, depth);
+    /* A Java thread blocked here on a guest lock must still take signals sent
+     * to it, as a Linux thread in futex_wait does (handler runs, wait goes
+     * on). Unity runs UnityMain on a Java host thread; before 17-11 only the
+     * VM's own waits took them, so the GC's stop-the-world signal (30) sat
+     * pending while UnityMain waited on the heap lock, the collector waited
+     * for its ack, and the heap lock's holder was already stopped: 11 s with
+     * no frame in Aloa's r28 LDoE run. The handler runs one nest level down,
+     * in its own wait slot, so this wait's record is untouched. */
+    if (ctx.is_arm64 && g_cb_depth < CB_MAX_DEPTH - 1 && arm_exec_dvm_signal_pending()) {
+        static std::atomic<unsigned> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 16u)
+            fprintf(stderr, "[signal] tid=%u takes a pending signal inside a callback "
+                    "lock wait (kind=%u)\n", g_dvm_guest_tid, (unsigned)g_cb_lock_wait.kind);
+        (void)arm_exec_dvm_take_signals();
+        if (g_cb_lock_wait.kind == CbLockWait::Idle) return;
+    }
     /* The pump lets go of the window when a guest bind wants it, but only at
      * the top of its loop. A pump parked here, inside a callback waiting on a
      * guest lock, never gets there: s53-1 (17-11) had Unity's first bind
