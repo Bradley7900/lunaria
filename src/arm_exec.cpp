@@ -392,6 +392,7 @@ static inline const char *android_gai_strerror(int error)
 #if defined(__APPLE__) || defined(_WIN32)
 #include <EGL/eglext_angle.h>
 #endif
+#include "luna_egl_mc.h"   /* records every eglMakeCurrent below; see the header */
 #include <GLES2/gl2.h>
 
 #include "luna_overlay.h"
@@ -12346,6 +12347,72 @@ static thread_local bool g_a64_is_worker = false;
  * a worker" is not the same test: every dvm bytecode thread also passes it,
  * and each one that ran a slice would build an engine of its own. */
 static thread_local bool g_a64_is_pump = false;
+
+/* ---- eglMakeCurrent recorder (see luna_egl_mc.h) ---------------------- */
+struct EglMcRec {
+    uint64_t ns, host;
+    EGLContext ctx;
+    EGLSurface draw;
+    const char *file;
+    int line;
+    uint32_t tid;
+    uint8_t ok, pump, worker;
+};
+enum { EGL_MC_RING = 512 };
+static EglMcRec g_egl_mc_ring[EGL_MC_RING];
+static std::atomic<uint32_t> g_egl_mc_pos{0};
+
+extern "C" EGLBoolean luna_egl_make_current_rec(EGLDisplay dpy, EGLSurface draw,
+                                                EGLSurface read, EGLContext ctx,
+                                                const char *file, int line) {
+    const EGLBoolean ok = (eglMakeCurrent)(dpy, draw, read, ctx);
+    const uint32_t i = g_egl_mc_pos.fetch_add(1, std::memory_order_relaxed);
+    EglMcRec &r = g_egl_mc_ring[i % EGL_MC_RING];
+    r.ns = host_mono_ns();
+    r.host = luna_os_thread_token();
+    r.ctx = ctx; r.draw = draw; r.file = file; r.line = line;
+    r.tid = g_current_tid;
+    r.ok = ok ? 1 : 0; r.pump = g_a64_is_pump; r.worker = g_a64_is_worker;
+    return ok;
+}
+
+/* Names that can be read without the ledger: the bootstrap context and
+ * surface, the guest's table, else the raw pointer. */
+static void egl_mc_name_ctx(EGLContext c, char *out, size_t n) {
+    if (c == EGL_NO_CONTEXT) { snprintf(out, n, "none"); return; }
+    if (c == g_egl_ctx) { snprintf(out, n, "boot"); return; }
+    for (size_t k = 0; k < g_egl_ctx_tab.size(); ++k)
+        if (g_egl_ctx_tab[k] == c) {
+            snprintf(out, n, "0x%x", (unsigned)(ARM_EGL_CTXTAB_BASE + k));
+            return;
+        }
+    snprintf(out, n, "%p", (void *)c);
+}
+
+extern "C" void luna_egl_mc_dump(const char *why) {
+    static std::atomic<int> dumps{0};
+    if (dumps.fetch_add(1, std::memory_order_relaxed) >= 3) return;
+    const uint32_t end = g_egl_mc_pos.load(std::memory_order_relaxed);
+    const uint32_t start = end > EGL_MC_RING ? end - EGL_MC_RING : 0u;
+    fprintf(stderr, "[egl-mc] %s: %u binds recorded, oldest first "
+            "(this host thread %llx)\n", why, end,
+            (unsigned long long)luna_os_thread_token());
+    const uint64_t now = host_mono_ns();
+    for (uint32_t i = start; i < end; ++i) {
+        const EglMcRec &r = g_egl_mc_ring[i % EGL_MC_RING];
+        char c[24];
+        egl_mc_name_ctx(r.ctx, c, sizeof c);
+        const char *f = r.file ? strrchr(r.file, '/') : nullptr;
+        if (!f && r.file) f = strrchr(r.file, '\\');
+        fprintf(stderr, "[egl-mc] #%u -%.3fs host %llx %s tid=%u ctx=%s surf=%s "
+                "%s %s:%d\n", i, (now - r.ns) / 1e9, (unsigned long long)r.host,
+                r.pump ? "pump" : r.worker ? "worker" : "other", r.tid, c,
+                r.draw == EGL_NO_SURFACE ? "none"
+                    : r.draw == g_egl_surf ? "win" : "other",
+                r.ok ? "ok" : "FAILED", f ? f + 1 : (r.file ? r.file : "?"),
+                r.line);
+    }
+}
 /* Buffer bindings belong to an EGL context, not to the process.
  * GL_ARRAY_BUFFER is context state, but GL_ELEMENT_ARRAY_BUFFER is *vertex
  * array object* state: glBindVertexArray changes which element buffer is
@@ -12576,6 +12643,7 @@ static void egl_sync_current_context(uint32_t tid) {
                 "thread %llx, err=0x%x (bound here=0x%x)\n", tid, want, want_sh,
                 (unsigned long long)luna_os_thread_token(), (unsigned)err,
                 g_egl_bound_handle);
+    luna_egl_mc_dump("context re-bind refused");
 }
 
 /* Bind EGL for a host->guest entry (JNI callback, etc.). Prefer the calling
@@ -18584,6 +18652,7 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
                     g_current_tid, thread_name_of(g_current_tid), ctx_h, draw_h,
                     (unsigned long long)luna_os_thread_token(), (unsigned)err,
                     old_ctx_h, lr);
+        luna_egl_mc_dump("guest eglMakeCurrent refused");
     }
     if (ok) {
         /* An EGLContext may be current to at most one thread.  The host sees
