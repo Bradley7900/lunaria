@@ -66734,9 +66734,15 @@ static bool cb_wait_takes_signals(CbLockWait::Kind kind)
     return kind != CbLockWait::Idle;
 }
 
+/* Bumped every time a callback wait on this host thread ends, so the long-wait
+ * report below measures ONE wait. Before 17-11 it measured "same word, same
+ * kind" across waits, and a callback that took the guest heap lock thousands
+ * of times read as one 92-second wait on it (s57). */
+static thread_local uint64_t g_cbw_ended;
 static void cb_lock_wait_reset(void)
 {
     g_cb_lock_wait = {};
+    ++g_cbw_ended;
 }
 
 /* Attached Java threads have callback waits instead of ArmThread parks. A
@@ -67067,13 +67073,13 @@ static thread_local uint64_t g_cbw_m0, g_cbw_f0;
 static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
     static thread_local GuestVA seen_va;
     static thread_local uint8_t seen_kind;
-    static thread_local uint64_t since_ns, next_ns;
+    static thread_local uint64_t since_ns, next_ns, seen_ended;
     static std::atomic<int> reports{0};
     const GuestVA va = g_cb_lock_wait.kind == CbLockWait::Cond
                            ? g_cb_lock_wait.cond_va : g_cb_lock_wait.mva;
     const uint64_t now = host_mono_ns();
-    if (va != seen_va || g_cb_lock_wait.kind != seen_kind) {
-        seen_va = va; seen_kind = g_cb_lock_wait.kind;
+    if (va != seen_va || g_cb_lock_wait.kind != seen_kind || seen_ended != g_cbw_ended) {
+        seen_va = va; seen_kind = g_cb_lock_wait.kind; seen_ended = g_cbw_ended;
         if (g_lh.ctl) { g_cbw_m0 = g_lh.ctl->malloc_calls; g_cbw_f0 = g_lh.ctl->free_calls; }
         since_ns = now; next_ns = now + 5'000'000'000ull;
         return;
