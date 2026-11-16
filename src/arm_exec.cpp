@@ -12588,6 +12588,24 @@ static void egl_rebind_for_host_entry(void) {
         return;
     }
     if (g_egl_ctx != EGL_NO_CONTEXT) {
+        /* Only the pump may take the bootstrap context once the guest has a
+         * context of its own. Every Java thread that calls into native code
+         * comes through here; the first one bound the bootstrap context AND
+         * the window surface on its own host thread and never let go, and a
+         * surface current on one thread makes every other thread's
+         * eglMakeCurrent on it fail with EGL_BAD_ACCESS. On 4 cores that hit
+         * Unity's very first bind on its main thread (16-11, ldoe42 traces):
+         * the main thread then ran with no context, read every GL limit as 0
+         * and the version as ES 2.0, decided the GPU had no texture size,
+         * crashed, and hung in its crash handler before drawing a frame.
+         * LUNARIA_EGL_FALLBACK_ANY_THREAD=1 restores the old behaviour. */
+        static const bool any_thread = [] {
+            const char *e = lunaria_env("LUNARIA_EGL_FALLBACK_ANY_THREAD");
+            return e && *e && *e != '0';
+        }();
+        if (!any_thread && !g_egl_ctx_tab.empty() && g_ctx && g_ctx->is_arm64 &&
+            !g_a64_is_pump)
+            return;
         if (eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx))
             egl_note_bound(ARM_EGL_CONTEXT, g_egl_surf);
     }
