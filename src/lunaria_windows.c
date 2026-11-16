@@ -47,6 +47,32 @@ size_t luna_os_stack_remaining(void)
    return current >= low && current < high ? (size_t)(current - low) : SIZE_MAX;
 }
 
+/* Android file names may hold characters a Windows name cannot: Firebase
+ * Crashlytics keeps its files under ".crashlytics.files.v2:<package>", and
+ * every create below it failed with ERROR_INVALID_NAME, which reached the
+ * guest as EINVAL ("Invalid argument", ~60 times a session in 2 Player Games,
+ * Aloa 17-11). WSL and Cygwin store such a character as U+F000 plus its
+ * code; so does this, and readdir turns it back. A drive letter's colon and
+ * the long-path prefix are left as they are. */
+static int file_name_char_forbidden(wchar_t c)
+{
+   return c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' ||
+          c == L'>' || c == L'|';
+}
+static void file_wide_encode(wchar_t *w)
+{
+   size_t i = 0;
+   if (!wcsncmp(w, L"\\\\?\\", 4)) i = 4;
+   if (((w[i] | 0x20) >= L'a' && (w[i] | 0x20) <= L'z') && w[i + 1] == L':') i += 2;
+   for (; w[i]; ++i)
+      if (file_name_char_forbidden(w[i])) w[i] = (wchar_t)(0xF000 + w[i]);
+}
+static void file_wide_decode(wchar_t *w, int count)
+{
+   for (int i = 0; i < count; ++i)
+      if (w[i] >= 0xF000 && w[i] < 0xF080 && file_name_char_forbidden((wchar_t)(w[i] - 0xF000)))
+         w[i] = (wchar_t)(w[i] - 0xF000);
+}
 static wchar_t *luna_file_wide(const char *path);
 static SOCKET lookup(int fd);
 static SRWLOCK socket_lock = SRWLOCK_INIT;
@@ -1938,10 +1964,11 @@ static wchar_t *luna_file_wide(const char *path)
       if (full) {
          memcpy(full, L"\\\\?\\", 4 * sizeof *full);
          DWORD got = GetFullPathNameW(wide, need, full + 4, NULL);
-         if (got && got < need) { free(wide); return full; }
+         if (got && got < need) { free(wide); file_wide_encode(full); return full; }
          free(full);
       }
    }
+   file_wide_encode(wide);
    return wide;
 }
 /* RootDirectory keeps relative opens tied to the directory object even if
@@ -2299,6 +2326,7 @@ luna_directory_entry *luna_directory_read(luna_directory *directory)
    else directory->ready = 0;
    luna_directory_entry *entry = &directory->entry;
    int count = (int)(native->FileNameLength / sizeof(wchar_t));
+   file_wide_decode(native->FileName, count);
    int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, native->FileName, count,
                                    entry->d_name, sizeof entry->d_name - 1, NULL, NULL);
    if (!length) { errno = GetLastError() == ERROR_INSUFFICIENT_BUFFER ? ENAMETOOLONG : EILSEQ; return NULL; }

@@ -63462,16 +63462,40 @@ static const struct rt_field rt_context_wrapper_fields[] = {
    F_END
 };
 
+/* The process's real base context, set when the Application is bound. A
+ * ContextWrapper with no mBase NPEs on a device too, but a device never hands
+ * a game one: 2 Player Games (Aloa 17-11) asked an Application with no base
+ * for getSystemService about 100 times a session, and each failure went
+ * through Unity's exception path and Crashlytics, which is stutter. Such a
+ * wrapper borrows the bound base instead, and the first one says so. */
+static dvm_ref g_cw_fallback_base;
+static bool cw_base_or_fallback(struct dvm *vm, dvm_ref self, union dvm_value *base,
+                                const char *what)
+{
+   (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", base);
+   if (base->l) return true;
+   if (g_cw_fallback_base && g_cw_fallback_base != self) {
+      static int said;
+      if (said++ < 4) {
+         struct dvm_class *c = dvm_object_class(vm, self);
+         fprintf(stderr, "[context] %s on an unattached %s: using the application's "
+                 "base context%s
+", what, c && c->name ? c->name : "?",
+                 said == 4 ? " (further cases not reported)" : "");
+      }
+      base->l = g_cw_fallback_base;
+      return true;
+   }
+   dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
+   return false;
+}
+
 static bool cw_get_system_service(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
                                   union dvm_value *out)
 {
    union dvm_value base = { 0 };
-   (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", &base);
-   if (!base.l) {
-      dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
-      return false;
-   }
+   if (!cw_base_or_fallback(vm, self, &base, "getSystemService")) return false;
    struct dvm_method *get = dvm_find_method(vm, dvm_object_class(vm, base.l),
       "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
    return get && dvm_call(vm, get, base.l, args, nargs, out);
@@ -63485,11 +63509,7 @@ static bool cw_create_configuration(struct dvm *vm, dvm_ref self,
                                      union dvm_value *out)
 {
    union dvm_value base = { 0 };
-   (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", &base);
-   if (!base.l) {
-      dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
-      return false;
-   }
+   if (!cw_base_or_fallback(vm, self, &base, "createConfigurationContext")) return false;
    return am_vcall(vm, base.l, "createConfigurationContext",
       "(Landroid/content/res/Configuration;)Landroid/content/Context;",
       args, nargs, out);
@@ -63508,11 +63528,7 @@ static bool cw_theme(struct dvm *vm, dvm_ref self,
                      const union dvm_value *args, int nargs, union dvm_value *out)
 {
    union dvm_value base = {0};
-   (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", &base);
-   if (!base.l) {
-      dvm__throw(vm, "java/lang/NullPointerException", "unattached ContextWrapper");
-      return false;
-   }
+   if (!cw_base_or_fallback(vm, self, &base, "getTheme/setTheme")) return false;
    const char *name = nargs ? "setTheme" : "getTheme";
    const char *sig = nargs ? "(I)V" : "()Landroid/content/res/Resources$Theme;";
    struct dvm_method *method = dvm_find_method(vm, dvm_object_class(vm, base.l), name, sig);
@@ -68810,6 +68826,7 @@ bool dvm_bind_application(struct dvm *vm, dvm_ref base, dvm_ref application)
 {
    dvm_ref thread = activity_thread_object(vm);
    if (!thread || !base) return false;
+   g_cw_fallback_base = base;
    union dvm_value bound = {0};
    (void)dvm_get_field(vm, thread, "mBoundApplication",
                        "Landroid/app/ActivityThread$AppBindData;", &bound);
