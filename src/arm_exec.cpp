@@ -48115,8 +48115,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * services' ProviderInstaller) calls it through syscall(), and on
          * ENOSYS falls back to open("/dev/urandom"), which a Windows host does
          * not have -- it then perror()s and abort()s the calling thread. */
+        /* prctl (167) and clone (220) too: pairip (Google Play's anti-tamper,
+         * Shadow Fight Shades) calls prctl(PR_GET_DUMPABLE), prctl(PR_SET_PTRACER)
+         * and a bare fork through syscall(). Before 17-11 prctl fell to the
+         * default below and came back as 0xffffffff (a 32-bit -1 in a 64-bit
+         * long, so "dumpable = 4294967295"), and clone came back as a raw -38
+         * with no -1. The raw svc#0 handlers answer both properly. */
         if ((ctx.is_arm64 && (nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
-                              nr==131u || nr==134u || nr==135u || nr==278u)) ||
+                              nr==131u || nr==134u || nr==135u || nr==278u || nr==167u || nr==220u)) ||
             (!ctx.is_arm64 && (nr==95u || nr==133u || nr==207u || nr==3u || nr==4u || nr==6u || nr==184u ||
                                nr==90u || nr==91u || nr==125u || nr==192u ||
                                nr==37u || nr==174u || nr==175u || nr==268u || nr==384u))) {
@@ -48499,7 +48505,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         default:
             if (uint32_t eva = errno_va(ctx, g_current_tid))
                 ctx.mem.write32(eva, guest_errno_word(ENOSYS));
-            ret32(~0u);
+            if (ctx.is_arm64) {
+                /* A 64-bit long: ret32(~0u) would be 4294967295, not -1. */
+                static std::atomic<uint32_t> n_unk{0};
+                if (n_unk.fetch_add(1, std::memory_order_relaxed) < 16)
+                    fprintf(stderr, "[syscall] syscall(%u) is not handled; returning -1/ENOSYS "
+                            "(tid=%u)\n", nr, g_current_tid);
+                ret64(UINT64_MAX);
+            } else
+                ret32(~0u);
             break;
         }
         break;
@@ -66890,11 +66904,11 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
         static thread_local GuestVA heap_wait_va;
         static thread_local uint64_t heap_wait_since;
         bool stale = false;
+        static const uint64_t stale_ns = [] {
+            const char *e = getenv("LUNARIA_FUTEX_STALE_MS");
+            return (uint64_t)(e ? atoll(e) : 10) * 1'000'000ull;
+        }();
         if (!woken && !expired) {
-            static const uint64_t stale_ns = [] {
-                const char *e = getenv("LUNARIA_FUTEX_STALE_MS");
-                return (uint64_t)(e ? atoll(e) : 10) * 1'000'000ull;
-            }();
             /* The guest heap lock is the emulator's own (src/lib/guest.c), and
              * its lock loop re-exchanges after every return, so on that word
              * a wait with no wake for 50 ms just tries again whatever the word
