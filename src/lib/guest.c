@@ -190,7 +190,7 @@ int luna_guest_cxa_guard_finish(unsigned *guard)
 struct lh_tc {
    uint64_t tid;                  /* 0 empty, LH_TC_DEAD released */
    uint32_t bytes;                /* cached payload bytes */
-   uint32_t pad;
+   uint32_t busy;                 /* 1 while one thread works on the slot */
    uint16_t cnt[LH_TC_CLASSES];
    uint32_t top[LH_TC_CLASSES];   /* newest cached block of the class */
 };
@@ -431,40 +431,74 @@ static inline struct lh_tc *lh_tc_slot(struct lh_heap *h, bool create)
    return spare;
 }
 
+/* A thread's cache is used WITHOUT the heap lock (17-11): only its owner
+ * touches it, so the shared lock bought nothing but a queue.  On Aloa's
+ * 4-core PC every malloc and free of every thread took that one lock, and
+ * threads waited seconds behind each other on it (2 Player Games, LDoE).
+ * The slot's own flag keeps the rare second user out -- two host threads
+ * with one thread pointer, or the emulator draining a finished thread's
+ * cache -- and that user simply goes the locked way. Slot creation stays
+ * under the heap lock; a lookup racing it misses and also goes locked.
+ * Neighbours never look inside a cached block: it is neither allocated nor
+ * free to them, before, during and after the owner's change of its magic. */
+static inline bool lh_tc_grab(struct lh_tc *t)
+{
+   uint32_t expected = 0;
+   return __atomic_compare_exchange_n(&t->busy, &expected, 1u, 0,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+static inline void lh_tc_let(struct lh_tc *t)
+{
+   __atomic_store_n(&t->busy, 0u, __ATOMIC_RELEASE);
+}
+
+static inline uint32_t lh_heap_top(const struct lh_heap *h)
+{
+   return __atomic_load_n(&h->ctl->ptr, __ATOMIC_RELAXED);
+}
+
 /* The newest cached block of exactly `size`, or 0.  A chain whose header was
  * overwritten is abandoned rather than followed. */
 static inline uint32_t lh_tc_take(struct lh_heap *h, uint32_t size)
 {
    struct lh_tc *t = lh_tc_slot(h, false);
    const uint32_t k = size / LH_ALIGN;
-   if (!t || !t->cnt[k]) return 0;
+   if (!t || !t->cnt[k] || !lh_tc_grab(t)) return 0;
    const uint32_t va = t->top[k];
-   if (va < h->ctl->start + LH_HDR || va >= h->ctl->ptr ||
+   if (!t->cnt[k]) { lh_tc_let(t); return 0; }
+   if (va < h->ctl->start + LH_HDR || va >= lh_heap_top(h) ||
        lh_r32(h, va - 4u) != LH_CACHED_MAGIC || lh_r32(h, va - LH_HDR) != size) {
       const uint32_t lost = (uint32_t)t->cnt[k] * size;
       t->bytes = t->bytes > lost ? t->bytes - lost : 0u;
       t->cnt[k] = 0;
       t->top[k] = 0;
+      lh_tc_let(t);
       return 0;
    }
    t->top[k] = lh_r32(h, va - LH_HDR + 8u);
    --t->cnt[k];
    t->bytes -= size;
    lh_w32(h, va - 4u, LH_ALLOC_MAGIC);
+   lh_tc_let(t);
    return va;
 }
 
-static inline bool lh_tc_put(struct lh_heap *h, uint32_t va, uint32_t size)
+/* `create` only with the heap lock held. */
+static inline bool lh_tc_put(struct lh_heap *h, uint32_t va, uint32_t size, bool create)
 {
    if (size > LH_SMALL_MAX) return false;
-   struct lh_tc *t = lh_tc_slot(h, true);
+   struct lh_tc *t = lh_tc_slot(h, create);
    const uint32_t k = size / LH_ALIGN;
    if (!t || t->cnt[k] >= LH_TC_CAP || t->bytes + size > LH_TC_BYTES) return false;
+   if (!lh_tc_grab(t)) return false;
+   if (t->cnt[k] >= LH_TC_CAP || t->bytes + size > LH_TC_BYTES) { lh_tc_let(t); return false; }
    lh_w32(h, va - LH_HDR + 8u, t->top[k]);
    lh_w32(h, va - 4u, LH_CACHED_MAGIC);
    t->top[k] = va;
    ++t->cnt[k];
    t->bytes += size;
+   lh_tc_let(t);
    return true;
 }
 
@@ -473,6 +507,9 @@ static inline void lh_tc_drop(struct lh_heap *h)
 {
    struct lh_tc *t = lh_tc_slot(h, false);
    if (!t) return;
+   unsigned spins = 0;
+   while (!lh_tc_grab(t))
+      if (++spins > 100000u) return;   /* still in use: leave it be */
    for (uint32_t k = 1; k < LH_TC_CLASSES; ++k) {
       while (t->cnt[k]) {
          const uint32_t va = t->top[k];
@@ -484,6 +521,7 @@ static inline void lh_tc_drop(struct lh_heap *h)
       }
    }
    t->tid = LH_TC_DEAD;
+   lh_tc_let(t);
 }
 
 /* `zeroed` reports memory that has never been handed out before. */
@@ -548,7 +586,7 @@ static inline void lh_free(struct lh_heap *h, uint32_t va)
    if (size < LH_MIN || (size & (LH_ALIGN - 1u)) ||
        (uint64_t)va + size > c->ptr) return;        /* corrupt */
    ++c->free_calls;
-   if (lh_tc_put(h, va, size)) return;
+   if (lh_tc_put(h, va, size, true)) return;
    lh_release(h, va, size);
 }
 
@@ -755,6 +793,14 @@ void *malloc(size_t n)
    struct lh_heap h;
    uint32_t size;
    if (!heap_get(&h) || !lh_size32(n, &size)) { set_errno(ENOMEM); return 0; }
+   if (size <= LH_SMALL_MAX) {        /* own cache, no shared lock */
+      const uint32_t hit = lh_tc_take(&h, lh_align(size ? size : 1u));
+      if (hit) {
+         ++h.ctl->malloc_calls;        /* racy statistics, as before */
+         ++h.ctl->malloc_reused;
+         return to_ptr(&h, hit);
+      }
+   }
    heap_lock(h.ctl);
    const uint32_t off = lh_malloc(&h, size, (bool *)0);
    heap_unlock(h.ctl);
@@ -769,6 +815,15 @@ void free(void *p)
    if (!p || !heap_get(&h)) return;
    const uint32_t off = to_off(&h, p);
    if (!off) return;
+   if (off >= h.ctl->start + LH_HDR && off < lh_heap_top(&h) &&
+       lh_r32(&h, off - 4u) == LH_ALLOC_MAGIC) {   /* own cache, no shared lock */
+      const uint32_t size = lh_r32(&h, off - LH_HDR);
+      if (size >= LH_MIN && !(size & (LH_ALIGN - 1u)) &&
+          (uint64_t)off + size <= lh_heap_top(&h) && lh_tc_put(&h, off, size, false)) {
+         ++h.ctl->free_calls;
+         return;
+      }
+   }
    heap_lock(h.ctl);
    lh_free(&h, off);
    heap_unlock(h.ctl);
