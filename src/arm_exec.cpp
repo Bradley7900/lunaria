@@ -17162,6 +17162,24 @@ static bool g_slide_active = false;
 static float g_slide_x, g_slide_y;
 static long long g_slide_until;
 static bool g_slide_overlay = false;   /* the slide is driving the overlay's pointer */
+/* Where the wheel wants the finger. The finger glides there over a few frames
+ * instead of jumping: a whole notch (80 px) in one move reads to a Unity
+ * ScrollRect or a camera as a velocity spike followed by a dead stop, which
+ * Aloa described as wheel scrolling being "so bad and hard" (17-11). */
+static float g_slide_tx, g_slide_ty;
+static void slide_step() {
+    if (!g_slide_active) return;
+    float ddx = g_slide_tx - g_slide_x, ddy = g_slide_ty - g_slide_y;
+    const float d = std::sqrt(ddx * ddx + ddy * ddy);
+    if (d < 0.5f) return;
+    const float most = 22.f;   /* px per frame: a notch takes about 4 frames */
+    if (d > most) { ddx *= most / d; ddy *= most / d; }
+    g_slide_x += ddx;
+    g_slide_y += ddy;
+    if (g_slide_overlay) luna_overlay_pointer(g_slide_x, g_slide_y, -1);
+    else touch_contact(29, 2, g_slide_x, g_slide_y);
+    g_slide_until = std::max<long long>(g_slide_until, (long long)touch_now_ms() + 120);
+}
 static void slide_finish() {
     if (!g_slide_active) return;
     if (g_slide_overlay) luna_overlay_pointer(g_slide_x, g_slide_y, 0);
@@ -17171,7 +17189,11 @@ static void slide_finish() {
 }
 static void pinch_poll() {
     if (g_pinch_active && touch_now_ms() >= g_pinch_until) pinch_finish();
-    if (g_slide_active && touch_now_ms() >= g_slide_until) slide_finish();
+    slide_step();
+    if (g_slide_active && touch_now_ms() >= g_slide_until &&
+        std::fabs(g_slide_tx - g_slide_x) < 0.5f &&
+        std::fabs(g_slide_ty - g_slide_y) < 0.5f)
+        slide_finish();
 }
 
 static void glfw_window_close_cb(GLFWwindow *w) {
@@ -17225,7 +17247,7 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
             dx = -dy;
             dy = 0;
         }
-        double cx = g_slide_x, cy = g_slide_y;
+        double cx = g_slide_tx, cy = g_slide_ty;
         if (!g_slide_active) {
             glfwGetCursorPos(w, &cx, &cy);
             window_to_surface(&cx, &cy);
@@ -17239,9 +17261,14 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
         const float step = 80.f;   /* pixels of finger travel per wheel notch */
         float nx = (float)cx + (float)dx * step * -1.f;
         float ny = (float)cy + (float)dy * step;
-        /* Out of room: lift and put the finger down again where it is. */
-        if (g_slide_active && (nx < 8 || ny < 8 || nx > sw - 8 || ny > sh - 8))
+        /* Out of room: lift, and put the finger down again at the pointer, so
+         * a long scroll in one direction does not lift on every notch at the
+         * edge it has reached. */
+        if (g_slide_active && (nx < 8 || ny < 8 || nx > sw - 8 || ny > sh - 8)) {
             slide_finish();
+            glfwGetCursorPos(w, &cx, &cy);
+            window_to_surface(&cx, &cy);
+        }
         if (!g_slide_active) {
             cx = std::min<double>(std::max<double>(cx, 8), sw - 8);
             cy = std::min<double>(std::max<double>(cy, 8), sh - 8);
@@ -17250,17 +17277,16 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
              * route the slide by acceptance, not document visibility. */
             g_slide_overlay = luna_overlay_pointer(cx, cy, 1);
             if (!g_slide_overlay) touch_contact(29, 0, (float)cx, (float)cy);
-            g_slide_x = (float)cx;
-            g_slide_y = (float)cy;
+            g_slide_x = g_slide_tx = (float)cx;
+            g_slide_y = g_slide_ty = (float)cy;
             g_slide_active = true;
             nx = g_slide_x + (float)dx * step * -1.f;
             ny = g_slide_y + (float)dy * step;
         }
-        g_slide_x = std::min(std::max(nx, 4.f), (float)sw - 4.f);
-        g_slide_y = std::min(std::max(ny, 4.f), (float)sh - 4.f);
-        if (g_slide_overlay) luna_overlay_pointer(g_slide_x, g_slide_y, -1);
-        else touch_contact(29, 2, g_slide_x, g_slide_y);
+        g_slide_tx = std::min(std::max(nx, 4.f), (float)sw - 4.f);
+        g_slide_ty = std::min(std::max(ny, 4.f), (float)sh - 4.f);
         g_slide_until = touch_now_ms() + 120;
+        slide_step();
         return;
     }
     if (!std::isfinite(dy) || dy == 0 || (!g_pinch_active && g_touch_state.count) ||
