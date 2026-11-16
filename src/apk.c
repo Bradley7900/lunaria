@@ -434,6 +434,50 @@ static unsigned char *zip_memory(struct zip *z, const char *name, size_t *size)
    *size = (size_t)e->size;
    return data;
 }
+/* A tree that was fully checked or extracted once carries a stamp with the
+ * archive's entry count and expanded size.  The tree's directory is named
+ * after the archive's content, so the same stamp means the same archive;
+ * later starts look at the stamp and a few sample files instead of every
+ * file.  Play services' tree is 9720 files, and it was walked on every one
+ * of its starts -- seconds of stat() on Aloa's HDD each time (17-11).
+ * A missing sample, or LUNARIA_FULL_CHECK=1, falls back to the full walk. */
+static void zip_stamp_name(char *out, size_t cap, const char *root)
+{
+   if (path_join(out, cap, root, ".lunaria-complete")) out[0] = 0;
+}
+static bool zip_stamp_ok(struct zip *z, const char *root, uint64_t total)
+{
+   if (getenv("LUNARIA_FULL_CHECK") && *getenv("LUNARIA_FULL_CHECK") == '1') return false;
+   char stamp[APK_PATH];
+   zip_stamp_name(stamp, sizeof stamp, root);
+   if (!stamp[0]) return false;
+   FILE *f = open_file(stamp, "rb");
+   if (!f) return false;
+   unsigned long long count = 0, bytes = 0;
+   const int got = fscanf(f, "%llu %llu", &count, &bytes);
+   fclose(f);
+   if (got != 2 || count != (unsigned long long)z->count || bytes != (unsigned long long)total)
+      return false;
+   /* Up to 16 files spread over the archive must still be there. */
+   const size_t step = z->count / 16 + 1;
+   for (size_t i = 0; i < z->count; i += step) {
+      const struct zip_entry *e = z->entries + i;
+      if (!e->name[0] || e->name[strlen(e->name) - 1] == '/' || !entry_safe(e->name)) continue;
+      char path[APK_PATH];
+      if (path_join(path, sizeof path, root, e->name) || !exists(path)) return false;
+   }
+   return true;
+}
+static void zip_stamp_write(struct zip *z, const char *root, uint64_t total)
+{
+   char stamp[APK_PATH];
+   zip_stamp_name(stamp, sizeof stamp, root);
+   if (!stamp[0]) return;
+   FILE *f = open_file(stamp, "wb");
+   if (!f) return;
+   fprintf(f, "%llu %llu", (unsigned long long)z->count, (unsigned long long)total);
+   fclose(f);
+}
 static int zip_extract(struct zip *z, const char *root, bool overwrite)
 {
    if (mkdirs(root))
@@ -443,6 +487,11 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
       if (UINT64_MAX - progress.total < z->entries[i].size)
          return apk_error("archive expanded size is too large");
       progress.total += z->entries[i].size;
+   }
+   if (!overwrite && zip_stamp_ok(z, root, progress.total)) {
+      fprintf(stderr, "[apk] cached files complete (stamp + samples, %zu files): %s\n",
+              progress.count, root);
+      return 0;
    }
    luna_launcher_progress(overwrite ? "Extracting archive" : "Checking installed files", root, 0, progress.total);
    fprintf(stderr, "[apk] %s: %s (%.1f MiB, %zu files)\n",
@@ -493,6 +542,7 @@ static int zip_extract(struct zip *z, const char *root, bool overwrite)
    }
    progress.name = "done";
    extraction_report(&progress, true);
+   zip_stamp_write(z, root, progress.total);
    return 0;
 }
 /* A growable NUL-terminated string.  Manifest metadata has no useful fixed
