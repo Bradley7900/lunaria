@@ -12541,8 +12541,23 @@ static void egl_sync_current_context(uint32_t tid) {
      * driver every slice (118k/s in this title) is the cost of not keeping one. */
     if (g_egl_bound_handle == want && g_egl_bound_surf == want_s)
         return;
-    if (eglMakeCurrent(g_egl_dpy, want_s, want_s, ectx))
+    if (eglMakeCurrent(g_egl_dpy, want_s, want_s, ectx)) {
         egl_note_bound(want, want_s);
+        return;
+    }
+    /* A context is current to at most one host thread. If the guest thread's
+     * context is still current on the host thread it last ran on, this fails
+     * with EGL_BAD_ACCESS and every GL call that follows runs with no context:
+     * glGetIntegerv answers 0, the version reads as ES 2.0, and Unity decides
+     * the GPU supports no texture size at all, then crashes (the 4-core
+     * startup hang, 16-11). It used to fail without a word. */
+    const EGLint err = eglGetError();
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) < 32)
+        fprintf(stderr, "[egl] sync FAILED: tid=%u wants ctx=0x%x surf=0x%x on host "
+                "thread %llx, err=0x%x (bound here=0x%x)\n", tid, want, want_sh,
+                (unsigned long long)luna_os_thread_token(), (unsigned)err,
+                g_egl_bound_handle);
 }
 
 /* Bind EGL for a host->guest entry (JNI callback, etc.). Prefer the calling
@@ -18503,6 +18518,16 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
     }
     EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
         ? eglMakeCurrent(g_egl_dpy, draw, read_s, ectx) : EGL_FALSE;
+    if (!ok) {
+        const EGLint err = eglGetError();
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 32)
+            fprintf(stderr, "[egl] guest eglMakeCurrent FAILED: tid=%u (%s) ctx=0x%x "
+                    "draw=0x%x on host thread %llx, err=0x%x, was ctx=0x%x lr=0x%08x\n",
+                    g_current_tid, thread_name_of(g_current_tid), ctx_h, draw_h,
+                    (unsigned long long)luna_os_thread_token(), (unsigned)err,
+                    old_ctx_h, lr);
+    }
     if (ok) {
         /* An EGLContext may be current to at most one thread.  The host sees
          * all guest threads on the pump thread, so eglMakeCurrent alone
