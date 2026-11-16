@@ -66665,6 +66665,31 @@ static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
      * the holder's TPIDR_EL0; say who that is and what it is doing. A holder
      * stopped by the GC inside malloc, or parked, is the whole answer. */
     if (g_lh.ctl && va == a64_guest_va(HEAP_BASE + 8u)) {
+        /* ldoe48 answered "owner 0" with the word at 2: either nobody holds it
+         * and a wake was lost, or the holder took it and stopped before
+         * writing its name (a slice end delivers signals, and Boehm parks the
+         * thread right there). Progress tells them apart: malloc and free
+         * calls still counting = the lock changes hands and this waiter is
+         * not woken; standing still = it is held. */
+        static uint64_t seen_m, seen_f;
+        const uint64_t m = g_lh.ctl->malloc_calls, f = g_lh.ctl->free_calls;
+        fprintf(stderr, "[cbwait]   heap: malloc_calls=%llu (+%llu since last report) "
+                "free_calls=%llu (+%llu) contended=%llu\n",
+                (unsigned long long)m, (unsigned long long)(m - seen_m),
+                (unsigned long long)f, (unsigned long long)(f - seen_f),
+                (unsigned long long)g_lh.ctl->contended);
+        seen_m = m; seen_f = f;
+        for (auto &t : g_threads) {
+            if (t.finished || !(t.signal_depth || t.pending_signals ||
+                                t.waiting_futex == va))
+                continue;
+            fprintf(stderr, "[cbwait]   tid=%u (%s) in-signal-handler=%u pending=0x%llx "
+                    "running=%d futex=0x%llx sigsuspend-ish sleep=%d pc=0x%llx lr=0x%llx\n",
+                    t.id, thread_name_of(t.id), (unsigned)t.signal_depth,
+                    (unsigned long long)t.pending_signals, (int)t.running,
+                    (unsigned long long)t.waiting_futex, (int)(t.sleep_until_ns != 0),
+                    (unsigned long long)t.pc64, (unsigned long long)t.lr64);
+        }
         const uint64_t owner = g_lh.ctl->owner;
         const ArmThread *h = nullptr;
         for (auto &t : g_threads)
