@@ -12603,11 +12603,24 @@ static void egl_rebind_for_host_entry(void) {
             const char *e = lunaria_env("LUNARIA_EGL_FALLBACK_ANY_THREAD");
             return e && *e && *e != '0';
         }();
-        if (!any_thread && !g_egl_ctx_tab.empty() && g_ctx && g_ctx->is_arm64 &&
-            !g_a64_is_pump)
+        /* Not only after the guest has a context: ldoe43 still hung once in
+         * six, with Unity's main thread on the pump and its bind refused all
+         * the same, so the surface had been taken by a Java thread's entry
+         * BEFORE the game created its context. Nothing on a non-pump host
+         * thread draws with the bootstrap context. */
+        if (!any_thread && g_ctx && g_ctx->is_arm64 && !g_a64_is_pump)
             return;
-        if (eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx))
+        if (eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx)) {
             egl_note_bound(ARM_EGL_CONTEXT, g_egl_surf);
+            if (!g_a64_is_pump) {
+                static std::atomic<int> said{0};
+                if (said.fetch_add(1, std::memory_order_relaxed) < 16)
+                    fprintf(stderr, "[egl] bootstrap context + window surface taken "
+                            "by non-pump host thread %llx (tid=%u %s)\n",
+                            (unsigned long long)luna_os_thread_token(),
+                            g_current_tid, thread_name_of(g_current_tid));
+            }
+        }
     }
 }
 
@@ -12634,6 +12647,14 @@ static void egl_ensure_window_surface_current(void) {
         if (h) {
             g_egl_tid_surf[g_current_tid] = ARM_EGL_SURFACE;
             egl_note_bound(h, g_egl_surf);
+        } else if (!g_a64_is_pump) {
+            /* Same hazard as the host-entry fallback: the bootstrap context
+             * and the window surface now belong to this host thread. */
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1, std::memory_order_relaxed) < 16)
+                fprintf(stderr, "[egl] ensure-window bound the bootstrap context on "
+                        "non-pump host thread %llx (tid=%u)\n",
+                        (unsigned long long)luna_os_thread_token(), g_current_tid);
         }
         static int n = 0;
         if (n++ < 12)
