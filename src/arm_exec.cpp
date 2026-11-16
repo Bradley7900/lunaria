@@ -23045,6 +23045,15 @@ static const char *map_guest_path(const char *path,char *buf,size_t capacity)
     (void)registered;
     if (!path) { errno=EFAULT; return nullptr; }
     if (!*path || path_is_host_staging(path)) return map_guest_path_raw(path,buf,capacity);
+#ifdef _WIN32
+    /* A host drive path of ours that Java made "absolute" against user.dir
+     * "/" ("/C:/.../files/x") is still ours, not a guest path to confine
+     * under device-root (Play services' module config, 17-11). Only staged
+     * roots pass; any other drive path stays confined. */
+    if (path[0]=='/' && isalpha((unsigned char)path[1]) && path[2]==':' &&
+        (path[3]=='/' || path[3]=='\\') && path_is_host_staging(path+1))
+        return map_guest_path_raw(path+1,buf,capacity);
+#endif
     char apk_host[PATH_MAX];const char *apk_inner=nullptr;
     if (apk_path_locate(path,apk_host,sizeof apk_host,&apk_inner)) return map_guest_path_raw(path,buf,capacity);
     char absolute[PATH_MAX],resolved[PATH_MAX];
@@ -33856,7 +33865,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             luna_file_mkdir(path, 0755);
             jobject file = jvm->native.AllocObject(env,
                 jvm->native.FindClass(env, "java/io/File"));
-            jni_file_set_path(file, path);
+            /* Guest spelling, as getFilesDir() publishes (see jni_stubs.c getDir). */
+            char guest_dir[PATH_MAX];
+            const char *published = arm_exec_unmap_host_path(path, guest_dir, sizeof guest_dir);
+            jni_file_set_path(file, published ? published : path);
             fprintf(stderr, "[arm_jni] getDir(\"%s\") -> %s (0x%x)\n",
                     utf ? utf : "", path, (uint32_t)(uintptr_t)file);
             if (utf)

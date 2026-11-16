@@ -1477,7 +1477,14 @@ android_content_Context_getDir(JNIEnv *env, jobject object, va_list args)
    snprintf(path, sizeof path, "%s/app_%s", base, namebuf);
    luna_file_mkdir(path, 0755);
    jobject file = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
-   jni_file_set_path(file, path);
+   /* Java gets the guest spelling, as getFilesDir() does.  The raw host
+    * path ("C:/...") is relative to Java on Windows, so it was confined a
+    * second time under device-root: Play services' getDir("chimera") module
+    * config never saved, it re-ran its module update and killed itself on
+    * every boot (5 restarts per LDoE run on Aloa's PC, 17-11). */
+   char guest[PATH_MAX];
+   const char *published = arm_exec_unmap_host_path(path, guest, sizeof guest);
+   jni_file_set_path(file, published ? published : path);
    return file;
 }
 
