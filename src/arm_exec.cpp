@@ -12753,6 +12753,34 @@ extern "C" void arm_exec_egl_note_current(void *egl_ctx, void *egl_draw) {
     egl_note_bound(h, surf);
 }
 
+/* A guest context another host thread must give up (see the sync failure
+ * below). One slot: two contexts contended at once just take turns. */
+static std::atomic<uint32_t> g_egl_ctx_release_req{0};
+static void egl_request_ctx_release(uint32_t h) {
+    g_egl_ctx_release_req.store(h, std::memory_order_release);
+}
+/* Called at SVC entry. Cheap unless a release is pending: then, if this host
+ * thread holds that context and the guest thread running here no longer owns
+ * it in the ledger, unbind. */
+static void egl_poll_ctx_release(void) {
+    const uint32_t h = g_egl_ctx_release_req.load(std::memory_order_acquire);
+    if (!h || g_egl_bound_handle != h || g_egl_dpy == EGL_NO_DISPLAY) return;
+    {
+        ArmLockGuard locked;
+        auto it = g_egl_tid_ctx.find(g_current_tid);
+        if (it != g_egl_tid_ctx.end() && it->second == h) return;   /* still ours */
+    }
+    eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    egl_note_bound(0u, EGL_NO_SURFACE);
+    uint32_t expect = h;
+    g_egl_ctx_release_req.compare_exchange_strong(expect, 0u);
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) < 16)
+        fprintf(stderr, "[egl] host thread %llx (tid=%u) released ctx=0x%x: a newer "
+                "guest eglMakeCurrent gave it to another thread\n",
+                (unsigned long long)luna_os_thread_token(), g_current_tid, h);
+}
+
 // Re-point the single host binding at whichever context the guest thread that is about to run had made current.
 static void egl_sync_current_context(uint32_t tid) {
     if (g_egl_tid_ctx.empty() || g_egl_dpy == EGL_NO_DISPLAY) return;
@@ -12778,6 +12806,15 @@ static void egl_sync_current_context(uint32_t tid) {
      * the GPU supports no texture size at all, then crashes (the 4-core
      * startup hang, 16-11). It used to fail without a word. */
     const EGLint err = eglGetError();
+    /* The guest ledger already moved the context to this thread (the newer
+     * eglMakeCurrent evicted the old owner), but the host thread the old owner
+     * runs on still has it current, and keeps it while that thread lives inside
+     * a callback. Unity's main thread (a JNI callback) and its render thread
+     * pass one context between them; with the main thread holding it on the
+     * host, every render-thread GL call ran with no context and LDoE's shaders
+     * failed to link (37x "GLSL link failed" in Aloa's log, 17-11). Ask the
+     * holder to let go at its next SVC; this sync retries on the next slice. */
+    if (err == EGL_BAD_ACCESS) egl_request_ctx_release(want);
     static std::atomic<int> said{0};
     if (said.fetch_add(1, std::memory_order_relaxed) < 32)
         fprintf(stderr, "[egl] sync FAILED: tid=%u wants ctx=0x%x surf=0x%x on host "
@@ -64117,6 +64154,7 @@ public:
          * normalises it into the A32 numbering the dispatcher switches on. */
         svc_ring_record(svc_no, (uint32_t)x30, (uint32_t)x0,
                         svc_no ? 0u : (uint32_t)jit64->GetRegister(8));
+        egl_poll_ctx_release();
 
         /* Detect loss of a TLS copy held in x23 (libyuanshen SSP prologue:
          * `mrs x23,tpidr_el0`).  Most frames never put TLS in x23; logging

@@ -63554,8 +63554,7 @@ static bool cw_base_or_fallback(struct dvm *vm, dvm_ref self, union dvm_value *b
       if (said++ < 4) {
          struct dvm_class *c = dvm_object_class(vm, self);
          fprintf(stderr, "[context] %s on an unattached %s: using the application's "
-                 "base context%s
-", what, c && c->name ? c->name : "?",
+                 "base context%s\n", what, c && c->name ? c->name : "?",
                  said == 4 ? " (further cases not reported)" : "");
       }
       base->l = g_cw_fallback_base;
