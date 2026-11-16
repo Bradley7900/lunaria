@@ -10211,9 +10211,55 @@ static bool cb_futex_starving(GuestVA uaddr)
     return false;
 }
 
+/* Giving a starving callback the WAKE is not enough on the guest heap lock.
+ * The callback reacts in milliseconds (its host thread polls, and often is
+ * running other guest threads when the wake lands); the threads hammering
+ * malloc re-take the free word in microseconds, so by the time the callback
+ * runs its exchange the lock is held again, and it waits again. s55-1: 24
+ * fair wakes on other words, the heap waiter still 7.8 s and +259,000
+ * mallocs. So on this one word, whose protocol is known (src/lib/guest.c:
+ * 0 free, 1 held, 2 held with waiters), the wake also RESERVES the lock for
+ * the callback: 0 -> 1 right after the unlocker's exchange, so newcomers see
+ * it held and queue. When the callback consumes its token it puts the word
+ * back to 0 and its own exchange, microseconds later, takes it. A reservation
+ * nobody collects in 100 ms is released (and its waiters woken) so a callback
+ * that went away cannot hold the heap. Under the execution lock. */
+static bool     g_heap_reserved = false;
+static uint64_t g_heap_reserved_ns = 0;
+static uint64_t g_heap_handoffs = 0;
+static bool heap_word_va(GuestVA a) {
+    return g_lh.ctl && a == a64_guest_va(HEAP_BASE + 8u);
+}
+static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake);
+static void heap_reserve_expire(void) {
+    if (!g_heap_reserved || host_mono_ns() - g_heap_reserved_ns < 100'000'000ull) return;
+    g_heap_reserved = false;
+    const uint32_t old = __atomic_exchange_n(&g_lh.ctl->state, 0u, __ATOMIC_SEQ_CST);
+    static int said;
+    if (said++ < 8)
+        fprintf(stderr, "[heap-handoff] reservation not collected in 100 ms; released "
+                "(word was %u)\n", old);
+    if (old == 2u) (void)futex_publish_wake(a64_guest_va(HEAP_BASE + 8u), 1u);
+}
+/* The callback's side: its WAKE token was consumed. */
+static void heap_reserve_collect(GuestVA uaddr) {
+    if (!g_heap_reserved || !heap_word_va(uaddr)) return;
+    g_heap_reserved = false;
+    /* 1 = reserved, nobody queued since; 2 = others queued behind it, and the
+     * callback's exchange writes 2 back, so its unlock still wakes them. */
+    (void)__atomic_exchange_n(&g_lh.ctl->state, 0u, __ATOMIC_SEQ_CST);
+    ++g_heap_handoffs;
+    if (g_heap_handoffs <= 8 || (g_heap_handoffs & (g_heap_handoffs - 1)) == 0)
+        fprintf(stderr, "[heap-handoff] guest heap lock handed to a starving callback "
+                "(tid=%u) after %.1f ms reserved (%llu so far)\n", g_current_tid,
+                (host_mono_ns() - g_heap_reserved_ns) / 1e6,
+                (unsigned long long)g_heap_handoffs);
+}
+
 static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
 {
     if (!uaddr || !max_wake) return 0;
+    heap_reserve_expire();
     const auto active = g_futex_wait_addrs.find(uaddr);
     if (active == g_futex_wait_addrs.end() || active->second == 0u)
         return 0;
@@ -10226,8 +10272,16 @@ static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
     const uint32_t wake_count = std::min(max_wake, eligible);
     if (!wake_count) return 0;
     g_futex_wake_tokens[uaddr] += wake_count;
-    if (!cb_futex_starving(uaddr))
+    if (!cb_futex_starving(uaddr)) {
         (void)futex_wake_parked(uaddr, wake_count);
+    } else if (!g_heap_reserved && heap_word_va(uaddr)) {
+        uint32_t expect = 0u;
+        if (__atomic_compare_exchange_n(&g_lh.ctl->state, &expect, 1u, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            g_heap_reserved = true;
+            g_heap_reserved_ns = host_mono_ns();
+        }
+    }
     /* Callback waiters have no schedulable ArmThread to publish as ready. */
     sched_pass_notify();
     return wake_count;
@@ -66743,6 +66797,7 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
      * that lock with guest SVCs.  Keep the check and grant atomic with their
      * updates, including when this callback was entered with the lock held. */
     ArmLockGuard wait_locked;
+    heap_reserve_expire();
     if (g_cb_lock_wait.kind == CbLockWait::Idle) return true;
     /* A sleep owns no word: the only condition is its deadline. */
     if(g_cb_lock_wait.kind==CbLockWait::RetrySleep){
@@ -66832,16 +66887,43 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
          * LUNARIA_FUTEX_STALE_MS=0 turns this off. */
         static thread_local GuestVA stale_va;
         static thread_local uint64_t stale_since;
+        static thread_local GuestVA heap_wait_va;
+        static thread_local uint64_t heap_wait_since;
         bool stale = false;
         if (!woken && !expired) {
             static const uint64_t stale_ns = [] {
                 const char *e = getenv("LUNARIA_FUTEX_STALE_MS");
                 return (uint64_t)(e ? atoll(e) : 10) * 1'000'000ull;
             }();
-            if (!stale_ns || guest_word_load(ctx.mem, mva) == g_cb_lock_wait.futex_expected) {
+            /* The guest heap lock is the emulator's own (src/lib/guest.c), and
+             * its lock loop re-exchanges after every return, so on that word
+             * a wait with no wake for 50 ms just tries again whatever the word
+             * says. s55-1: the slow path was entered 82 times in the whole run,
+             * so the word sat at 0 between hundreds of thousands of fast-path
+             * cycles, and the one wake the waiter needed never arrived. */
+            if (heap_word_va(mva)) {
+                const uint64_t now = host_mono_ns();
+                if (heap_wait_va != mva) { heap_wait_va = mva; heap_wait_since = now; }
+                else if (now - heap_wait_since >= 50'000'000ull) {
+                    heap_wait_va = 0;
+                    static std::atomic<uint32_t> n_retry{0};
+                    const uint32_t n = n_retry.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 8 || (n & (n - 1)) == 0)
+                        fprintf(stderr, "[heap-retry] callback tid=%u: no wake on the guest "
+                                "heap lock in 50 ms (word=%u); retrying the exchange (%u so far)\n",
+                                g_current_tid, guest_word_load(ctx.mem, mva), n);
+                    stale = true;
+                }
+            }
+            if (!stale && (!stale_ns ||
+                           guest_word_load(ctx.mem, mva) == g_cb_lock_wait.futex_expected)) {
                 stale_va = 0;
                 return false;
             }
+        }
+        if (stale) {
+            /* heap retry: fall through to the wake path */
+        } else if (!woken && !expired) {
             const uint64_t now = host_mono_ns();
             if (stale_va != mva) { stale_va = mva; stale_since = now; return false; }
             if (now - stale_since < stale_ns) return false;
@@ -66858,6 +66940,8 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
                         mva == a64_guest_va(HEAP_BASE + 8u) ? " [guest heap lock]" : "");
         }
         stale_va = 0;
+        heap_wait_va = 0;
+        if (woken) heap_reserve_collect(mva);
         if (stale) woken = true;
         futex_wait_addr_remove(mva);
         if (woken)
