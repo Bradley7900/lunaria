@@ -12338,6 +12338,14 @@ static void join_wake_on_target_exit(ArmExecCtx &ctx, uint32_t target_tid)
  * bind because the other thread has the same guest context current. */
 static thread_local uint32_t g_egl_bound_handle = 0u;
 static thread_local EGLSurface g_egl_bound_surf = EGL_NO_SURFACE;
+/* True on the host threads the A64 engine pool dispatches slices to.  They run
+ * guest code but never the scheduler itself. */
+static thread_local bool g_a64_is_worker = false;
+/* The host thread that drives the frame pump. It owns the GL context, so it
+ * is the only thread allowed to run a guest thread that has touched GL. "Not
+ * a worker" is not the same test: every dvm bytecode thread also passes it,
+ * and each one that ran a slice would build an engine of its own. */
+static thread_local bool g_a64_is_pump = false;
 /* Buffer bindings belong to an EGL context, not to the process.
  * GL_ARRAY_BUFFER is context state, but GL_ELEMENT_ARRAY_BUFFER is *vertex
  * array object* state: glBindVertexArray changes which element buffer is
@@ -12477,10 +12485,20 @@ static EGLSurface egl_host_surf(uint32_t handle) {
 
 static void egl_note_bound(uint32_t handle, EGLSurface surf) {
     if (handle != g_egl_bound_handle && lunaria_env("LUNARIA_TRACE_EGL")) {
-        static int n = 0;
-        if (n++ < 64)
-            fprintf(stderr, "[egl] host binding 0x%x -> 0x%x (tid=%u)\n",
-                    g_egl_bound_handle, handle, g_current_tid);
+        /* The bootstrap context is re-bound on every new host thread a JNI
+         * entry arrives on, and those lines used to eat the whole budget
+         * before the game made a context of its own. Guest contexts are the
+         * ones whose host thread matters: one current on the wrong thread
+         * makes every later bind elsewhere fail with EGL_BAD_ACCESS. */
+        const bool guest_ctx = handle >= ARM_EGL_CTXTAB_BASE ||
+                               g_egl_bound_handle >= ARM_EGL_CTXTAB_BASE;
+        static std::atomic<int> n{0};
+        if (guest_ctx && n.fetch_add(1, std::memory_order_relaxed) < 256)
+            fprintf(stderr, "[egl] host binding 0x%x -> 0x%x (tid=%u %s) on host "
+                    "thread %llx (%s)\n", g_egl_bound_handle, handle, g_current_tid,
+                    thread_name_of(g_current_tid),
+                    (unsigned long long)luna_os_thread_token(),
+                    g_a64_is_pump ? "pump" : g_a64_is_worker ? "worker" : "other");
     }
     g_egl_bound_handle = handle;
     g_egl_bound_surf = surf;
@@ -19156,14 +19174,8 @@ static thread_local bool g_scheduling = false;
  * start a whole second pass while the pump was inside one, and the two would
  * spend their time handing the execution lock back and forth. */
 static std::atomic<bool> g_pass_active{false};
-/* True on the host threads the A64 engine pool dispatches slices to.  They run
- * guest code but never the scheduler itself. */
-static thread_local bool g_a64_is_worker = false;
-/* The host thread that drives the frame pump. It owns the GL context, so it
- * is the only thread allowed to run a guest thread that has touched GL. "Not
- * a worker" is not the same test: every dvm bytecode thread also passes it,
- * and each one that ran a slice would build an engine of its own. */
-static thread_local bool g_a64_is_pump = false;
+/* g_a64_is_worker and g_a64_is_pump are defined further up, next to the EGL
+ * ledger, which needs them to say which host thread took a context. */
 /* Set by the loader before the engine runs: UE (and similar) keep the game on
  * guest pthread workers; the host pump only calls schedule_threads(). */
 static bool g_a64_worker_engine = false;
