@@ -761,6 +761,12 @@ uint32_t  arm_exec_input_queue_handle(void);
 void  arm_exec_clipboard_set(const char *utf8);
 char *arm_exec_clipboard_get(void);
 
+/* View.requestPointerCapture / releasePointerCapture: the guest wants the
+ * mouse locked to the window (a first-person camera).  The host hides the
+ * cursor and turns relative motion into a held finger.  Any thread. */
+void arm_exec_pointer_capture(int on);
+int  arm_exec_pointer_captured(void);
+
 /* Returns 1 if the GLFW window close button was pressed, 0 otherwise. */
 int arm_exec_glfw_should_close(void);
 void arm_exec_request_quit(void);

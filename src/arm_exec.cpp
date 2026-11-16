@@ -17167,6 +17167,7 @@ static bool g_slide_overlay = false;   /* the slide is driving the overlay's poi
  * ScrollRect or a camera as a velocity spike followed by a dead stop, which
  * Aloa described as wheel scrolling being "so bad and hard" (17-11). */
 static float g_slide_tx, g_slide_ty;
+static float g_slide_sx, g_slide_sy;   /* where this slide went down */
 static void slide_step() {
     if (!g_slide_active) return;
     float ddx = g_slide_tx - g_slide_x, ddy = g_slide_ty - g_slide_y;
@@ -17188,8 +17189,10 @@ static void slide_finish() {
     g_slide_overlay = false;
 }
 static void drag_flush();
+static void look_poll();
 static void pinch_poll() {
     drag_flush();
+    look_poll();
     if (g_pinch_active && touch_now_ms() >= g_pinch_until) pinch_finish();
     slide_step();
     if (g_slide_active && touch_now_ms() >= g_slide_until &&
@@ -17203,6 +17206,104 @@ static void glfw_window_close_cb(GLFWwindow *w) {
     arm_exec_request_quit();
 }
 
+/* Mouse look: the cursor is locked to the window and hidden, the way
+ * Minecraft holds it, and its motion becomes a finger held on the camera side
+ * of the screen.  A touch game turns the camera with a swipe, so a mouse that
+ * has to be pressed, dragged, released and carried back to swipe again cannot
+ * aim (Aloa 17-11, Exploration Craft).  On with F8, or by itself when the game
+ * asks Android for pointer capture (Unity's Cursor.lockState = Locked calls
+ * View.requestPointerCapture).  Off with F8 or Esc, or when the window loses
+ * focus; a click brings it back if the game asked for it.  Left click while
+ * locked is a tap held at the centre of the screen, where the crosshair is.
+ * The finger lifts and comes back down at its anchor when it has travelled
+ * far, or after a short rest, as a thumb does. */
+static std::atomic<int>  g_look_want{-1};      /* guest request, applied on poll */
+static std::atomic<bool> g_look{false};
+static bool   g_look_guest = false;            /* the game asked for the lock */
+static double g_look_lx, g_look_ly;            /* last cursor, surface units */
+static float  g_look_fx, g_look_fy, g_look_ax, g_look_ay;
+static float  g_look_pdx = 0, g_look_pdy = 0;  /* motion not yet delivered */
+static bool   g_look_down = false, g_look_click = false;
+static long long g_look_last_ms = 0;
+extern "C" void arm_exec_pointer_capture(int on) {
+    g_look_want.store(on ? 1 : 0, std::memory_order_release);
+}
+extern "C" int arm_exec_pointer_captured(void) {
+    return g_look.load(std::memory_order_acquire) ? 1 : 0;
+}
+static void look_lift() {
+    if (g_look_down) touch_contact(28, 1, g_look_fx, g_look_fy);
+    g_look_down = false;
+}
+static void look_set(bool on, const char *why) {
+    if (!g_glfw || on == g_look.load()) return;
+    if (on) {
+        glfwSetInputMode(g_glfw, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+#ifdef GLFW_RAW_MOUSE_MOTION
+        if (glfwRawMouseMotionSupported())
+            glfwSetInputMode(g_glfw, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+#endif
+        glfwGetCursorPos(g_glfw, &g_look_lx, &g_look_ly);
+        window_to_surface(&g_look_lx, &g_look_ly);
+        g_look_ax = g_fb_w * 0.72f;
+        g_look_ay = g_fb_h * 0.5f;
+        g_look_pdx = g_look_pdy = 0;
+    } else {
+        look_lift();
+        if (g_look_click) touch_contact(27, 1, g_fb_w * 0.5f, g_fb_h * 0.5f);
+        g_look_click = false;
+#ifdef GLFW_RAW_MOUSE_MOTION
+        if (glfwRawMouseMotionSupported())
+            glfwSetInputMode(g_glfw, GLFW_RAW_MOUSE_MOTION, GLFW_FALSE);
+#endif
+        glfwSetInputMode(g_glfw, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    }
+    g_look.store(on, std::memory_order_release);
+    fprintf(stderr, "[input] mouse look %s (%s)\n", on ? "ON" : "off", why);
+}
+static void look_motion(double cx, double cy) {
+    window_to_surface(&cx, &cy);
+    g_look_pdx += (float)(cx - g_look_lx);
+    g_look_pdy += (float)(cy - g_look_ly);
+    g_look_lx = cx;
+    g_look_ly = cy;
+}
+static void look_poll() {
+    const int want = g_look_want.exchange(-1, std::memory_order_acq_rel);
+    if (want >= 0) {
+        g_look_guest = want != 0;
+        look_set(g_look_guest && glfwGetWindowAttrib(g_glfw, GLFW_FOCUSED),
+                 "the game asked for pointer capture");
+    }
+    if (!g_look.load()) return;
+    const long long now = (long long)touch_now_ms();
+    if (g_look_pdx == 0 && g_look_pdy == 0) {
+        if (g_look_down && now - g_look_last_ms > 300) look_lift();
+        return;
+    }
+    g_look_last_ms = now;
+    if (!g_look_down) {
+        /* Down this frame, moving from the next: a phone never reports a
+         * contact's first sample already displaced, and a camera that sees
+         * one treats it as a jump. The motion waits one frame. */
+        g_look_fx = g_look_ax;
+        g_look_fy = g_look_ay;
+        touch_contact(28, 0, g_look_fx, g_look_fy);
+        g_look_down = true;
+        return;
+    }
+    g_look_fx += g_look_pdx;
+    g_look_fy += g_look_pdy;
+    g_look_pdx = g_look_pdy = 0;
+    const float reach = 0.22f * (float)std::min(g_fb_w, g_fb_h);
+    if (std::fabs(g_look_fx - g_look_ax) > reach || std::fabs(g_look_fy - g_look_ay) > reach ||
+        g_look_fx < 1 || g_look_fy < 1 || g_look_fx > g_fb_w - 2 || g_look_fy > g_fb_h - 2) {
+        look_lift();   /* the thumb runs out of room and comes back */
+        return;
+    }
+    touch_contact(28, 2, g_look_fx, g_look_fy);
+}
+
 static void drag_flush();
 static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     drag_flush();   /* the last position before the button changes */
@@ -17213,6 +17314,20 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     window_to_surface(&cx, &cy);
     /* Right click is the emulator's, never the guest's: a touchscreen has no
      * second button, so no app is waiting for one. */
+    if (g_look.load()) {
+        if (button == GLFW_MOUSE_BUTTON_LEFT) {
+            g_look_click = action == GLFW_PRESS;
+            touch_contact(27, g_look_click ? 0 : 1, g_fb_w * 0.5f, g_fb_h * 0.5f);
+            return;
+        }
+        if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS)
+            look_set(false, "right click opens the menu");
+        else return;
+    } else if (g_look_guest && button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS &&
+               !luna_overlay_menu_showing()) {
+        look_set(true, "click back into a game that holds the pointer");
+        return;
+    }
     if (button == GLFW_MOUSE_BUTTON_RIGHT) {
         if (action == GLFW_PRESS) {
             keymap_release();
@@ -17244,6 +17359,7 @@ static void drag_flush() {
     if (g_touch_down) touch_contact(0, 2, g_drag_x, g_drag_y);
 }
 static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
+    if (g_look.load()) { look_motion(cx, cy); return; }
     window_to_surface(&cx, &cy);
     if (luna_overlay_pointer(cx, cy, -1)) return;
     if (!g_touch_down) return;   /* touchscreen semantics: no hover events */
@@ -17288,7 +17404,9 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
             glfwGetCursorPos(w, &cx, &cy);
             window_to_surface(&cx, &cy);
         }
+        bool fresh = false;
         if (!g_slide_active) {
+            fresh = true;
             cx = std::min<double>(std::max<double>(cx, 8), sw - 8);
             cy = std::min<double>(std::max<double>(cy, 8), sh - 8);
             /* A Java window can contain a native SurfaceView. Its document
@@ -17298,14 +17416,33 @@ static void glfw_scroll_cb(GLFWwindow *w, double dx, double dy) {
             if (!g_slide_overlay) touch_contact(29, 0, (float)cx, (float)cy);
             g_slide_x = g_slide_tx = (float)cx;
             g_slide_y = g_slide_ty = (float)cy;
+            g_slide_sx = g_slide_x;
+            g_slide_sy = g_slide_y;
             g_slide_active = true;
             nx = g_slide_x + (float)dx * step * -1.f;
             ny = g_slide_y + (float)dy * step;
         }
+        /* A slide shorter than a drag is a tap. Unity's EventSystem (and
+         * Android's touch slop) call anything under ~10-20 px between down and
+         * up a click, so a touchpad's or a high-resolution wheel's small ticks
+         * clicked whatever button was under the pointer (Aloa 17-11, 2 Player
+         * Games: "scrolling was causing clicks"). Every slide travels at least
+         * 32 px from where it went down. */
+        {
+            const float vx = nx - g_slide_sx, vy = ny - g_slide_sy;
+            const float len = std::sqrt(vx * vx + vy * vy);
+            const float least = 32.f;
+            if (len > 0.01f && len < least) {
+                nx = g_slide_sx + vx * least / len;
+                ny = g_slide_sy + vy * least / len;
+            }
+        }
         g_slide_tx = std::min(std::max(nx, 4.f), (float)sw - 4.f);
         g_slide_ty = std::min(std::max(ny, 4.f), (float)sh - 4.f);
         g_slide_until = touch_now_ms() + 120;
-        slide_step();
+        /* Not in the frame it went down: a first sample already displaced
+         * reads as a jump, and down+move in one frame merge into one. */
+        if (!fresh) slide_step();
         return;
     }
     if (!std::isfinite(dy) || dy == 0 || (!g_pinch_active && g_touch_state.count) ||
@@ -17421,6 +17558,7 @@ static void keymap_apply_pending(void) {
 }
 static void glfw_focus_cb(GLFWwindow *, int focused) {
     if (focused) return;
+    look_set(false, "the window lost focus");
     pinch_finish();
     keymap_release();
     if (g_touch_state.count) touch_contact(0, 3, 0, 0);
@@ -17439,6 +17577,14 @@ static void glfw_key_cb(GLFWwindow *, int key, int scancode, int action, int mod
     if (action != GLFW_PRESS && action != GLFW_RELEASE) return;
     if (action == GLFW_PRESS && key == GLFW_KEY_F9) { luna_input_record_toggle(); return; }
     if (action == GLFW_PRESS && key == GLFW_KEY_F10) { luna_input_play_toggle(); return; }
+    if (action == GLFW_PRESS && key == GLFW_KEY_F8) {
+        look_set(!g_look.load(), "F8");
+        return;
+    }
+    if (key == GLFW_KEY_ESCAPE && g_look.load()) {
+        if (action == GLFW_PRESS) look_set(false, "Esc");
+        return;
+    }
     keymap_apply_pending();
     float width, height; keymap_size(width, height);
     if (luna_keymap_key(&g_keymap, key, action == GLFW_PRESS, width, height, keymap_emit, nullptr)) return;
@@ -66574,10 +66720,53 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
      * predicate, wait again, and spin at 1.5 million futex calls a second until
      * the 120-second abandon timer fired). */
     if (g_cb_lock_wait.kind == CbLockWait::Futex) {
-        const bool woken = futex_token_consume(mva);
+        bool woken = futex_token_consume(mva);
         const bool expired = g_cb_lock_wait.timed &&
                              host_mono_ns() >= g_cb_lock_wait.deadline_ns;
-        if (!woken && !expired) return false;
+        /* A lost wake strands this waiter for good: s52-2 (17-11) had a
+         * callback parked 31 s on the guest heap lock with the word at 0 (free)
+         * and 272,000 mallocs gone through since it went to sleep. The lock
+         * kept changing hands; this waiter's WAKE had gone to someone else and
+         * every later unlock saw the word uncontended and woke nobody. That
+         * stall is LDoE's "connection lost" (its network check times out
+         * behind it) and the 2 Player Games lockups.
+         * futex(2) allows a wait to return spuriously, and every correct user
+         * loops on its predicate (bionic's mutex re-marks itself contended with
+         * an exchange, which is what makes the next unlock wake it). So when
+         * the word has moved off the value this wait was entered on and no wake
+         * has come for 10 ms, return as woken (a guest thread's own park already
+         * ends the moment the word changes; this matches it, with a short grace). A wait whose word still holds
+         * the expected value is left alone: that one really is still asleep.
+         * LUNARIA_FUTEX_STALE_MS=0 turns this off. */
+        static thread_local GuestVA stale_va;
+        static thread_local uint64_t stale_since;
+        bool stale = false;
+        if (!woken && !expired) {
+            static const uint64_t stale_ns = [] {
+                const char *e = getenv("LUNARIA_FUTEX_STALE_MS");
+                return (uint64_t)(e ? atoll(e) : 10) * 1'000'000ull;
+            }();
+            if (!stale_ns || guest_word_load(ctx.mem, mva) == g_cb_lock_wait.futex_expected) {
+                stale_va = 0;
+                return false;
+            }
+            const uint64_t now = host_mono_ns();
+            if (stale_va != mva) { stale_va = mva; stale_since = now; return false; }
+            if (now - stale_since < stale_ns) return false;
+            stale = true;
+            static std::atomic<uint32_t> n_stale{0};
+            const uint32_t n = n_stale.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n <= 24 || (n & (n - 1)) == 0)
+                fprintf(stderr, "[futex-fix] callback tid=%u futex 0x%llx moved to "
+                        "0x%08x (waited for 0x%08x) and no wake came in %llu ms; "
+                        "returning as a spurious wake (%u so far)%s\n",
+                        g_current_tid, (unsigned long long)mva,
+                        guest_word_load(ctx.mem, mva), g_cb_lock_wait.futex_expected,
+                        (unsigned long long)((now - stale_since) / 1'000'000ull), n,
+                        mva == a64_guest_va(HEAP_BASE + 8u) ? " [guest heap lock]" : "");
+        }
+        stale_va = 0;
+        if (stale) woken = true;
         futex_wait_addr_remove(mva);
         if (woken)
             g_cb_resume_result = 0u;

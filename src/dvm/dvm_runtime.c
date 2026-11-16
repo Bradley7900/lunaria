@@ -198,6 +198,9 @@ RT_BUILTIN_DECL(view_get_drawing_rect);
 RT_BUILTIN_DECL(view_get_visible_display_frame);
 RT_BUILTIN_DECL(view_request_layout);
 RT_BUILTIN_DECL(view_clear_focus);
+RT_BUILTIN_DECL(view_request_pointer_capture);
+RT_BUILTIN_DECL(view_release_pointer_capture);
+RT_BUILTIN_DECL(view_has_pointer_capture);
 RT_BUILTIN_DECL(view_request_focus);
 RT_BUILTIN_DECL(view_has_focus);
 RT_BUILTIN_DECL(rect_width);
@@ -56189,6 +56192,9 @@ static const struct rt_method rt_view[] = {
      view_get_content_description),
    M("setTooltipText", "(Ljava/lang/CharSequence;)V", nop_void),
    M("setPointerIcon", "(Landroid/view/PointerIcon;)V", nop_void),
+   M("requestPointerCapture", "()V", view_request_pointer_capture),
+   M("releasePointerCapture", "()V", view_release_pointer_capture),
+   M("hasPointerCapture", "()Z", view_has_pointer_capture),
    M("setTouchDelegate", "(Landroid/view/TouchDelegate;)V", nop_void),
    M("getHitRect", "(Landroid/graphics/Rect;)V", view_get_hit_rect),
    M("addOnLayoutChangeListener", "(Landroid/view/View$OnLayoutChangeListener;)V", view_add_layout_listener),
@@ -59801,6 +59807,34 @@ static bool act_getCurrentFocus(struct dvm *vm, dvm_ref self,
       if (first) view_dispatch_focus_change(vm, first, true);
    }
    RETL(g_focus_view);
+}
+
+/* Pointer capture (API 26): a first-person game asks for the mouse to be
+ * locked to the window.  Unity does this for Cursor.lockState = Locked.  The
+ * host locks it and keeps feeding the camera as a held finger. */
+static bool view_request_pointer_capture(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs; (void)out;
+   arm_exec_pointer_capture(1);
+   return true;
+}
+static bool view_release_pointer_capture(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs; (void)out;
+   arm_exec_pointer_capture(0);
+   return true;
+}
+static bool view_has_pointer_capture(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+   (void)vm; (void)self; (void)args; (void)nargs;
+   if (out) out->i = arm_exec_pointer_captured();
+   return true;
 }
 
 /* requestFocus(): the view becomes the one text goes to.  It used to answer
