@@ -12348,6 +12348,23 @@ static thread_local bool g_a64_is_worker = false;
  * and each one that ran a slice would build an engine of its own. */
 static thread_local bool g_a64_is_pump = false;
 
+/* The window surface belongs to the guest once a guest context has bound it on
+ * a host thread other than the pump. Before that the pump keeps the bootstrap
+ * context current with the window surface (host entries, the stalled-guest
+ * frame), and a surface current on one thread makes every other thread's
+ * eglMakeCurrent on it fail with EGL_BAD_ACCESS. That was the 4-core startup
+ * hang (ldoe45 ring, 16-11): the pump drew its stalled-guest frame with the
+ * bootstrap context 8 ms before Unity's first bind on its own host thread,
+ * Unity's bind was refused, and its main thread ran with no context at all.
+ * `wants` is raised by a refused guest bind and makes the pump let go at its
+ * next frame; `owns` keeps it from taking the surface back afterwards. */
+static std::atomic<bool> g_egl_guest_wants_window{false};
+static std::atomic<bool> g_egl_guest_owns_window{false};
+static bool egl_pump_must_yield_window(void) {
+    return g_egl_guest_wants_window.load(std::memory_order_acquire) ||
+           g_egl_guest_owns_window.load(std::memory_order_acquire);
+}
+
 /* ---- eglMakeCurrent recorder (see luna_egl_mc.h) ---------------------- */
 struct EglMcRec {
     uint64_t ns, host;
@@ -12678,6 +12695,14 @@ static void egl_rebind_for_host_entry(void) {
          * thread draws with the bootstrap context. */
         if (!any_thread && g_ctx && g_ctx->is_arm64 && !g_a64_is_pump)
             return;
+        if (g_a64_is_pump && egl_pump_must_yield_window()) {
+            if (eglGetCurrentContext() == g_egl_ctx) {
+                eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                               EGL_NO_CONTEXT);
+                egl_note_bound(0u, EGL_NO_SURFACE);
+            }
+            return;
+        }
         if (eglMakeCurrent(g_egl_dpy, g_egl_surf, g_egl_surf, g_egl_ctx)) {
             egl_note_bound(ARM_EGL_CONTEXT, g_egl_surf);
             if (!g_a64_is_pump) {
@@ -18639,12 +18664,39 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
         g_egl_tid_surf.erase(g_current_tid);
         gl_tid_unmark(g_current_tid);
         egl_note_bound(0u, EGL_NO_SURFACE);
+        if (!g_a64_is_pump)
+            g_egl_guest_owns_window.store(false, std::memory_order_release);
         return EGL_TRUE;
     }
     EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
         ? eglMakeCurrent(g_egl_dpy, draw, read_s, ectx) : EGL_FALSE;
+    EGLint retry_err = EGL_SUCCESS;
+    if (!ok && !g_a64_is_pump && draw != EGL_NO_SURFACE &&
+        (retry_err = eglGetError()) == EGL_BAD_ACCESS) {
+        /* The pump holds the surface. Ask it to let go and wait for it: a
+         * thread that runs on without its context reads every GL limit as 0
+         * and never draws. 3 s is far past the pump's frame period. */
+        g_egl_guest_wants_window.store(true, std::memory_order_release);
+        const uint64_t t0 = host_mono_ns();
+        int tries = 0;
+        while (!ok && host_mono_ns() - t0 < 3'000'000'000ull) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            ++tries;
+            ok = eglMakeCurrent(g_egl_dpy, draw, read_s, ectx);
+            if (!ok) retry_err = eglGetError();
+        }
+        fprintf(stderr, "[egl] guest eglMakeCurrent ctx=0x%x on host thread %llx "
+                "refused (pump held the window surface); %s after %d retries, "
+                "%.1f ms
+", ctx_h, (unsigned long long)luna_os_thread_token(),
+                ok ? "bound" : "STILL REFUSED", tries,
+                (host_mono_ns() - t0) / 1e6);
+        if (ok) g_egl_guest_wants_window.store(false, std::memory_order_release);
+    }
+    if (ok && !g_a64_is_pump && draw == g_egl_surf)
+        g_egl_guest_owns_window.store(true, std::memory_order_release);
     if (!ok) {
-        const EGLint err = eglGetError();
+        const EGLint err = (retry_err != EGL_SUCCESS) ? retry_err : eglGetError();
         static std::atomic<int> said{0};
         if (said.fetch_add(1, std::memory_order_relaxed) < 32)
             fprintf(stderr, "[egl] guest eglMakeCurrent FAILED: tid=%u (%s) ctx=0x%x "
@@ -60553,6 +60605,9 @@ static bool guest_window_present_frame(void)
     if (g_egl_dpy == EGL_NO_DISPLAY || g_egl_surf == EGL_NO_SURFACE ||
         g_egl_ctx == EGL_NO_CONTEXT)
         return false;
+    /* The game holds (or is about to take) the window surface on its own
+     * host thread: binding it here would be refused, or would refuse it. */
+    if (egl_pump_must_yield_window()) return false;
 
     const uint64_t now = host_mono_ns();
     /* "The guest has stopped drawing": its swap counter has not moved for
@@ -70050,6 +70105,15 @@ extern "C" void arm64_exec_threads_run_engine(int on) {
 
 extern "C" void arm64_exec_run_pending_threads(void) {
     g_a64_is_pump = true;   /* this is the frame pump's host thread */
+    /* A guest bind on another host thread was refused because the pump still
+     * holds the bootstrap context with the window surface: let go here, at a
+     * point where the pump holds no lock the waiting thread could need. */
+    if (g_egl_guest_wants_window.load(std::memory_order_acquire) &&
+        g_egl_dpy != EGL_NO_DISPLAY && eglGetCurrentContext() == g_egl_ctx &&
+        g_egl_ctx != EGL_NO_CONTEXT) {
+        eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        egl_note_bound(0u, EGL_NO_SURFACE);
+    }
     // During bootstrap, workers need long slices to finish Unity's thread-pool setup.
     if (!g_ctx || !g_ctx->jit64) return;
     uint64_t slice = env_ticks("LUNARIA_THREAD_TICKS", UINT64_MAX);
