@@ -8505,8 +8505,45 @@ struct SemEvent { GuestVA sva; uint32_t tid; int32_t delta, after; uint64_t lr; 
 static SemEvent g_sem_history[64];
 static unsigned g_sem_history_n;
 
+/* The same hang needs more than the semaphore: a stop-the-world round ends
+ * when the ack count EQUALS the number of threads signalled, so one ack that
+ * arrives after its round has ended is counted in the next one and every
+ * later round is off by one forever (16-11, n44-7: rounds start at value 1,
+ * restart acks outnumber the collector's takes). Which thread was late, and
+ * whether its signal was late or its handler was, is in the order of sends,
+ * handler entries, sigreturns, posts and takes. All of them go in this ring
+ * without printing (printing moves the timing); it is printed with the poll
+ * report. K=pthread_kill(other=target) E=handler entered R=rt_sigreturn
+ * P=post T=take; val = signal, or the semaphore value after. */
+struct GcEv { uint64_t ns; GuestVA sva; uint32_t tid, other; int32_t val; char type; };
+static GcEv g_gc_ev[4096];
+static std::atomic<uint32_t> g_gc_ev_n{0};
+static uint64_t host_mono_ns();
+static void gc_ev_note(char type, uint32_t other, int32_t val, GuestVA sva = 0)
+{
+    const uint32_t i = g_gc_ev_n.fetch_add(1, std::memory_order_relaxed);
+    g_gc_ev[i % 4096u] = { host_mono_ns(), sva, g_current_tid, other, val, type };
+}
+static void gc_ev_dump(GuestVA sva)
+{
+    const uint32_t end = g_gc_ev_n.load(std::memory_order_relaxed);
+    const uint32_t n = end < 4096u ? end : 4096u;
+    const uint64_t now = host_mono_ns();
+    unsigned shown = 0;
+    fprintf(stderr, "[gc-ev] signal/ack timeline for sem 0x%llx (%u events kept), "
+            "oldest first, ms before now:\n", (unsigned long long)sva, n);
+    for (uint32_t k = 0; k < n; ++k) {
+        const GcEv &e = g_gc_ev[(end - n + k) % 4096u];
+        if ((e.type == 'P' || e.type == 'T') && e.sva != sva) continue;
+        if (++shown > 1500u) break;
+        fprintf(stderr, "[gc-ev] %9.2f %c tid=%u other=%u val=%d\n",
+                (now - e.ns) / 1e6, e.type, e.tid, e.other, e.val);
+    }
+}
+
 static void sem_history_note(GuestVA sva, int32_t delta, int32_t after, uint64_t lr)
 {
+    gc_ev_note(delta > 0 ? 'P' : 'T', (uint32_t)lr, after, sva);
     g_sem_history[g_sem_history_n++ % 64u] = { sva, g_current_tid, delta, after, lr };
 }
 
@@ -8529,6 +8566,7 @@ static void sem_poll_note(GuestVA sva, int32_t value, uint64_t lr)
                 e.delta > 0 ? "post" : "take", e.tid, e.after,
                 (unsigned long long)e.lr);
     }
+    gc_ev_dump(sva);
 }
 
 
@@ -8633,6 +8671,7 @@ static void a64_fill_signal_frame(ArmExecCtx &ctx, int sig, uint32_t target_tid,
                                   GuestVA supplied_si = 0,
                                   GuestVA supplied_uc = 0,
                                   Dynarmic::A64::Jit *live_jit = nullptr) {
+    gc_ev_note('E', target_tid, sig);
     static thread_local GuestVA fallback_si = 0, fallback_uc = 0;
     GuestVA si_va = supplied_si;
     GuestVA uc_va = supplied_uc;
@@ -18687,8 +18726,7 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
         }
         fprintf(stderr, "[egl] guest eglMakeCurrent ctx=0x%x on host thread %llx "
                 "refused (pump held the window surface); %s after %d retries, "
-                "%.1f ms
-", ctx_h, (unsigned long long)luna_os_thread_token(),
+                "%.1f ms\n", ctx_h, (unsigned long long)luna_os_thread_token(),
                 ok ? "bound" : "STILL REFUSED", tries,
                 (host_mono_ns() - t0) / 1e6);
         if (ok) g_egl_guest_wants_window.store(false, std::memory_order_release);
@@ -32287,6 +32325,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * and matches what the rest of the process was told. */
             ret32(guest_tid_of(g_current_tid)); break;
         case 139: /* __NR_rt_sigreturn */
+            if (ctx.is_arm64) gc_ev_note('R', 0, 0);
             if (ctx.is_arm64 && a64_rt_sigreturn(ctx, g_current_tid)) {
                 g_yield_requested = true;
                 break;
@@ -47615,6 +47654,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         // pthread_kill(thread_id=r0, sig=r1) / kill(pid=r0, sig=r1).
         uint32_t target_tid = r0;
         int      sig        = (int)r1;
+        gc_ev_note('K', target_tid, sig);
         static int pkill_log = 0;
         if (pkill_log++ < 400) {
             /* Who the sender is by every measure: the scheduler's tid, this
@@ -57713,6 +57753,7 @@ extern "C" int arm_exec_dvm_take_signals(void)
             fprintf(stderr, "[signal] parked Java thread tid=%u takes sig %d "
                     "(handler 0x%llx)\n", tid, sig, (unsigned long long)handler);
         GuestArg args[3] = { guest_arg_j((uint64_t)sig), guest_arg_j(si), guest_arg_j(uc) };
+        gc_ev_note('E', tid, sig);
         busy = true;
         call_guest_abi64(*g_ctx, handler, args, 3, 'v', nullptr);
         busy = false;
