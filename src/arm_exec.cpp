@@ -10189,6 +10189,28 @@ static void arm_signal_resume_futex(ArmExecCtx &ctx, ArmThread &t,
     t.regs[0] = (uint32_t)result;
 }
 
+/* A callback's FUTEX_WAIT has no ArmThread to put on g_futex_waiters: it
+ * waits for a wake token. futex_wake_parked() hands each WAKE to a parked
+ * guest thread first, so on a word that guest threads queue on all the time
+ * the callback never gets one. s53-1 (17-11): a callback 16 s on the guest
+ * heap lock, word 2, 378,000 mallocs by others meanwhile, zero tokens. That is
+ * starvation, not a lost wake, and it is what the LDoE "connection lost"
+ * stall and the 2 Player Games lockups are. A kernel futex queue is FIFO, so a
+ * waiter that has been there longest goes first; a callback that has waited
+ * more than 20 ms marks the address here (refreshed every poll), and while the
+ * mark is fresh a WAKE leaves its token for the callback instead of
+ * completing a parked thread. A mark not refreshed for 50 ms is ignored, so a
+ * callback that went away cannot hold the address. Under the execution lock. */
+static std::unordered_map<GuestVA, uint64_t> g_cb_futex_starving;
+static bool cb_futex_starving(GuestVA uaddr)
+{
+    auto it = g_cb_futex_starving.find(uaddr);
+    if (it == g_cb_futex_starving.end()) return false;
+    if (host_mono_ns() - it->second < 50'000'000ull) return true;
+    g_cb_futex_starving.erase(it);
+    return false;
+}
+
 static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
 {
     if (!uaddr || !max_wake) return 0;
@@ -10204,7 +10226,8 @@ static uint32_t futex_publish_wake(GuestVA uaddr, uint32_t max_wake)
     const uint32_t wake_count = std::min(max_wake, eligible);
     if (!wake_count) return 0;
     g_futex_wake_tokens[uaddr] += wake_count;
-    (void)futex_wake_parked(uaddr, wake_count);
+    if (!cb_futex_starving(uaddr))
+        (void)futex_wake_parked(uaddr, wake_count);
     /* Callback waiters have no schedulable ArmThread to publish as ready. */
     sched_pass_notify();
     return wake_count;
@@ -57077,8 +57100,11 @@ static void schedule_threads(uint64_t slice) {
         if (t.waiting_futex) {
             GuestVA uaddr = t.waiting_futex;
             auto tok = g_futex_wake_tokens.find(uaddr);
+            /* A token on an address a starving callback has marked is that
+             * callback's (see g_cb_futex_starving). */
             const bool woken =
-                (tok != g_futex_wake_tokens.end() && tok->second > 0u);
+                (tok != g_futex_wake_tokens.end() && tok->second > 0u) &&
+                !cb_futex_starving(uaddr);
             const bool changed = (ctx.mem.read32(uaddr) != t.futex_val);
             const bool timed_out = t.futex_timed &&
                                    host_mono_ns() >= t.futex_until_ns;
@@ -66723,6 +66749,34 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
         bool woken = futex_token_consume(mva);
         const bool expired = g_cb_lock_wait.timed &&
                              host_mono_ns() >= g_cb_lock_wait.deadline_ns;
+        /* Fairness against parked guest threads: see g_cb_futex_starving. The
+         * clock runs across back-to-back waits on one word (a woken callback
+         * that loses the race for the lock and waits again is still the one
+         * that has waited longest); a gap of 100 ms starts it over. */
+        {
+            static thread_local GuestVA starve_va;
+            static thread_local uint64_t starve_since, starve_last;
+            const uint64_t now = host_mono_ns();
+            if (starve_va != mva || now - starve_last > 100'000'000ull) {
+                starve_va = mva;
+                starve_since = now;
+            }
+            starve_last = now;
+            const uint64_t waited = now - starve_since;
+            if (woken || expired) {
+                if (g_cb_futex_starving.erase(mva) && waited > 200'000'000ull) {
+                    static std::atomic<uint32_t> said{0};
+                    const uint32_t n = said.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n <= 16 || (n & (n - 1)) == 0)
+                        fprintf(stderr, "[futex-fair] callback tid=%u got futex 0x%llx "
+                                "after %.0f ms ahead of parked threads (%u)%s\n",
+                                g_current_tid, (unsigned long long)mva, waited / 1e6, n,
+                                mva == a64_guest_va(HEAP_BASE + 8u) ? " [guest heap lock]" : "");
+                }
+            } else if (waited > 20'000'000ull) {
+                g_cb_futex_starving[mva] = now;
+            }
+        }
         /* A lost wake strands this waiter for good: s52-2 (17-11) had a
          * callback parked 31 s on the guest heap lock with the word at 0 (free)
          * and 272,000 mallocs gone through since it went to sleep. The lock
@@ -66958,6 +67012,24 @@ static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth) {
     if (g_cb_lock_wait.kind == CbLockWait::Idle) return;
     cb_lock_wait_long_report(ctx, depth);
+    /* The pump lets go of the window when a guest bind wants it, but only at
+     * the top of its loop. A pump parked here, inside a callback waiting on a
+     * guest lock, never gets there: s53-1 (17-11) had Unity's first bind
+     * refused for 3 s while the pump sat in such a wait holding the bootstrap
+     * context on the window surface. Same test as the loop's. */
+    if (g_a64_is_pump && g_egl_guest_wants_window.load(std::memory_order_acquire) &&
+        g_egl_dpy != EGL_NO_DISPLAY && eglGetCurrentContext() != EGL_NO_CONTEXT &&
+        (eglGetCurrentContext() == g_egl_ctx ||
+         (eglGetCurrentSurface(EGL_DRAW) == g_egl_surf &&
+          g_egl_bound_handle < ARM_EGL_CTXTAB_BASE))) {
+        eglMakeCurrent(g_egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        egl_note_bound(0u, EGL_NO_SURFACE);
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8)
+            fprintf(stderr, "[egl] pump released the window surface from inside a "
+                    "callback wait (kind=%u) so the guest's bind can proceed\n",
+                    (unsigned)g_cb_lock_wait.kind);
+    }
     if (!g_scheduling || (!g_a64_is_worker &&
                          (ctx.is_arm64 || g_slice_depth <= CB_MAX_DEPTH))) {
         schedule_threads(env_ticks("LUNARIA_CB_MUTEX_TICKS", 2'000'000ULL));
