@@ -66631,6 +66631,8 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
  * Say what it waits on, whether the word has moved since it was sampled (a
  * signal that happened but whose WAKE was lost) and what the wake bookkeeping
  * holds for it. Every 10 s per wait, so a stuck one keeps reporting. */
+/* malloc/free counters when this host thread's current callback wait began. */
+static thread_local uint64_t g_cbw_m0, g_cbw_f0;
 static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
     static thread_local GuestVA seen_va;
     static thread_local uint8_t seen_kind;
@@ -66641,6 +66643,7 @@ static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
     const uint64_t now = host_mono_ns();
     if (va != seen_va || g_cb_lock_wait.kind != seen_kind) {
         seen_va = va; seen_kind = g_cb_lock_wait.kind;
+        if (g_lh.ctl) { g_cbw_m0 = g_lh.ctl->malloc_calls; g_cbw_f0 = g_lh.ctl->free_calls; }
         since_ns = now; next_ns = now + 5'000'000'000ull;
         return;
     }
@@ -66671,14 +66674,13 @@ static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
          * thread right there). Progress tells them apart: malloc and free
          * calls still counting = the lock changes hands and this waiter is
          * not woken; standing still = it is held. */
-        static uint64_t seen_m, seen_f;
+        uint64_t &seen_m = g_cbw_m0, &seen_f = g_cbw_f0;
         const uint64_t m = g_lh.ctl->malloc_calls, f = g_lh.ctl->free_calls;
-        fprintf(stderr, "[cbwait]   heap: malloc_calls=%llu (+%llu since last report) "
+        fprintf(stderr, "[cbwait]   heap: malloc_calls=%llu (+%llu since this wait began) "
                 "free_calls=%llu (+%llu) contended=%llu\n",
                 (unsigned long long)m, (unsigned long long)(m - seen_m),
                 (unsigned long long)f, (unsigned long long)(f - seen_f),
                 (unsigned long long)g_lh.ctl->contended);
-        seen_m = m; seen_f = f;
         for (auto &t : g_threads) {
             if (t.finished || !(t.signal_depth || t.pending_signals ||
                                 t.waiting_futex == va))
