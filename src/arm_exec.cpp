@@ -66660,6 +66660,35 @@ static void cb_lock_wait_long_report(ArmExecCtx &ctx, int depth) {
             (now - since_ns) / 1e9, futex_token_count(va),
             wa == g_futex_wait_addrs.end() ? 0u : (unsigned)wa->second,
             (int)g_scheduling, (int)g_a64_is_worker);
+    /* The wait seen in nearly every 4-core run (5-18 s, UnityMain) is on the
+     * guest heap's own lock (HEAP_BASE+8, lh_ctl.state). Its owner word names
+     * the holder's TPIDR_EL0; say who that is and what it is doing. A holder
+     * stopped by the GC inside malloc, or parked, is the whole answer. */
+    if (g_lh.ctl && va == a64_guest_va(HEAP_BASE + 8u)) {
+        const uint64_t owner = g_lh.ctl->owner;
+        const ArmThread *h = nullptr;
+        for (auto &t : g_threads)
+            if (!t.finished && t.tls64 == owner) { h = &t; break; }
+        if (!h)
+            fprintf(stderr, "[cbwait]   heap lock owner tls=0x%llx is no guest "
+                    "thread (a callback or the main thread)%s\n",
+                    (unsigned long long)owner,
+                    owner == g_tpidr_el0_val ? " - THIS callback's own tls" : "");
+        else
+            fprintf(stderr, "[cbwait]   heap lock held by tid=%u (%s): running=%d "
+                    "ready=%d in-signal-handler=%u pending-signals=0x%llx "
+                    "cond=0x%llx mutex=0x%llx futex=0x%llx sem=0x%llx sleep=%d "
+                    "slices=%llu pc=0x%llx lr=0x%llx\n", h->id, thread_name_of(h->id),
+                    (int)h->running, (int)g_in_ready[h->id], (unsigned)h->signal_depth,
+                    (unsigned long long)h->pending_signals,
+                    (unsigned long long)h->waiting_cond,
+                    (unsigned long long)h->waiting_mutex,
+                    (unsigned long long)h->waiting_futex,
+                    (unsigned long long)h->waiting_sem,
+                    (int)(h->sleep_until_ns != 0),
+                    (unsigned long long)h->slices,
+                    (unsigned long long)h->pc64, (unsigned long long)h->lr64);
+    }
 }
 
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth) {
