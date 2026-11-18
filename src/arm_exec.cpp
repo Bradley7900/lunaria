@@ -66190,6 +66190,18 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
         }
         arm64_tls_release(ctx, ts.id);
         thread_stack_release(ts);
+        /* A forked child that failed before (or instead of) exec: what it
+         * called. LDoE's Ping child reports "Error spawning child process
+         * '/system/bin/ping'! (error 9, 9)" and never reaches execve (19-11). */
+        if (finished_value && fork_child_by_tid(finished_tid)) {
+            static int fdump = 0;
+            if (fdump++ < 3) {
+                fprintf(stderr, "[fork] child tid=%u ended %llu without exec — "
+                        "its calls:\n", finished_tid,
+                        (unsigned long long)finished_value);
+                svc_ring_dump_tid(finished_tid);
+            }
+        }
         /* A forked child that ended without calling exit() — it returned, or
          * it was killed — still owes its parent's waitpid() a status. */
         fork_child_mark_exited(finished_tid,
