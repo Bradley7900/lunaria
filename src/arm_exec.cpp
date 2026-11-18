@@ -17484,6 +17484,8 @@ static void look_poll() {
 }
 
 static void drag_flush();
+static uint64_t g_drag_down_present = 0;   /* see drag_flush */
+static long long g_drag_down_ms = 0;
 static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
     drag_flush();   /* the last position before the button changes */
     pinch_finish();
@@ -17522,6 +17524,10 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
      * it act on a tap the player aimed at the dialog. */
     if (luna_overlay_pointer(cx, cy, g_touch_down ? 1 : 0)) return;
     touch_contact(0, g_touch_down ? 0 : 1, (float)cx, (float)cy);
+    if (g_touch_down) {
+        g_drag_down_present = __atomic_load_n(&g_guest_egl_swap_count, __ATOMIC_RELAXED);
+        g_drag_down_ms = (long long)touch_now_ms();
+    }
 }
 
 /* A drag is delivered once per frame, at the newest position, the way a
@@ -17532,8 +17538,16 @@ static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
  * Exploration Craft: "moving the camera was not possible... it would glitch"). */
 static bool g_drag_pending = false;
 static float g_drag_x, g_drag_y;
+/* The first MOVE waits for the game to present once after the press (cap
+ * 150 ms), like mouse look: at 16 fps the press and a displaced first sample
+ * otherwise share one game frame, which a camera reads as a jump. Only while
+ * the button is still down; a release flushes regardless. */
 static void drag_flush() {
     if (!g_drag_pending) return;
+    if (g_touch_down &&
+        __atomic_load_n(&g_guest_egl_swap_count, __ATOMIC_RELAXED) < g_drag_down_present + 1u &&
+        (long long)touch_now_ms() - g_drag_down_ms < 150)
+        return;
     g_drag_pending = false;
     if (g_touch_down) touch_contact(0, 2, g_drag_x, g_drag_y);
 }
