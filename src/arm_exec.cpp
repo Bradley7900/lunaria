@@ -4700,13 +4700,18 @@ static uint32_t arm_malloc_usable_size(ArmExecCtx &ctx, uint32_t va) {
     return lh_usable_size(hold.h, va);
 }
 /* A guest thread has finished: its cached free blocks go back to the heap. */
-static void arm_heap_thread_exit(ArmExecCtx &ctx, uint32_t tid) {
-    if (!tid) return;
+/* Drop the cache slot keyed `key`: a small tid (the emulator's own mallocs)
+ * or a thread pointer (the guest's). */
+static void arm_heap_thread_exit_key(ArmExecCtx &ctx, uint64_t key) {
+    if (!key || !heap_of(ctx) || !heap_of(ctx)->ctl) return;
     GuestHeapLock hold(ctx);
     const uint64_t saved = hold.h->tid;
-    hold.h->tid = tid;
+    hold.h->tid = key;
     lh_tc_drop(hold.h);
     hold.h->tid = saved;
+}
+static void arm_heap_thread_exit(ArmExecCtx &ctx, uint32_t tid) {
+    arm_heap_thread_exit_key(ctx, tid);
 }
 static bool arm_heap_owns(ArmExecCtx &ctx, uint32_t va) {
     GuestHeapLock hold(ctx);
@@ -13673,6 +13678,17 @@ static void guest_thread_atexit_run(ArmExecCtx &ctx, uint32_t tid)
    }
    guest_thread_cleanup_run(ctx, tid);
    guest_tls_destructors_run(ctx, tid);
+   /* Its malloc cache goes back to the heap now that the dtors have run.
+    * The guest's own malloc keys the slot on the thread pointer (TPIDR_EL0,
+    * src/lib/guest.c self_owner), the emulator's on the small tid, and only
+    * the A32 exit path dropped one, by tid. So every A64 thread that ended
+    * kept its slot: Unity starts and ends job threads all session, the
+    * 128-slot table filled, and every later thread took the locked path again
+    * (plus up to a slot's byte cap left cached per dead thread). */
+   if (exiting && ctx.is_arm64) {
+      if (exiting->tls64) arm_heap_thread_exit_key(ctx, exiting->tls64);
+      arm_heap_thread_exit_key(ctx, tid);
+   }
 }
 
 // Dalvik bytecode calling a method the dex declares `native`: the emulator lives in libjvm.
