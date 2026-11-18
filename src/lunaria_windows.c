@@ -4054,7 +4054,14 @@ rescan:
       if (socket != INVALID_SOCKET) {
          indices[used] = i;
          native[used].fd = socket;
-         native[used].events = fds[i].events;
+         /* WSAPoll fails the WHOLE call with WSAEINVAL when an entry asks
+          * for POLLPRI (and is fussy about POLLRDBAND). Android curl asks
+          * POLLRDNORM|POLLIN|POLLRDBAND|POLLPRI for its readable/alive
+          * check right after connect(); the -1 reads as CSELECT_ERR, so
+          * every TLS dial-out was dropped before its ClientHello (LDoE
+          * "connection lost", 2PG stuck loading). Ask only what Winsock
+          * supports; urgent data is never reported, as on most stacks. */
+         native[used].events = (SHORT)(fds[i].events & (POLLRDNORM | POLLWRNORM));
          ++used;
          continue;
       }
