@@ -1900,7 +1900,22 @@ static void binder_serve_transact(struct dvm *vm, uint32_t sender, uint32_t seq,
  * a handler may block (BlockingServiceConnection refuses the main thread), and
  * the main looper must stay free to deliver what it waits for.  One thread
  * keeps the order of one-way calls to a Binder. */
-struct binder_job { uint32_t sender, seq, uid; int worker; size_t size; uint8_t body[]; };
+struct binder_job { uint32_t sender, seq, uid; int worker; int provider; size_t size; uint8_t body[]; };
+
+/* A content-provider operation (LBQ1) for a Binder thread.  It used to run
+ * inline in dvm_binder_receive, i.e. on whichever thread drives the pump (the
+ * frame pump / main thread): a provider query that took seconds (Play services
+ * reading its database on an HDD) froze the window and every guest thread
+ * pinned to the pump, like the transactions this pool exists to keep off it. */
+static void binder_serve_provider(struct dvm *vm, uint32_t sender, uint32_t seq, uint32_t uid,
+                                  const uint8_t *body, size_t blen)
+{
+   g_binder_caller_uid = uid;
+   g_binder_caller_pid = sender;
+   const int rc = g_binder_provider_serve ? g_binder_provider_serve(vm, sender, seq, body, blen) : -ENOSYS;
+   if (rc < 0) binder_reply(sender, seq, rc, 0, NULL, 0);
+   g_binder_caller_uid = g_binder_caller_pid = 0;
+}
 static const struct rt_field rt_binder_job_fields[] = { { "job", "J" }, F_END };
 
 /* A pool of Binder threads, as a process has (up to 15).  A synchronous
@@ -1934,7 +1949,8 @@ static bool binder_job_run(struct dvm *vm, dvm_ref self, const union dvm_value *
    struct binder_job *j = (struct binder_job *)(uintptr_t)ptr.j;
    if (j) {
       if (getenv("LUNARIA_TRACE_BINDER")) fprintf(stderr, "[binder] serving seq %u\n", j->seq);
-      binder_serve_transact(vm, j->sender, j->seq, j->uid, j->body, j->size);
+      if (j->provider) binder_serve_provider(vm, j->sender, j->seq, j->uid, j->body, j->size);
+      else binder_serve_transact(vm, j->sender, j->seq, j->uid, j->body, j->size);
       atomic_fetch_sub(&g_binder_load[j->worker], 1);
       free(j);
    }
@@ -1943,10 +1959,10 @@ static bool binder_job_run(struct dvm *vm, dvm_ref self, const union dvm_value *
 static const struct rt_method rt_binder_job[] = { M("run", "()V", binder_job_run), M_END };
 
 static void binder_dispatch_transact(struct dvm *vm, uint32_t sender, uint32_t seq, uint32_t uid,
-                                     const uint8_t *body, size_t blen)
+                                     const uint8_t *body, size_t blen, int provider)
 {
    if (getenv("LUNARIA_TRACE_BINDER")) fprintf(stderr, "[binder] transaction from %u seq %u (%zu bytes)\n", sender, seq, blen);
-   const bool oneway = blen >= 16 && (bget(body + 8) & BINDER_FLAG_ONEWAY);
+   const bool oneway = !provider && blen >= 16 && (bget(body + 8) & BINDER_FLAG_ONEWAY);
    const int worker = binder_pick_worker(oneway);
    dvm_ref handler = binder_worker(vm, worker);
    struct dvm_class *jc = dvm__class_by_desc(vm, "Llunaria/BinderJob;");
@@ -1954,10 +1970,11 @@ static void binder_dispatch_transact(struct dvm *vm, uint32_t sender, uint32_t s
    struct binder_job *j = job ? malloc(sizeof *j + blen) : NULL;
    if (!j) {
       if (getenv("LUNARIA_TRACE_BINDER")) fprintf(stderr, "[binder] no Binder thread (handler=%u job=%u): serving inline\n", (unsigned)handler, (unsigned)job);
-      binder_serve_transact(vm, sender, seq, uid, body, blen);
+      if (provider) binder_serve_provider(vm, sender, seq, uid, body, blen);
+      else binder_serve_transact(vm, sender, seq, uid, body, blen);
       return;
    }
-   j->sender = sender; j->seq = seq; j->uid = uid; j->size = blen; j->worker = worker;
+   j->sender = sender; j->seq = seq; j->uid = uid; j->size = blen; j->worker = worker; j->provider = provider;
    memcpy(j->body, body, blen);
    atomic_fetch_add(&g_binder_load[worker], 1);
    union dvm_value ptr = { .j = (int64_t)(uintptr_t)j }, post = { .l = job }, posted = { 0 };
@@ -1967,7 +1984,8 @@ static void binder_dispatch_transact(struct dvm *vm, uint32_t sender, uint32_t s
       (void)dvm_set_field(vm, job, "job", "J", (union dvm_value){ .j = 0 });
       atomic_fetch_sub(&g_binder_load[worker], 1);
       free(j);
-      binder_serve_transact(vm, sender, seq, uid, body, blen);
+      if (provider) binder_serve_provider(vm, sender, seq, uid, body, blen);
+      else binder_serve_transact(vm, sender, seq, uid, body, blen);
    }
 }
 
@@ -2029,8 +2047,14 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
       uint8_t *copy = n ? malloc(n) : NULL;
       if (n) { if (copy) memcpy(copy, body + 12, n); }
       pthread_mutex_lock(&g_binder_lock);
-      e->status = status; e->handle = handle; e->payload = copy; e->payload_size = copy ? n : 0; e->done = true;
+      /* Look the waiter up again under this hold: a wait that timed out in the
+       * gap since the first lookup has dropped and freed `e`, and writing into
+       * it corrupted the heap. */
+      struct binder_pending *live = g_binder_pending;
+      while (live && live != e) live = live->next;
+      if (live) { e->status = status; e->handle = handle; e->payload = copy; e->payload_size = copy ? n : 0; e->done = true; }
       pthread_mutex_unlock(&g_binder_lock);
+      if (!live) free(copy);
       return 1;
    }
 
@@ -2042,8 +2066,7 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
    g_binder_caller_uid = caller_uid;
    g_binder_caller_pid = sender;
    if (provider_op) {
-      int rc = g_binder_provider_serve ? g_binder_provider_serve(vm, sender, seq, body, blen) : -ENOSYS;
-      if (rc < 0) binder_reply(sender, seq, rc, 0, NULL, 0);
+      binder_dispatch_transact(vm, sender, seq, caller_uid, body, blen, 1);   /* Binder thread, not the pump */
       g_binder_caller_uid = g_binder_caller_pid = 0;
       dvm__tstate_load(vm, &saved);
       dvm_gil_leave_to_guest(vm, cookie);
@@ -2077,7 +2100,7 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
       if (dvm_exception(vm)) { dvm_clear_exception(vm); if (status >= 0) status = -EIO; }
       binder_reply(sender, seq, status, handle, payload, psize);
    } else {   /* transact */
-      binder_dispatch_transact(vm, sender, seq, caller_uid, body, blen);
+      binder_dispatch_transact(vm, sender, seq, caller_uid, body, blen, 0);
    }
    g_binder_caller_uid = g_binder_caller_pid = 0;
    dvm__tstate_load(vm, &saved);
