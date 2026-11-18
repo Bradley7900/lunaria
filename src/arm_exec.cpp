@@ -41540,7 +41540,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 return rc;
             };
             int rc = poll_once();
-            if (rc < 0) { fail(errno); break; }
+            if (rc < 0) {
+                const int pe = errno;
+                /* This used to fail before the trace line below, so a poll the
+                 * host refused (WSAEINVAL on POLLPRI, 19-11) left no answer. */
+                if (trace()) {
+                    static int pf = 0;
+                    if (pf++ < 50)
+                        fprintf(stderr, "[net] poll FAILED n=%u errno=%d tid=%u lr=0x%08x fd=%d ev=0x%x\n",
+                                n, pe, g_current_tid, lr,
+                                (int)ctx.mem.read32(fds),
+                                (unsigned)(ctx.mem.read32(fds + 4u) & 0xffffu));
+                }
+                fail(pe);
+                break;
+            }
             /* Only while a dial-out is pending: see g_connect_pending. */
             if (g_connect_pending.load(std::memory_order_relaxed))
                 for (uint32_t i = 0; i < n; ++i) {
