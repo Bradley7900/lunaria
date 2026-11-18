@@ -10244,7 +10244,22 @@ static void heap_reserve_expire(void) {
     if (said++ < 8)
         fprintf(stderr, "[heap-handoff] reservation not collected in 100 ms; released "
                 "(word was %u)\n", old);
-    if (old == 2u) (void)futex_publish_wake(a64_guest_va(HEAP_BASE + 8u), 1u);
+    /* Wake a PARKED guest thread, past the starving mark. Through
+     * futex_publish_wake this was a no-op or worse: the callback's own token
+     * is still pending, so `eligible` counted it and could be 0, and with the
+     * mark still fresh the wake reserved the word for the same callback again,
+     * so an expired reservation was renewed instead of released. */
+    if (old == 2u) {
+        const GuestVA hva = a64_guest_va(HEAP_BASE + 8u);
+        const auto active = g_futex_wait_addrs.find(hva);
+        if (active != g_futex_wait_addrs.end() && active->second > 0u) {
+            /* Same bookkeeping as futex_publish_wake's normal branch; with no
+             * guest thread parked there, the token is the callback's. */
+            g_futex_wake_tokens[hva] += 1u;
+            (void)futex_wake_parked(hva, 1u);
+            sched_pass_notify();
+        }
+    }
 }
 /* The callback's side: its WAKE token was consumed. */
 static void heap_reserve_collect(GuestVA uaddr) {
