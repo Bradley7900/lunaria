@@ -1200,11 +1200,50 @@ static void binder_window_poll(struct timespec *last)
    arm_exec_pause_poll();
 }
 
+/* Who drives the pump, and since when (ms on the monotonic clock). */
+static atomic_int g_binder_pump_depth;
+static atomic_long g_binder_pump_since_ms;
+static atomic_int g_binder_pump_owner_main;
+static long binder_now_ms(void)
+{
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return (long)t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
 static void binder_pump_once(void)
 {
-   if (!g_binder_pump || pthread_mutex_trylock(&g_binder_pump_lock)) return;
+   if (!g_binder_pump) return;
+   if (!pthread_mutex_trylock(&g_binder_pump_lock)) {
+      if (atomic_fetch_add(&g_binder_pump_depth, 1) == 0) {
+         atomic_store(&g_binder_pump_since_ms, binder_now_ms());
+         atomic_store(&g_binder_pump_owner_main, dvm_on_main_thread() ? 1 : 0);
+      }
+      g_binder_pump();
+      atomic_fetch_sub(&g_binder_pump_depth, 1);
+      pthread_mutex_unlock(&g_binder_pump_lock);
+      return;
+   }
+   /* The holder is stuck inside a message it is serving (Aloa's r38: Play
+    * services answered the advertising-ID call in 0 ms and the game read the
+    * answer 30 s later, after two of Play services' own queries to the game
+    * timed out behind that holder). Every message would wait behind it,
+    * including the reply this waiter needs. The pool and channel ticks are
+    * thread-safe and hand each message to exactly one caller, so after 200 ms
+    * this waiter reads them too. LUNARIA_BINDER_SHARED_PUMP=0 restores the
+    * one-at-a-time pump. */
+   static int shared = -1;
+   if (shared < 0) { const char *v = getenv("LUNARIA_BINDER_SHARED_PUMP"); shared = !(v && *v == '0'); }
+   if (!shared) return;
+   const long held = binder_now_ms() - atomic_load(&g_binder_pump_since_ms);
+   if (held < 200) return;
+   static atomic_int said;
+   if (atomic_fetch_add(&said, 1) < 8)
+      fprintf(stderr, "[binder] pump held %ld ms by the %s thread, which is serving a message; "
+              "this %s thread reads messages too\n", held,
+              atomic_load(&g_binder_pump_owner_main) ? "main" : "a background",
+              dvm_on_main_thread() ? "main" : "background");
    g_binder_pump();
-   pthread_mutex_unlock(&g_binder_pump_lock);
 }
 
 /* A wait that took long is the first thing to look at when the game stops:
