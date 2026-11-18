@@ -40656,9 +40656,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                               (int)r2);
             if (fd < 0) { fail(errno); break; }
             adopt(fd, (int)r0, type, (type & GUEST_SOCK_NONBLOCK) != 0);
-            if (trace())
+            if (trace()) {
                 fprintf(stderr, "[net] socket(%d,%d,%d) -> fd %d\n",
                         (int)r0, type, (int)r2, fd);
+                /* LDoE/2PG (Unity curl) connect, never send, and dial again:
+                 * what the thread did since its last dial is in its ring. */
+                static int sn = 0;
+                if ((r0 == 2 || r0 == 10) && sn++ < 6)
+                    svc_ring_dump_tid(g_current_tid);
+            }
             ok(fd);
             break;
         }
