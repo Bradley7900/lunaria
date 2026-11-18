@@ -66913,7 +66913,16 @@ static bool cb_lock_wait_try_grant(ArmExecCtx &ctx) {
                                 g_current_tid, (unsigned long long)mva, waited / 1e6, n,
                                 mva == a64_guest_va(HEAP_BASE + 8u) ? " [guest heap lock]" : "");
                 }
-            } else if (waited > 20'000'000ull) {
+            } else if (waited > 20'000'000ull &&
+                       (g_cb_lock_wait.futex_expected == 2u || heap_word_va(mva))) {
+                /* Only a LOCK word is fair game: bionic's mutex waits with 2
+                 * (held, contended), the guest heap lock likewise. On any other
+                 * word (a semaphore, a condition sequence, a job-queue counter)
+                 * a WAKE is a message for whoever it was meant for, and the
+                 * callback waits for a state change, not its turn. Aloa's r34
+                 * 2PG (18-11): UnityMain's callback marked 0x70001140b9b0 for
+                 * 5.3 s and took 4096 wakes off the parked workers it was
+                 * waiting on, so the loading screen never finished. */
                 g_cb_futex_starving[mva] = now;
             }
         }
