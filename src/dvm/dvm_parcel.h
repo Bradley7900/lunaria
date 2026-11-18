@@ -1954,9 +1954,22 @@ static bool binder_job_run(struct dvm *vm, dvm_ref self, const union dvm_value *
    (void)dvm_get_field(vm, self, "job", "J", &ptr);
    struct binder_job *j = (struct binder_job *)(uintptr_t)ptr.j;
    if (j) {
-      if (getenv("LUNARIA_TRACE_BINDER")) fprintf(stderr, "[binder] serving seq %u\n", j->seq);
+      const bool trace = getenv("LUNARIA_TRACE_BINDER") != NULL;
+      struct timespec t0, t1;
+      if (trace) {
+         clock_gettime(CLOCK_MONOTONIC, &t0);
+         fprintf(stderr, "[binder] pid %lu Binder:%d serving %s seq %u from %u\n",
+                 (unsigned long)getpid(), j->worker + 1, j->provider ? "provider op" : "transaction",
+                 j->seq, j->sender);
+      }
       if (j->provider) binder_serve_provider(vm, j->sender, j->seq, j->uid, j->body, j->size);
       else binder_serve_transact(vm, j->sender, j->seq, j->uid, j->body, j->size);
+      if (trace) {
+         clock_gettime(CLOCK_MONOTONIC, &t1);
+         fprintf(stderr, "[binder] pid %lu Binder:%d served seq %u in %.0f ms\n",
+                 (unsigned long)getpid(), j->worker + 1, j->seq,
+                 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+      }
       atomic_fetch_sub(&g_binder_load[j->worker], 1);
       free(j);
    }
@@ -2072,7 +2085,17 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
    g_binder_caller_uid = caller_uid;
    g_binder_caller_pid = sender;
    if (provider_op) {
-      binder_dispatch_transact(vm, sender, seq, caller_uid, body, blen, 1);   /* Binder thread, not the pump */
+      /* LUNARIA_BINDER_PROVIDER_INLINE=1 serves it here as before 18-11, an
+       * A/B for Aloa's r37 boot freeze (Play services never answered the
+       * advertising-ID calls once provider ops moved to the pool). */
+      static int inline_prov = -1;
+      if (inline_prov < 0) {
+         const char *v = getenv("LUNARIA_BINDER_PROVIDER_INLINE");
+         inline_prov = v && *v == '1';
+         if (inline_prov) fprintf(stderr, "[binder] provider ops served inline (LUNARIA_BINDER_PROVIDER_INLINE=1)\n");
+      }
+      if (inline_prov) binder_serve_provider(vm, sender, seq, caller_uid, body, blen);
+      else binder_dispatch_transact(vm, sender, seq, caller_uid, body, blen, 1);   /* Binder thread, not the pump */
       g_binder_caller_uid = g_binder_caller_pid = 0;
       dvm__tstate_load(vm, &saved);
       dvm_gil_leave_to_guest(vm, cookie);
