@@ -66046,8 +66046,7 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
                 static int sk = 0;
                 if (sk++ < 4)
                     fprintf(stderr, "[fork] child tid=%u: skipping %s's atfork "
-                            "child handler 0x%llx (shared address space)
-",
+                            "child handler 0x%llx (shared address space)\n",
                             t.id, mod, (unsigned long long)handlers[i]);
                 continue;
             }
