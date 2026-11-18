@@ -71,8 +71,35 @@ jobs:
           path: /tmp/lunaria-windows-deps
           key: windows-deps-${{ hashFiles('scripts/fetch-windows-deps.py') }}
 
+      # Compiler cache: only files whose preprocessed source changed rebuild.
+      # Symlinks named like the cross compilers sit first on PATH, so the
+      # build scripts and dynarmic's CMake pick up ccache with no changes.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-win-${{ github.run_id }}
+          restore-keys: ccache-win-
+
+      - name: Enable ccache
+        run: |
+          sudo apt-get install -y --no-install-recommends ccache
+          mkdir -p "$HOME/ccbin"
+          for t in x86_64-w64-mingw32-gcc x86_64-w64-mingw32-g++ x86_64-w64-mingw32-clang x86_64-w64-mingw32-clang++; do
+            ln -sf "$(command -v ccache)" "$HOME/ccbin/$t"
+          done
+          echo "$HOME/ccbin" >> "$GITHUB_PATH"
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          ccache -z
+
       - name: Cross-build Windows ZIP
         run: make -j"$(nproc)" dist-cross-win
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
 
       - uses: actions/upload-artifact@v4
         with:
