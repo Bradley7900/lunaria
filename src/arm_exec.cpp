@@ -67462,6 +67462,18 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
         g_cb_stack_mapped.fetch_or(1u << slot, std::memory_order_release);
     } else {
         stack_top = cb_nested_sp(true);
+        /* A callback parked in a lock wait (cb_lock_wait_progress) is between
+         * JIT runs, not inside an SVC, so there is no SVC caller SP; but the
+         * parked callback's own SP is exactly where that thread's stack is.
+         * A signal taken there (Boehm's stop-the-world) runs below it, as the
+         * kernel would put the frame. Without this every such signal was
+         * skipped, the collector never got its ack and 2PG (r36) drew one
+         * frame in 50 s. AArch64 Linux has no red zone; 256 is margin. */
+        if (!stack_top && depth > 0 && g_cb64.jit[depth - 1]) {
+            const GuestVA psp = g_cb64.jit[depth - 1]->GetSP();
+            if (a64_is_guest_va(psp) && psp > 512u)
+                stack_top = (psp - 256u) & ~(GuestVA)0xf;
+        }
         if (!stack_top) {
             fprintf(stderr, "[cb64] nested callback fn=0x%llx at depth %d has "
                     "no caller stack — skipped\n",
