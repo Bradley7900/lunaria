@@ -28205,8 +28205,18 @@ extern "C" void arm_exec_prepare_mono_config(void);
  * stack that uses the file-descriptor calls instead got only byte totals, so
  * the same trace said less about the connection that matters most. */
 static void net_trace_data(const char *what, int fd, const uint8_t *p, ssize_t n) {
-    if (!guest_net::trace() || n <= 0 || !p || !guest_net::is_guest_socket(fd))
+    if (!guest_net::trace() || !guest_net::is_guest_socket(fd))
         return;
+    /* A failed transfer is the interesting one when a connection is dropped
+     * straight after connect(): print it too (r39 LDoE "connection lost"
+     * showed no write at all, which a silent failure would also look like). */
+    if (n <= 0 || !p) {
+        static int nfail = 0;
+        if (nfail++ < 100)
+            fprintf(stderr, "[net] %s fd=%d -> %zd errno=%d tid=%u\n",
+                    what, fd, n, n < 0 ? errno : 0, g_current_tid);
+        return;
+    }
     size_t show = (size_t)n;
     if (show > 400) show = 400;
     fprintf(stderr, "[net] %s fd=%d %zd\n[net] %s data: ", what, fd, n, what);
@@ -40532,6 +40542,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         fprintf(stderr, "[net] abandoned connect on tid=%u — "
                                 "the calls it made on the way here:\n",
                                 g_current_tid);
+                        svc_ring_dump_tid(g_current_tid);
+                    }
+                } else if (guest_net::trace() &&
+                           (cs->domain == 2 || cs->domain == 10)) {
+                    /* r39 LDoE: connected sockets closed with nothing sent and
+                     * no close in the trace. Name the calls that led here. */
+                    static int cn = 0;
+                    if (cn++ < 6) {
+                        fprintf(stderr, "[net] close fd=%d tid=%u lr=0x%08x — "
+                                "the calls it made on the way here:\n",
+                                (int)r0, g_current_tid, lr);
                         svc_ring_dump_tid(g_current_tid);
                     }
                 }
