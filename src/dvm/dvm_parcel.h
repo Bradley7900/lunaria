@@ -2130,8 +2130,9 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
       static int inline_prov = -1;
       if (inline_prov < 0) {
          const char *v = getenv("LUNARIA_BINDER_PROVIDER_INLINE");
-         inline_prov = v && *v == '1';
-         if (inline_prov) fprintf(stderr, "[binder] provider ops served inline (LUNARIA_BINDER_PROVIDER_INLINE=1)\n");
+         /* Inline is the default again (r38 booted on it; the pool never did). */
+         inline_prov = !(v && *v == '0');
+         if (!inline_prov) fprintf(stderr, "[binder] provider ops served on a Binder thread (LUNARIA_BINDER_PROVIDER_INLINE=0)\n");
       }
       if (inline_prov) binder_serve_provider(vm, sender, seq, caller_uid, body, blen);
       else binder_dispatch_transact(vm, sender, seq, caller_uid, body, blen, 1);   /* Binder thread, not the pump */
