@@ -5440,6 +5440,28 @@ static void register_module_phdr(ArmExecCtx &ctx, const char *path,
     g_module_phdrs.push_back({load_bias, name_va, phdr_va, phnum, is_64});
 }
 
+/* The file name of the loaded 64-bit module whose PT_LOAD span holds `addr`,
+ * or nullptr.  Same walk as dladdr(), any process. */
+static const char *guest_module_name_at(ArmExecCtx &ctx, GuestVA addr)
+{
+    for (const auto &m : g_module_phdrs) {
+        if (!m.is_64) continue;
+        const uint8_t *ph = ctx.mem.ptr(m.phdr_va);
+        if (!ph) continue;
+        GuestVA lo = ~(GuestVA)0, hi = 0;
+        for (uint16_t i = 0; i < m.phnum; ++i) {
+            const Elf64_Phdr *p = (const Elf64_Phdr *)ph + i;
+            if (p->p_type != PT_LOAD) continue;
+            const GuestVA a = m.load_bias + (GuestVA)p->p_vaddr;
+            const GuestVA e = a + (GuestVA)p->p_memsz;
+            if (a < lo) lo = a;
+            if (e > hi) hi = e;
+        }
+        if (addr >= lo && addr < hi) return (const char *)ctx.mem.ptr(m.name_va);
+    }
+    return nullptr;
+}
+
 static thread_local uint32_t g_dvm_guest_tid;
 static thread_local GuestVA g_dvm_guest_tls;
 struct DvmNativeStack {
@@ -66008,10 +66030,29 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
         const uint16_t count = t.atfork_child_n;
         t.atfork_child_n = 0;
         t.atfork_child.fill(0);
-        for (uint16_t i = 0; i < count; ++i)
-            if (handlers[i])
-                (void)call_guest_cb64(ctx, handlers[i], 0, 0, 0, 0,
-                                      nullptr, 0);
+        for (uint16_t i = 0; i < count; ++i) {
+            if (!handlers[i]) continue;
+            /* il2cpp's Boehm GC registers a child handler that drops every
+             * thread but the caller from the GC's thread table — right for
+             * a real child, which has its own copy of that table.  Here the
+             * child shares the parent's memory, so it gutted the PARENT's
+             * table and the next stop-the-world hung half-way (LDoE, Aloa
+             * r48: suspend sent to 14 threads, restart to 1, UnityMain
+             * frozen right after Unity's Ping forked).  Its prepare/parent
+             * pair still runs, balanced, in the parent. */
+            const char *mod = guest_module_name_at(ctx, handlers[i]);
+            if (mod && strstr(mod, "libil2cpp") &&
+                !lunaria_env("LUNARIA_FORK_IL2CPP_CHILD_HANDLER")) {
+                static int sk = 0;
+                if (sk++ < 4)
+                    fprintf(stderr, "[fork] child tid=%u: skipping %s's atfork "
+                            "child handler 0x%llx (shared address space)
+",
+                            t.id, mod, (unsigned long long)handlers[i]);
+                continue;
+            }
+            (void)call_guest_cb64(ctx, handlers[i], 0, 0, 0, 0, nullptr, 0);
+        }
     }
     if (g_slice_detail) {
         const uint64_t sl_tid = host_mono_ns();
