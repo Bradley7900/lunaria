@@ -67615,6 +67615,16 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
                 lock_abandon = true;
                 break;
             }
+            /* cb_lock_wait_progress runs other guest threads, and they leave
+             * their own tid and TLS in these host-thread locals. A signal
+             * taken on the next pass must see this callback's thread: with
+             * the wrong tid take_main_signal() refused it, and the 17-11
+             * fallback ran Boehm's suspend handler as whichever thread ran
+             * last, so its ack and its sigsuspend belonged to someone else
+             * and the world never restarted (Aloa's r39 2PG: frozen at 10 s). */
+            g_current_tid = callback_tid;
+            g_tpidr_el0_val = callback_tpidr_el0;
+            g_tpidrro_el0_val = callback_tpidrro_el0;
             if (cb_wait_takes_signals(g_cb_lock_wait.kind) &&
                 cb.take_main_signal()) break;
             if (cb_lock_wait_try_grant(ctx)) break;
