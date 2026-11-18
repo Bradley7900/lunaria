@@ -1921,7 +1921,9 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"lldiv",                   SVC_LLDIV},
     // Process/socket stubs return -1 instead of fake success (0)
     {"fork",                    SVC_FORK},
-    {"execl",                   SVC_RETM1_ENOSYS},
+    {"execl",                   SVC_LIBC_EXECL},
+    {"execlp",                  SVC_LIBC_EXECL},
+    {"execle",                  SVC_LIBC_EXECL},
     {"execv",                   SVC_LIBC_EXECV},
     {"execve",                  SVC_LIBC_EXECVE},
     {"execvp",                  SVC_LIBC_EXECVP},
@@ -36191,8 +36193,27 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
      * so Unity's Ping (fork + execv("/system/bin/ping")) died in the child
      * with "Error spawning child process" and LDoE never found a battle
      * server. execvp needs no PATH walk: device_exec matches by basename. */
-    case SVC_LIBC_EXECVE: case SVC_LIBC_EXECV: case SVC_LIBC_EXECVP: {
+    case SVC_LIBC_EXECVE: case SVC_LIBC_EXECV: case SVC_LIBC_EXECVP:
+    case SVC_LIBC_EXECL: {
         if (!ctx.is_arm64) { arm_set_errno(ctx, ENOSYS); ret32(~0u); break; }
+        if (svc_no == SVC_LIBC_EXECL) {
+            /* execl/execlp/execle(path, arg0, ..., NULL[, envp]): AAPCS64
+             * passes the variadic words in x1..x7, then on the stack. Lay
+             * them out as an argv array below SP (nothing lives there during
+             * this call) and take the execv path. */
+            const GuestVA sp = g_svc_jit64 ? (GuestVA)g_svc_jit64->GetSP() : 0;
+            if (!sp || sp < 0x2000u) { arm_set_errno(ctx, EFAULT); ret32(~0u); break; }
+            const GuestVA vec = (sp - 0x1000u) & ~(GuestVA)0xf;
+            unsigned n = 0;
+            for (; n < 63u; ++n) {
+                const uint64_t w = n < 7u ? regs[1 + n]
+                                          : ctx.mem.read64(sp + (GuestVA)(n - 7u) * 8u);
+                ctx.mem.write64(vec + (GuestVA)n * 8u, w);
+                if (!w) break;
+            }
+            ctx.mem.write64(vec + (GuestVA)n * 8u, 0);
+            regs[1] = vec; g_svc_args64[1] = vec;
+        }
         if (svc_no != SVC_LIBC_EXECVE) { regs[2] = 0; g_svc_args64[2] = 0; }
         const uint64_t saved7 = regs[7];
         regs[7] = 221;

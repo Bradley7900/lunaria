@@ -1995,6 +1995,7 @@ enum SvcId : uint32_t {
     SVC_LIBC_EXECVE,
     SVC_LIBC_EXECV,
     SVC_LIBC_EXECVP,
+    SVC_LIBC_EXECL,
     SVC_TRAMP_TOTAL,
 };
 
