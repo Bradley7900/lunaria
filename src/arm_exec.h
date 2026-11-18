@@ -364,6 +364,9 @@ uint32_t arm_exec_env_va(void);
 void arm_exec_glfw_poll(void);
 /* Host input only, and only on the window owner, while execution is paused. */
 void arm_exec_pause_poll(void);
+/* While a Binder call waits on the frame pump's host thread: run the guest
+ * threads pinned to the pump (GL owners). No-op on any other thread. */
+void arm_exec_binder_wait_tick(void);
 int arm_exec_host_ui_thread(void);
 /* Dispatch main-Looper NDK frame callbacks from the framework frame pump. */
 void arm_exec_main_choreographer_tick(void);

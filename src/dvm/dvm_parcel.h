@@ -1187,6 +1187,7 @@ static pthread_mutex_t g_binder_pump_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 static void binder_window_poll(struct timespec *last)
 {
    struct timespec now;
+   arm_exec_binder_wait_tick();   /* GL-pinned guest threads, if this is the pump (own 4 ms pacing) */
    clock_gettime(CLOCK_MONOTONIC, &now);
    if ((now.tv_sec - last->tv_sec) * 1000L + (now.tv_nsec - last->tv_nsec) / 1000000L < 100) return;
    *last = now;

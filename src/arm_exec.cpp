@@ -70821,8 +70821,31 @@ extern "C" void arm64_exec_run_pending_threads(void) {
     schedule_threads(slice);
     // Second pass so HttpManager can drain work queued mid-frame by the game thread.
     schedule_threads(env_ticks("LUNARIA_HTTP_DRAIN_TICKS", 5'000'000ULL));
-    // Device callbacks belong on the host frame, not on a guest spin path.
     drive_opensles_callbacks(*g_ctx);
+}
+
+/* A Binder call that waits on the pump's host thread (up to 15 s, 30 s for two
+ * in a row) used to stop every guest thread pinned to the pump with it: Aloa's
+ * r33 LDoE (17-11) had UnityGfxDeviceW "runnable but not running" for 23,000
+ * passes while UnityMain waited 27 s for it, until Play services answered.
+ * The wait has dropped the execution lock and the GIL; run the pinned threads
+ * every 4 ms from here, as the frame loop would. LUNARIA_BINDER_WAIT_RUN=0 off. */
+extern "C" void arm_exec_binder_wait_tick(void) {
+    if (!g_a64_is_pump || g_scheduling || !g_ctx || !g_ctx->jit64) return;
+    static const bool on = [] {
+        const char *e = getenv("LUNARIA_BINDER_WAIT_RUN");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return;
+    static thread_local uint64_t last_ns;
+    const uint64_t now = host_mono_ns();
+    if (now - last_ns < 4'000'000ull) return;
+    last_ns = now;
+    static std::atomic<unsigned> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) == 0u)
+        fprintf(stderr, "[binder] pump runs its guest threads while a Binder call waits\n");
+    ArmLockGuard locked;
+    schedule_threads(env_ticks("LUNARIA_HTTP_DRAIN_TICKS", 5'000'000ULL));
 }
 
 // Walk a guest AArch64 frame-pointer chain for a stall dump.
