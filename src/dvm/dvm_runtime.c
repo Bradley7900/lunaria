@@ -5978,6 +5978,38 @@ static bool tl_remove(struct dvm *vm, dvm_ref self,
 /* Forward: Handler.post needs to tell main-looper posts from background ones. */
 static dvm_ref looper_main(struct dvm *vm);
 
+/* When the last WebView load*() started (dvm__now_ms), 0 for never.
+ *
+ * An SDK that loads a page arms its own "the page never answered" timeout in
+ * the same breath: UMP posts a 10000 ms runnable right after
+ * loadDataWithBaseURL and fails the consent form with "Web view timed out"
+ * when it fires. Our WebView is a separate browser process driven over CDP,
+ * slower to first answer than a phone's in-process one (2PG on an i5-2400:
+ * the form's first consent:// action arrived just after the 10 s mark, r40 and
+ * r44), so such a timeout is lengthened. Only a delayed post issued within
+ * 500 ms of a load, of 3 s or more, and only while LUNARIA_WEB_TIMEOUT_GRACE
+ * (seconds, default 20, 0 = off) allows. */
+static uint64_t g_webview_load_started_ms;
+static int64_t webview_load_grace(int64_t delay)
+{
+   if (delay < 3000 || !g_webview_load_started_ms) return delay;
+   const uint64_t now = dvm__now_ms();
+   if (now - g_webview_load_started_ms > 500) return delay;
+   static int grace_s = -1;
+   if (grace_s < 0) {
+      const char *v = getenv("LUNARIA_WEB_TIMEOUT_GRACE");
+      grace_s = v && *v ? atoi(v) : 20;
+      if (grace_s < 0) grace_s = 0;
+   }
+   if (!grace_s) return delay;
+   static int told = 0;
+   if (told++ < 4)
+      fprintf(stderr, "[webview] a %lld ms timeout armed with a page load: "
+              "+%d s for this WebView (LUNARIA_WEB_TIMEOUT_GRACE)\n",
+              (long long)delay, grace_s);
+   return delay + (int64_t)grace_s * 1000;
+}
+
 /* android.os.Handler.  The host stubs answered post() with a bare `false` and
  * dropped the Runnable, so anything that delivered its result through the main
  * looper — Volley's ExecutorDelivery, every SDK callback built on it — was
@@ -5992,6 +6024,7 @@ static bool h_post_token(struct dvm *vm, dvm_ref self,
     * a caller says "unless something cancels me first".  Running it straight
     * away made every such timeout beat the work it was guarding. */
    int64_t delay = (nargs > 1) ? ARG(1).j : 0;
+   delay = webview_load_grace(delay);
    dvm_ref looper = 0;
    if (self) {
       union dvm_value lv = { 0 };
@@ -51528,6 +51561,7 @@ static bool webview_load_url(struct dvm *vm, dvm_ref self,
                              union dvm_value *out)
 {
    (void)nargs; (void)out;
+   g_webview_load_started_ms = dvm__now_ms();   /* see webview_load_grace */
    dvm_ref url = ARG(0).l;
    const char *text = url ? dvm_string_utf8(vm, url) : NULL;
    if (!text) RETV();
@@ -51588,6 +51622,7 @@ static bool webview_load_data(struct dvm *vm, dvm_ref self,
                               union dvm_value *out)
 {
    (void)nargs; (void)out;
+   g_webview_load_started_ms = dvm__now_ms();   /* see webview_load_grace */
    /* loadData(data, mime, encoding) / loadDataWithBaseURL(base, data, …).
     * ARG(0) is the base URL when five args are present. */
    dvm_ref url = nargs >= 5 ? ARG(0).l : 0;
