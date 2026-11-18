@@ -158,6 +158,12 @@ static inline int luna_socket_inet_aton(const char *text, struct in_addr *addres
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* One ICMP echo from the host, for the device's /system/bin/ping (Unity's
+ * Ping class runs it; LDoE picks its battle region that way). Returns 0 with
+ * the round trip, -2 when the name does not resolve, -1 on no reply or when
+ * the host offers no unprivileged ICMP. ip_out gets the numeric address. */
+int luna_icmp_ping(const char *host, int timeout_ms, char *ip_out, size_t ip_len,
+                   int *ttl_out, double *rtt_ms);
 /* Host readiness callback executes without the monitor lock. */
 int luna_fd_monitor_start(void (*ready)(void));
 int luna_fd_monitor_update(const struct pollfd *fds, size_t count, int64_t deadline_ms);

@@ -1990,6 +1990,11 @@ enum SvcId : uint32_t {
     SVC_GL3_VertexAttribI4iv,
     SVC_GL3_VertexAttribI4uiv,
     SVC_GL3_WaitSync,
+    /* libc execve/execv/execvp: the same device-program path as raw syscall
+     * 221 (Unity's Ping runs /system/bin/ping through libc). */
+    SVC_LIBC_EXECVE,
+    SVC_LIBC_EXECV,
+    SVC_LIBC_EXECVP,
     SVC_TRAMP_TOTAL,
 };
 

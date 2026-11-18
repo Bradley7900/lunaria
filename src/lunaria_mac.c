@@ -1570,3 +1570,12 @@ int luna_os_open_url(const char *url)
    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
    return 0;
 }
+
+/* No unprivileged ICMP path wired here yet: the device's ping reports no
+ * reply (see lunaria_os.h). */
+int luna_icmp_ping(const char *host, int timeout_ms, char *ip_out, size_t ip_len,
+                   int *ttl_out, double *rtt_ms)
+{
+   (void)host; (void)timeout_ms; (void)ip_out; (void)ip_len; (void)ttl_out; (void)rtt_ms;
+   return -1;
+}

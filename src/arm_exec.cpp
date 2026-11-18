@@ -1922,9 +1922,9 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     // Process/socket stubs return -1 instead of fake success (0)
     {"fork",                    SVC_FORK},
     {"execl",                   SVC_RETM1_ENOSYS},
-    {"execv",                   SVC_RETM1_ENOSYS},
-    {"execve",                  SVC_RETM1_ENOSYS},
-    {"execvp",                  SVC_RETM1_ENOSYS},
+    {"execv",                   SVC_LIBC_EXECV},
+    {"execve",                  SVC_LIBC_EXECVE},
+    {"execvp",                  SVC_LIBC_EXECVP},
     {"waitpid",                 SVC_WAITPID},
     {"system",                  SVC_SYSTEM},
     {"__libc_init",             SVC_LIBC_INIT},
@@ -23469,6 +23469,81 @@ static int device_run_jobs(const char *cmdline, std::string &out,
     return status;
 }
 
+/* ping [-c count] [-W secs] [-w deadline] [...] host
+ *
+ * Unity's Ping class runs /system/bin/ping and reads "time=" back; LDoE pings
+ * its battle servers (asia/eu/us) that way to choose one, and with no ping on
+ * the device every probe failed and the game ended in "connection lost"
+ * (19-11, Aloa r44). Real echoes from the host, printed the way Android's
+ * iputils ping prints them. */
+static int device_cmd_ping(int argc, char *const argv[], std::string &out) {
+    int count = 1, per_s = 0, deadline_s = 0;
+    const char *host = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (a[0] == '-' && a[1]) {
+            const char o = a[1];
+            if (strchr("cwWistIQplM", o)) {
+                const char *v = a[2] ? a + 2 : (i + 1 < argc ? argv[++i] : "");
+                if (o == 'c') count = atoi(v);
+                else if (o == 'W') per_s = atoi(v);
+                else if (o == 'w') deadline_s = atoi(v);
+            }
+            continue;
+        }
+        host = a;
+    }
+    if (!host) { out += "ping: usage error: Destination address required\n"; return 2; }
+    if (count < 1) count = 1;
+    if (count > 5) count = 5;
+    int per_ms = per_s > 0 ? per_s * 1000 : (deadline_s > 0 ? deadline_s * 1000 : 1000);
+    if (per_ms > 2000) per_ms = 2000;   /* the call blocks this guest thread */
+    char ip[64] = "";
+    double rtts[5];
+    int got = 0, ttl = 64;
+    char line[256];
+    for (int seq = 1; seq <= count; ++seq) {
+        double rtt = 0;
+        int t = 64;
+        const int rc = luna_icmp_ping(host, per_ms, ip, sizeof ip, &t, &rtt);
+        if (rc == -2) {
+            snprintf(line, sizeof line, "ping: unknown host %s\n", host);
+            out += line;
+            fprintf(stderr, "[exec] ping %s: unknown host\n", host);
+            return 2;
+        }
+        if (seq == 1) {
+            snprintf(line, sizeof line, "PING %s (%s) 56(84) bytes of data.\n", host, ip);
+            out += line;
+        }
+        if (rc == 0) {
+            ttl = t;
+            rtts[got++] = rtt;
+            snprintf(line, sizeof line, "64 bytes from %s: icmp_seq=%d ttl=%d time=%.1f ms\n",
+                     ip, seq, ttl, rtt);
+            out += line;
+        }
+    }
+    double mn = 0, mx = 0, sum = 0;
+    for (int i = 0; i < got; ++i) {
+        if (!i || rtts[i] < mn) mn = rtts[i];
+        if (!i || rtts[i] > mx) mx = rtts[i];
+        sum += rtts[i];
+    }
+    snprintf(line, sizeof line,
+             "\n--- %s ping statistics ---\n%d packets transmitted, %d received, %d%% packet loss, time %dms\n",
+             host, count, got, (count - got) * 100 / count, (int)sum);
+    out += line;
+    if (got) {
+        snprintf(line, sizeof line, "rtt min/avg/max/mdev = %.3f/%.3f/%.3f/0.000 ms\n",
+                 mn, sum / got, mx);
+        out += line;
+    }
+    fprintf(stderr, "[exec] ping %s (%s): %d/%d replies%s\n", host, ip, got, count,
+            got ? "" : " (no ICMP reply from the host)");
+    return got ? 0 : 1;
+}
+
 static int device_run_command(const std::vector<std::string> &words,
                               const std::string &in, std::string &out,
                               bool background) {
@@ -23491,6 +23566,7 @@ static int device_run_command(const std::vector<std::string> &words,
         return 127;
     }
     if (!strcmp(name, "pm"))   return device_cmd_pm(argc, argv.data(), out);
+    if (!strcmp(name, "ping")) return device_cmd_ping(argc, argv.data(), out);
     if (!strcmp(name, "grep")) return device_cmd_grep(argc, argv.data(), in, out);
     if (!strcmp(name, "cat"))  { out = in; return 0; }
     if (!strcmp(name, "echo")) {
@@ -23554,7 +23630,7 @@ static int device_exec(const char *path, const std::vector<std::string> &words,
     if (!path || !*path) return -1;
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
-    static const char *const known[] = { "sh", "pm", "grep", "cat", "echo",
+    static const char *const known[] = { "sh", "pm", "grep", "cat", "echo", "ping",
                                          "toybox", "toolbox", nullptr };
     bool have = false;
     for (const char *const *k = known; *k; ++k)
@@ -36107,6 +36183,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             strncat((char*)ctx.mem.ptr(r0), (const char*)ctx.mem.ptr(r1), r2);
         }
         retarg0();
+        break;
+    }
+    /* libc execve(path, argv, envp) / execv(path, argv) / execvp(file, argv):
+     * the same body as the raw A64 syscall 221, which already runs the
+     * device's utilities and guest program images. These were ENOSYS stubs,
+     * so Unity's Ping (fork + execv("/system/bin/ping")) died in the child
+     * with "Error spawning child process" and LDoE never found a battle
+     * server. execvp needs no PATH walk: device_exec matches by basename. */
+    case SVC_LIBC_EXECVE: case SVC_LIBC_EXECV: case SVC_LIBC_EXECVP: {
+        if (!ctx.is_arm64) { arm_set_errno(ctx, ENOSYS); ret32(~0u); break; }
+        if (svc_no != SVC_LIBC_EXECVE) { regs[2] = 0; g_svc_args64[2] = 0; }
+        const uint64_t saved7 = regs[7];
+        regs[7] = 221;
+        dispatch_svc(ctx, 0, regs);
+        regs[7] = saved7;
+        const int64_t rv = (int64_t)regs[0];
+        if (rv < 0 && rv > -4096) {
+            arm_set_errno(ctx, (int)-rv);
+            regs[0] = ~0ull;
+        }
         break;
     }
     /* A failure with a reason.  See SVC_RETM1_ENOSYS in arm.h. */

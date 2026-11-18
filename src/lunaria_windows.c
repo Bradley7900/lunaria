@@ -5174,3 +5174,42 @@ int luna_os_open_url(const char *url)
    CloseHandle(pi.hProcess);
    return 0;
 }
+
+/* ---- ICMP echo for the device's ping (see lunaria_os.h) ---- */
+#include <icmpapi.h>
+int luna_icmp_ping(const char *host, int timeout_ms, char *ip_out, size_t ip_len,
+                   int *ttl_out, double *rtt_ms)
+{
+   if (luna_socket_startup() != 0 || !host || !*host) return -2;
+   struct addrinfo hints, *res = NULL;
+   memset(&hints, 0, sizeof hints);
+   hints.ai_family = AF_INET;
+   if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -2;
+   struct in_addr addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+   freeaddrinfo(res);
+   if (ip_out && ip_len) inet_ntop(AF_INET, &addr, ip_out, (socklen_t)ip_len);
+   HANDLE icmp = IcmpCreateFile();
+   if (icmp == INVALID_HANDLE_VALUE) return -1;
+   char payload[56];
+   memset(payload, 'L', sizeof payload);
+   DWORD reply_size = (DWORD)(sizeof(ICMP_ECHO_REPLY) + sizeof payload + 8 + 64);
+   void *reply = malloc(reply_size);
+   int result = -1;
+   if (reply) {
+      LARGE_INTEGER freq, t0, t1;
+      QueryPerformanceFrequency(&freq);
+      QueryPerformanceCounter(&t0);
+      DWORD n = IcmpSendEcho(icmp, addr.s_addr, payload, (WORD)sizeof payload, NULL,
+                             reply, reply_size, (DWORD)(timeout_ms > 0 ? timeout_ms : 1000));
+      QueryPerformanceCounter(&t1);
+      const ICMP_ECHO_REPLY *r = (const ICMP_ECHO_REPLY *)reply;
+      if (n > 0 && r->Status == IP_SUCCESS) {
+         if (ttl_out) *ttl_out = r->Options.Ttl;
+         if (rtt_ms) *rtt_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+         result = 0;
+      }
+      free(reply);
+   }
+   IcmpCloseHandle(icmp);
+   return result;
+}
