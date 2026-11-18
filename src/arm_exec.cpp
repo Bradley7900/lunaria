@@ -17376,6 +17376,20 @@ static long long g_look_last_ms = 0;
  * the head snapped for a moment (Aloa 17-11, Exploration Craft). */
 static int g_look_id = 28;
 static long long g_look_rest_until = 0;
+/* The rest is counted in the GAME's frames too, not only in ms: 34 ms is two
+ * frames at 60 fps but half of one at Aloa's 16 fps, so on his PC the lift and
+ * the new press still landed in the same game frame and the view jumped for
+ * one frame and back, about once a second (his 17-11 video, r34). The new
+ * press waits until the guest has presented twice since the lift, capped at
+ * 250 ms so a game that stops presenting cannot hold the thumb up. */
+static uint64_t g_look_rest_present = 0;
+static uint64_t g_look_down_present = 0;
+static long long g_look_down_ms = 0;
+static bool look_rest_over(long long now) {
+    if (now < g_look_rest_until) return false;
+    const uint64_t presents = __atomic_load_n(&g_guest_egl_swap_count, __ATOMIC_RELAXED);
+    return presents >= g_look_rest_present + 2u || now >= g_look_rest_until + 216;
+}
 extern "C" void arm_exec_pointer_capture(int on) {
     g_look_want.store(on ? 1 : 0, std::memory_order_release);
 }
@@ -17387,6 +17401,7 @@ static void look_lift() {
         touch_contact(g_look_id, 1, g_look_fx, g_look_fy);
         g_look_id = g_look_id == 28 ? 26 : 28;
         g_look_rest_until = (long long)touch_now_ms() + 34;
+        g_look_rest_present = __atomic_load_n(&g_guest_egl_swap_count, __ATOMIC_RELAXED);
     }
     g_look_down = false;
 }
@@ -17437,7 +17452,7 @@ static void look_poll() {
         return;
     }
     g_look_last_ms = now;
-    if (!g_look_down && now < g_look_rest_until) return;   /* motion waits */
+    if (!g_look_down && !look_rest_over(now)) return;   /* motion waits */
     if (!g_look_down) {
         /* Down this frame, moving from the next: a phone never reports a
          * contact's first sample already displaced, and a camera that sees
@@ -17446,8 +17461,16 @@ static void look_poll() {
         g_look_fy = g_look_ay;
         touch_contact(g_look_id, 0, g_look_fx, g_look_fy);
         g_look_down = true;
+        g_look_down_present = __atomic_load_n(&g_guest_egl_swap_count, __ATOMIC_RELAXED);
+        g_look_down_ms = now;
         return;
     }
+    /* "Moving from the next frame" means the GAME's next frame: at 16 fps the
+     * window thread's next tick is still inside the frame that saw the press.
+     * Motion keeps adding up meanwhile (up to 150 ms). */
+    if (__atomic_load_n(&g_guest_egl_swap_count, __ATOMIC_RELAXED) < g_look_down_present + 1u &&
+        now - g_look_down_ms < 150)
+        return;
     g_look_fx += g_look_pdx;
     g_look_fy += g_look_pdy;
     g_look_pdx = g_look_pdy = 0;
