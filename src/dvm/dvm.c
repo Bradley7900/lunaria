@@ -96,6 +96,28 @@ static const char *dvm__env_trace_class(void)
    static _Atomic(const char *) slot = DVM_ENV_UNREAD;
    return dvm__env_once(&slot, "LUNARIA_DVM_TRACE_CLASS");
 }
+/* LUNARIA_DVM_TRACE_CLASS may list several substrings separated by '|'
+ * ("android/ump|gms/ads|applovin"): a class matches when it contains any. */
+static bool dvm__trace_class_has(const char *name, const char *filter)
+{
+   if (!name || !filter) return false;
+   if (!strchr(filter, '|')) return strstr(name, filter) != NULL;
+   const char *p = filter;
+   while (*p) {
+      const char *e = strchr(p, '|');
+      size_t n = e ? (size_t)(e - p) : strlen(p);
+      if (n) {
+         char part[128];
+         if (n >= sizeof part) n = sizeof part - 1;
+         memcpy(part, p, n);
+         part[n] = 0;
+         if (strstr(name, part)) return true;
+      }
+      if (!e) break;
+      p = e + 1;
+   }
+   return false;
+}
 
 /* ------------------------------------------------------------------------ *
  * Descriptors
@@ -2065,7 +2087,7 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
    struct dvm_method *m = fr->m;
    const char *trace_class = dvm__env_trace_class();
    bool trace_this = !trace_class ||
-      (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
+      (m->cls && m->cls->name && dvm__trace_class_has(m->cls->name, trace_class));
    const uint16_t *insns = m->code.insns;
    uint32_t nins = m->code.insns_size;
    uint32_t nregs = fr->nregs;
@@ -3630,9 +3652,9 @@ static bool trace_call_enabled(struct dvm *vm, const struct dvm_method *m,
    if (!vm->trace) return false;
    const char *filter = dvm__env_trace_class();
    if (!filter) return true;
-   if (m && m->cls && m->cls->name && strstr(m->cls->name, filter)) return true;
+   if (m && m->cls && m->cls->name && dvm__trace_class_has(m->cls->name, filter)) return true;
    return caller && caller->method && caller->method->cls &&
-      caller->method->cls->name && strstr(caller->method->cls->name, filter);
+      caller->method->cls->name && dvm__trace_class_has(caller->method->cls->name, filter);
 }
 
 static void call_histogram(const struct dvm_method *m);
@@ -3877,7 +3899,7 @@ bool dvm__sched_trace_for(const char *class_name)
       filter = (s && strcmp(s, "1") && strcmp(s, "on")) ? s : NULL;
    }
    if (!filter) return true;
-   return class_name && strstr(class_name, filter) != NULL;
+   return class_name && dvm__trace_class_has(class_name, filter);
 }
 
 /* `nested` separates the two callers.  The drain at a call boundary is
