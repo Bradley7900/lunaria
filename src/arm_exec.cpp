@@ -70948,7 +70948,19 @@ extern "C" void arm64_exec_run_pending_threads(void) {
  * The wait has dropped the execution lock and the GIL; run the pinned threads
  * every 4 ms from here, as the frame loop would. LUNARIA_BINDER_WAIT_RUN=0 off. */
 extern "C" void arm_exec_binder_wait_tick(void) {
-    if (!g_a64_is_pump || g_scheduling || !g_ctx || !g_ctx->jit64) return;
+    if (!g_ctx || !g_ctx->jit64) return;
+    if (!g_a64_is_pump) {
+        static std::atomic<unsigned> said_np{0};
+        if (said_np.fetch_add(1, std::memory_order_relaxed) == 0u)
+            fprintf(stderr, "[binder] a Binder call waits on a host thread that is not the pump\n");
+        return;
+    }
+    /* Usually the wait is NESTED in a scheduler pass (a guest thread's JNI call
+     * reached Java, which made the call), so g_scheduling is set. ldoe67 bailed
+     * out on that and the GL thread sat "runnable but not running" for the
+     * whole 60 s again (Aloa r36). Nest the way cb_lock_wait_progress does: the
+     * running thread is skipped and nested slices have their own engines. */
+    if (g_scheduling && (g_a64_is_worker || g_slice_depth > CB_MAX_DEPTH)) return;
     static const bool on = [] {
         const char *e = getenv("LUNARIA_BINDER_WAIT_RUN");
         return !(e && e[0] == '0');

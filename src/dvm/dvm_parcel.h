@@ -993,14 +993,13 @@ static bool parcel_readHashMap(struct dvm *vm, dvm_ref self, const union dvm_val
  * handles; a reply to one is matched by sequence number.
  * ======================================================================== */
 #define BINDER_FLAG_ONEWAY 1
-/* On Android a synchronous Binder call has no timeout at all: the caller waits
- * for the reply or for the remote to die (DeadObjectException). Ours gives up so
- * a helper that died silently cannot hang the game, but 15 s was too short for a
- * background thread: on Aloa's HDD Play services is still booting for 30 s+,
- * and every give-up hands the game an exception it never sees on a phone (LDoE's
- * "connection lost", ads/measurement init failing). The main thread keeps 15 s,
- * close to the ANR window; other threads wait up to 60 s. */
-#define BINDER_WAIT_MS (dvm_on_main_thread() ? 15000L : 60000L)
+/* On Android a synchronous Binder call has no timeout at all. Ours gives up so
+ * a helper that died silently cannot hang the game. ldoe67 tried 60 s for
+ * background threads and it made Aloa's startup freeze 60 s instead of 15
+ * (r36): a "background" Java thread's wait still held up the pump's guest
+ * threads. Back to 15 s for every thread until a wait stops blocking anything
+ * else. */
+#define BINDER_WAIT_MS 15000L
 
 static int (*g_binder_send)(void *user, const char *peer, const void *bytes, size_t size);
 static void *g_binder_send_user;
