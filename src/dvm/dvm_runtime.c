@@ -50022,6 +50022,10 @@ struct webview_host_view {
    bool navigating, loaded, image_ready, host_open;
    bool scripted_eval_done;
    time_t scripted_eval_at;
+   /* loadData/loadDataWithBaseURL: the markup, written into about:blank once
+    * that has loaded (document.open/write/close runs its scripts). */
+   char *pending_doc;
+   bool doc_nav;             /* the about:blank navigation for pending_doc is under way */
 };
 static struct webview_host_view g_webviews[WEBVIEW_HOST_MAX];
 /* The emulator menu's WebView controls, applied on the main looper.
@@ -51350,6 +51354,23 @@ static void webview_host_tick(struct dvm *vm)
                     strstr(message, slot->page.session_id)) {
             slot->navigating = false;
             slot->loaded = true;
+            if (slot->pending_doc && slot->doc_nav && !slot->pending_url) {
+               /* The blank page is up: write the app's markup into it. Its
+                * scripts run as the page's own (the consent form in 2PG
+                * talks back to the app from them); then it has finished. */
+               const char *pre = "document.open();document.write(", *post = ");document.close();";
+               char *quoted = lunaria_cdp_json_quote(slot->pending_doc);
+               char *js = quoted ? malloc(strlen(pre) + strlen(quoted) + strlen(post) + 1) : NULL;
+               if (js) {
+                  strcpy(js, pre); strcat(js, quoted); strcat(js, post);
+                  webview_host_eval(vm, slot, js, 0);
+                  fprintf(stderr, "[webview] loadData: wrote %zu bytes of markup into view=%u\n",
+                          strlen(slot->pending_doc), (unsigned)slot->view);
+               }
+               free(js); free(quoted);
+               free(slot->pending_doc); slot->pending_doc = NULL;
+               slot->doc_nav = false;
+            }
             /* what the page's responses set, back into CookieManager */
             if (!webview_cookie_callback_queue(slot, slot->url, NULL, true))
                webview_finish(vm, slot->view, slot->url_ref);
@@ -51571,9 +51592,29 @@ static bool webview_load_data(struct dvm *vm, dvm_ref self,
     * ARG(0) is the base URL when five args are present. */
    dvm_ref url = nargs >= 5 ? ARG(0).l : 0;
    if (!url) url = dvm_new_string(vm, "about:blank");
-   fprintf(stderr, "[webview] loadData base=%s\n",
-           url ? dvm_string_utf8(vm, url) : "(null)");
-   webview_finish(vm, self, url);
+   const dvm_ref data = nargs >= 5 ? ARG(1).l : nargs >= 1 ? ARG(0).l : 0;
+   const dvm_ref enc = nargs >= 5 ? ARG(3).l : nargs >= 3 ? ARG(2).l : 0;
+   const char *encs = enc ? dvm_string_utf8(vm, enc) : NULL;
+   const char *doc = data ? dvm_string_utf8(vm, data) : NULL;
+   fprintf(stderr, "[webview] loadData base=%s (%zu bytes)\n",
+           url ? dvm_string_utf8(vm, url) : "(null)", doc ? strlen(doc) : (size_t)0);
+   /* Before 19-11 the markup was dropped and the page reported finished at
+    * once: a page whose scripts must answer the app (Google's consent form,
+    * which 2PG waits on) then timed out. Give it to the engine; base64 data
+    * and a WebView with no engine keep the old behaviour. */
+   const bool base64 = encs && !strcasecmp(encs, "base64");
+   struct webview_host_view *slot = doc && !base64 && !(getenv("LUNARIA_WEB_LOADDATA") && *getenv("LUNARIA_WEB_LOADDATA") == '0')
+      ? webview_host_new(vm, self) : NULL;
+   if (!slot) { webview_finish(vm, self, url); RETV(); }
+   free(slot->pending_doc);
+   slot->pending_doc = strdup(doc);
+   free(slot->pending_url);
+   slot->pending_url = strdup("about:blank");
+   slot->doc_nav = true;
+   free(slot->url);
+   { const char *u = dvm_string_utf8(vm, url); slot->url = strdup(u ? u : "about:blank"); }
+   slot->url_ref = url;
+   webview_start(vm, self, url);
    RETV();
 }
 
@@ -51670,6 +51711,7 @@ static bool webview_destroy(struct dvm *vm, dvm_ref self,
    if (slot) {
       webview_host_shut(slot);
       free(slot->pending_url);
+      free(slot->pending_doc);
       free(slot->url);
       dvm_unpin(vm, slot->view);
       memset(slot, 0, sizeof *slot);
