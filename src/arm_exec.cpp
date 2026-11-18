@@ -29857,6 +29857,33 @@ static SvcLeafFn svc_leaf_fn(uint32_t svc_no)
     return svc_info(svc_no).leaf;
 }
 
+/* The FIRST FindClass / Get(Static)MethodID of a given name is where the VM
+ * loads and initialises a class (dex parse, <clinit>), and that can take a
+ * second on a slow PC: Aloa's r23 2PG had one GetMethodID hold the execution
+ * lock 984 ms, and every guest thread stops for that long. A Java host thread
+ * does the same work without the lock, so the first lookup of each key drops
+ * it here; repeats (Unity asks every frame) keep the cheap locked path, since
+ * re-taking the ticket lock per JNI call cost UnitySampleGame 4/5 of its fps.
+ * LUNARIA_JNI_LOOKUP_UNLOCKED=1 turns it on (off by default until tested on
+ * a real game). Called with the execution lock held. */
+static bool jni_lookup_first_time(uint64_t salt, const char *a, const char *b) {
+    static const bool on = [] {
+        const char *e = getenv("LUNARIA_JNI_LOOKUP_UNLOCKED");
+        return e && e[0] == '1';
+    }();
+    if (!on) return false;
+    uint64_t h = 1469598103934665603ull ^ salt;
+    for (const char *s : {a, b})
+        if (s) for (; *s; ++s) { h ^= (uint8_t)*s; h *= 1099511628211ull; }
+    static std::unordered_set<uint64_t> seen;
+    if (!seen.insert(h).second) return false;
+    static std::atomic<unsigned> said{0};
+    if (said.fetch_add(1, std::memory_order_relaxed) == 0u)
+        fprintf(stderr, "[arm_jni] first-time class/method lookups run without the "
+                "execution lock (LUNARIA_JNI_LOOKUP_UNLOCKED)\n");
+    return true;
+}
+
 static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                          std::array<uint64_t, 16> &regs) {
     GlDebugDelivery debug_delivery{ctx, regs};
@@ -33442,7 +33469,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             fprintf(stderr, "[arm_jni] FindClass: %s\n", name);
             ++fc_count;
         }
-        jobject cls = jvm->native.FindClass(env, name);
+        jobject cls;
+        if (jni_lookup_first_time(6u, name, nullptr)) {
+            ArmLockDropped unlocked;
+            cls = jvm->native.FindClass(env, name);
+        } else {
+            cls = jvm->native.FindClass(env, name);
+        }
         RET_OBJ(cls);
         break;
     }
@@ -33701,7 +33734,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case 33: {
         const char *mn = ARM_STR(r2);
         const char *ms = ARM_STR(r3);
-        jmethodID gm = jvm->native.GetMethodID(env, AS_CLASS(r1), mn, ms);
+        jmethodID gm;
+        if (jni_lookup_first_time(33u ^ (r1 << 8), mn, ms)) {
+            ArmLockDropped unlocked;
+            gm = jvm->native.GetMethodID(env, AS_CLASS(r1), mn, ms);
+        } else {
+            gm = jvm->native.GetMethodID(env, AS_CLASS(r1), mn, ms);
+        }
         static int gm_diag = 0;
         bool gm_hot = mn && (strstr(mn, "Message") || strstr(mn, "Frame") ||
                              strstr(mn, "handle") || strstr(mn, "doFrame"));
@@ -34810,8 +34849,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
 
     // 113: GetStaticMethodID
-    case 113: RET_OBJ(jvm->native.GetStaticMethodID(env, AS_CLASS(r1),
-                      ARM_STR(r2), ARM_STR(r3))); break;
+    case 113: {
+        const char *sn = ARM_STR(r2), *ss = ARM_STR(r3);
+        jmethodID sm;
+        if (jni_lookup_first_time(113u ^ (r1 << 8), sn, ss)) {
+            ArmLockDropped unlocked;
+            sm = jvm->native.GetStaticMethodID(env, AS_CLASS(r1), sn, ss);
+        } else {
+            sm = jvm->native.GetStaticMethodID(env, AS_CLASS(r1), sn, ss);
+        }
+        RET_OBJ(sm);
+        break;
+    }
 
     // 114-143: CallStatic* stubs
     // CallStaticObjectMethod/V/A — dispatch special-cased static calls that need argument marshaling.
