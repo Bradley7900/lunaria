@@ -11002,12 +11002,75 @@ static std::map<uint32_t, std::map<int, int>> g_child_fds;
  * says whether the map can possibly have anything in it. */
 static std::atomic<uint32_t> g_child_fd_maps{0};
 
+/* Host descriptors a child owns outright: its own copies of the parent's
+ * pipe ends, taken at fork().  Unity's Ping (19-11, Aloa r48) is the shape
+ * that needs them: the parent closes the pipe's write end straight after
+ * fork() and the child closes the read end before exec.  With one shared
+ * table both closes were real, so the program's output had nowhere to go
+ * and every probe read back empty ("Error parsing ping output!"). */
+static std::map<uint32_t, std::vector<int>> g_child_owned_fds;
+
 static void child_fd_set(uint32_t tid, int newfd, int oldfd)
 {
     std::lock_guard<std::mutex> g(g_child_fd_lock);
     auto &proc = g_child_fds[tid];
     if (proc.empty()) g_child_fd_maps.fetch_add(1, std::memory_order_relaxed);
-    proc[newfd] = oldfd;
+    auto via = proc.find(oldfd);
+    proc[newfd] = via == proc.end() ? oldfd : via->second;
+}
+
+/* fork(): the child starts with its own reference to every guest pipe end. */
+static void child_fd_inherit_pipes(uint32_t tid)
+{
+    std::vector<int> ends;
+    {
+        std::lock_guard<std::mutex> lock(g_guest_pipe_mutex);
+        for (const auto &kv : g_guest_pipe_write_by_read) {
+            ends.push_back(kv.first);
+            ends.push_back(kv.second);
+        }
+    }
+    if (ends.empty()) return;
+    std::lock_guard<std::mutex> g(g_child_fd_lock);
+    auto &proc = g_child_fds[tid];
+    const bool was_empty = proc.empty();
+    for (int fd : ends) {
+        const int own = luna_fd_dup(fd, 3, 1);
+        if (own < 0) continue;
+        proc[fd] = own;
+        g_child_owned_fds[tid].push_back(own);
+    }
+    if (was_empty && !proc.empty())
+        g_child_fd_maps.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* close() in a child that has not exec'd yet.  Returns false when `tid` is
+ * not such a child (the caller then closes for real).  The shared host
+ * descriptor is never touched: only the child's own copy goes, if it has one. */
+static bool child_fd_close(uint32_t tid, int fd)
+{
+    std::lock_guard<std::mutex> g(g_child_fd_lock);
+    auto proc = g_child_fds.find(tid);
+    if (proc == g_child_fds.end()) {
+        g_child_fds[tid][fd] = -1;
+        g_child_fd_maps.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    auto slot = proc->second.find(fd);
+    const int host = slot == proc->second.end() ? fd : slot->second;
+    proc->second[fd] = -1;
+    auto owned = g_child_owned_fds.find(tid);
+    if (owned != g_child_owned_fds.end() && host >= 0) {
+        auto &v = owned->second;
+        auto it = std::find(v.begin(), v.end(), host);
+        if (it != v.end()) {
+            bool still_used = false;
+            for (const auto &kv : proc->second)
+                if (kv.second == host) { still_used = true; break; }
+            if (!still_used) { luna_fd_close(host); v.erase(it); }
+        }
+    }
+    return true;
 }
 
 static int child_fd_get(uint32_t tid, int fd)
@@ -11024,6 +11087,11 @@ static void child_fd_forget(uint32_t tid)
 {
     if (!g_child_fd_maps.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> g(g_child_fd_lock);
+    auto owned = g_child_owned_fds.find(tid);
+    if (owned != g_child_owned_fds.end()) {
+        for (int fd : owned->second) luna_fd_close(fd);
+        g_child_owned_fds.erase(owned);
+    }
     auto proc = g_child_fds.find(tid);
     if (proc == g_child_fds.end()) return;
     if (!proc->second.empty())
@@ -23480,16 +23548,23 @@ static int device_run_jobs(const char *cmdline, std::string &out,
  * iputils ping prints them. */
 static int device_cmd_ping(int argc, char *const argv[], std::string &out) {
     int count = 1, per_s = 0, deadline_s = 0;
+    bool quiet = false;
     const char *host = nullptr;
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (a[0] == '-' && a[1]) {
             const char o = a[1];
-            if (strchr("cwWistIQplM", o)) {
-                const char *v = a[2] ? a + 2 : (i + 1 < argc ? argv[++i] : "");
-                if (o == 'c') count = atoi(v);
-                else if (o == 'W') per_s = atoi(v);
-                else if (o == 'w') deadline_s = atoi(v);
+            /* Flags may be bundled: Unity runs "ping -qnc 1 <ip>". */
+            size_t k = 1;
+            while (a[k] && !strchr("cwWistIQplM", a[k])) { if (a[k] == 'q') quiet = true; ++k; }
+            if (!a[k]) continue;
+            const char ob = a[k];
+            {
+                (void)o;
+                const char *v = a[k + 1] ? a + k + 1 : (i + 1 < argc ? argv[++i] : "");
+                if (ob == 'c') count = atoi(v);
+                else if (ob == 'W') per_s = atoi(v);
+                else if (ob == 'w') deadline_s = atoi(v);
             }
             continue;
         }
@@ -23521,6 +23596,7 @@ static int device_cmd_ping(int argc, char *const argv[], std::string &out) {
         if (rc == 0) {
             ttl = t;
             rtts[got++] = rtt;
+            if (quiet) continue;   /* -q: summary lines only, as iputils prints */
             snprintf(line, sizeof line, "64 bytes from %s: icmp_seq=%d ttl=%d time=%.1f ms\n",
                      ip, seq, ttl, rtt);
             out += line;
@@ -31412,7 +31488,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
             int fd = (int)(int64_t)g_svc_args64[0];
             int rc = 0;
-            if (fd > 2) {
+            if (fd > 2 && fork_child_by_tid(g_current_tid)) {
+                child_fd_close(g_current_tid, fd);   /* the child's table only */
+            } else if (fd > 2) {
                 guest_net::g_close_lr = lr;
                 guest_net::forget(fd);
                 guest_pipe_forget(fd);
@@ -40648,7 +40726,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_LIBC_CLOSE:
-        if ((int)r0 > 2) {
+        if ((int)r0 > 2 && fork_child_by_tid(g_current_tid)) {
+            child_fd_close(g_current_tid, (int)r0);   /* the child's table only */
+            ret32(0);
+        } else if ((int)r0 > 2) {
             guest_net::g_close_lr = lr;
             /* Abandoning a dial-out that was still in flight is a decision
              * some caller made; the lr alone is a thunk.  Name the chain. */
@@ -50216,6 +50297,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* A fork child has its own process status; its parent remains alive. */
         if (fork_child_by_tid(g_current_tid)) {
             fork_child_mark_exited(g_current_tid, (int32_t)((r0 & 0xffu) << 8));
+            child_fd_forget(g_current_tid);
             if (ArmThread *t = arm_thread_by_tid(g_current_tid)) {
                 t->exit_value = r0 & 0xffu;
                 t->finished = true;
@@ -52866,6 +52948,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     child_tid = t.id;
                     spawned = true;
                     fork_child_add(g_current_tid, child_tid);
+                    child_fd_inherit_pipes(child_tid);
                     /* Linux: parent's fork() return equals the child's
                      * getpid()/gettid() and /proc/<pid>.  That is
                      * guest_tid_of(sched), not the scheduler slot. */
@@ -66227,6 +66310,7 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
          * it was killed — still owes its parent's waitpid() a status. */
         fork_child_mark_exited(finished_tid,
                                (int32_t)((finished_value & 0xffu) << 8));
+        child_fd_forget(finished_tid);   /* its own pipe copies close with it */
         /* pthread_exit's first wake attempt intentionally deferred while this
          * slice was live.  This second call is the publication point that was
          * missing: a parked pthread_join can now become runnable. */
@@ -70842,6 +70926,7 @@ static int guest_program_spawn(const std::vector<std::string> &words,
         g_thread_by_tid[slot->id] = slot;
     }
     fork_child_add(parent_tid, nid);
+    child_fd_inherit_pipes(nid);
     thread_mark_ready(nid);
     if (child_tid) *child_tid = nid;
     fprintf(stderr, "[exec] started %s as pid=%u tid=%u "
