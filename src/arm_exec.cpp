@@ -14407,14 +14407,20 @@ struct GlBufInfo { int32_t size; uint32_t usage; };
 static bool gl_map_unlocked(void) {
     static const bool on = [] {
         const char *e = lunaria_env("LUNARIA_GL_MAP_UNLOCKED");
-        return e && e[0] == '1';
+        const bool v = e && e[0] == '1';
+        fprintf(stderr, "[gl] LUNARIA_GL_MAP_UNLOCKED=%d
+", v ? 1 : 0);
+        return v;
     }();
     return on;
 }
 static bool gl_bufinfo_cache_on(void) {
     static const bool on = [] {
         const char *e = lunaria_env("LUNARIA_GL_BUFINFO_CACHE");
-        return e && e[0] == '1';
+        const bool v = e && e[0] == '1';
+        fprintf(stderr, "[gl] LUNARIA_GL_BUFINFO_CACHE=%d
+", v ? 1 : 0);
+        return v;
     }();
     return on;
 }
