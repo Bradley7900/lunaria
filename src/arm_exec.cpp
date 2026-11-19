@@ -71430,6 +71430,46 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
      * and guest state are untouched. */
     if (!lunaria_env("LUNARIA_DUMP_THREADS_ONLY"))
         svc_ring_dump();
+    /* Host threads that run guest code (a Java thread inside a JNI call, such
+     * as UnityMain) are not ArmThreads, so the per-thread dump below never
+     * lists them, and in LDoE's 40 s freeze (r52) the collector was exactly
+     * such a thread. Its own ring says whether it is parked inside one SVC
+     * (newest call long ago) or turning in guest code between calls (newest
+     * call recent), and which. Times here are before NOW, not before the
+     * thread's newest call. */
+    {
+        const uint64_t now_stamp = svc_ring_stamp();
+        const double ns_per = svc_ring_ns_per_stamp();
+        for (uint32_t tid = 1; tid < THREAD_TID_MAX; ++tid) {
+            const uint32_t pos = g_svc_ring_by_tid_pos[tid];
+            if (!pos) continue;
+            bool listed = false;
+            for (const ArmThread &t : g_threads)
+                if (t.id == tid && !t.finished) { listed = true; break; }
+            if (listed) continue;
+            const SvcTraceEnt &nw = g_svc_ring_by_tid[tid][(pos - 1u) & (SVC_TID_RING - 1)];
+            const double ago = nw.ns && now_stamp >= nw.ns
+                                   ? (double)(now_stamp - nw.ns) * ns_per / 1e6 : 0.0;
+            if (ago > 120000.0) continue;   /* long gone */
+            fprintf(stderr, "[host-thread] tid=%u (%s): %u SVCs, newest %s%u(%s) "
+                    "lr=0x%08x %.1f ms ago; its last calls, ms before now:\n",
+                    tid, thread_name_of(tid), pos, nw.svc ? "svc=" : "raw ",
+                    nw.svc ? nw.svc : nw.raw, nw.svc ? svc_symbol_name(nw.svc) : "",
+                    nw.lr, ago);
+            const uint32_t n = pos < 48u ? pos : 48u;
+            for (uint32_t i = pos - n; i < pos; ++i) {
+                const SvcTraceEnt &e = g_svc_ring_by_tid[tid][i & (SVC_TID_RING - 1)];
+                const double a = e.ns && now_stamp >= e.ns
+                                     ? (double)(now_stamp - e.ns) * ns_per / 1e6 : 0.0;
+                if (e.svc)
+                    fprintf(stderr, "[host-thread]   -%9.1f  svc=%u(%s) lr=0x%08x r0=0x%08x\n",
+                            a, e.svc, svc_symbol_name(e.svc), e.lr, e.r0);
+                else
+                    fprintf(stderr, "[host-thread]   -%9.1f  raw syscall %u lr=0x%08x r0=0x%08x\n",
+                            a, e.raw, e.lr, e.r0);
+            }
+        }
+    }
     /* The queue itself, not just per-thread flags: "queued" and "in the queue"
      * are separate facts and a hang lives in the gap between them. */
     {
