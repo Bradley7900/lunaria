@@ -28830,6 +28830,17 @@ static bool svc_lockfree_compute(uint32_t no) {
         set(SVC_CLOCK_GETTIME);
         set(SVC_GETTIMEOFDAY);
 
+        /* Calendar conversions: the caller's struct tm (or localtime's one static
+         * buffer, allocated once under its own guard), the zone, which has its
+         * own mutex, and the host's cached Windows zone rules. LDoE's .NET time
+         * zone setup walks every day out to 2037 through gmtime, localtime and
+         * mktime, and those three held the execution lock for 64% of the time it
+         * was held across a whole five-second window of its boot (r93, 20-11)
+         * with every other engine queued behind them. */
+        for (uint32_t n : {SVC_LOCALTIME, SVC_GMTIME, SVC_LOCALTIME_R,
+                           SVC_GMTIME_R, SVC_MKTIME, SVC_TIMEGM, SVC_DIFFTIME})
+            set(n);
+
         /* GetEnv/AttachCurrentThread write one constant, the address of the JNIEnv
          * table in the guest window, into a guest pointer and answer JNI_OK; Detach
          * and DestroyJavaVM answer JNI_OK and nothing else. Every thread sees the
@@ -51926,8 +51937,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_LOCALTIME: case SVC_GMTIME: {
-        static uint32_t tm_static = 0;
-        if (!tm_static) tm_static = arm_malloc(ctx, ctx.is_arm64 ? 56u : 44u);
+        /* Runs outside the execution lock (svc_lockfree_compute). */
+        static std::mutex tm_static_mx;
+        static std::atomic<uint32_t> tm_static_va{0};
+        uint32_t tm_static = tm_static_va.load(std::memory_order_acquire);
+        if (!tm_static) {
+            std::lock_guard<std::mutex> g(tm_static_mx);
+            tm_static = tm_static_va.load(std::memory_order_relaxed);
+            if (!tm_static) {
+                tm_static = arm_malloc(ctx, ctx.is_arm64 ? 56u : 44u);
+                tm_static_va.store(tm_static, std::memory_order_release);
+            }
+        }
         time_t t = ctx.is_arm64
             ? (time_t)ctx.mem.read64(argp(0))
             : (time_t)(int32_t)ctx.mem.read32(argp(0));
@@ -51949,9 +51970,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * same instant reads back as one call answering nine hours apart, which is
          * what a clock-tamper check looks like. */
         {
-            static uint64_t calls[2] = {};
+            static std::atomic<uint64_t> calls[2] = {};
             const unsigned kind = svc_no == SVC_LOCALTIME ? 0u : 1u;
-            const uint64_t count = ++calls[kind];
+            const uint64_t count = calls[kind].fetch_add(1, std::memory_order_relaxed) + 1;
             if (count <= 3 || count % 50000 == 0)
                 fprintf(stderr, "[%s-spin] #%llu lr=0x%08x r0=0x%08" PRIx64 " t=%ld "
                         "hh:mm:ss=%02d:%02d:%02d\n",
@@ -51974,11 +51995,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         write_guest_tm(ctx, address, value, 0);
         /* bionic's UTC abbreviation has process lifetime, like tzname. */
+        static std::once_flag gmt_once;
         static uint32_t gmt = 0;
-        if (!gmt) {
+        std::call_once(gmt_once, [&] {
             gmt = arm_malloc(ctx, 4);
             if (gmt) memcpy(ctx.mem.ptr(gmt), "GMT", 4);
-        }
+        });
         if (ctx.is_arm64) ctx.mem.write64(address + 48, gmt);
         else ctx.mem.write32(address + 40, gmt);
         if (ctx.is_arm64) ret64((uint64_t)seconds); else ret32((uint32_t)seconds);
