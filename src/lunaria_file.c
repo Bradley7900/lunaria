@@ -135,6 +135,7 @@ char *luna_temp_mkdtemp(char *pattern, size_t capacity)
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <stdlib.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -154,12 +155,13 @@ static void sym_init(void)
 }
 static void sym_enter(void) {pthread_once(&sym_once,sym_init);pthread_mutex_lock(&sym_lock);}
 static void sym_leave(void) {int e=errno;pthread_mutex_unlock(&sym_lock);errno=e;}
+static void sym_changed(void);
 void luna_symlink_set_mapper(luna_symlink_mapper mapper,luna_symlink_mapper reverse)
-{sym_enter();path_mapper=mapper;reverse_mapper=reverse;sym_leave();}
+{sym_enter();sym_changed();path_mapper=mapper;reverse_mapper=reverse;sym_leave();}
 static luna_file_inode_mapper inode_mapper;
 static unsigned file_uid,file_gid;
 void luna_file_set_credentials(unsigned uid,unsigned gid,luna_file_inode_mapper mapper)
-{sym_enter();file_uid=uid;file_gid=gid;inode_mapper=mapper;sym_leave();}
+{sym_enter();sym_changed();file_uid=uid;file_gid=gid;inode_mapper=mapper;sym_leave();}
 /* Ownership follows the inode, including paths containing parent components.
  * Search checks still run on the original components before normalization. */
 static int sym_inode(const char *path,luna_file_info *info)
@@ -226,6 +228,47 @@ static int sym_copy(char *out,size_t cap,const char *text)
    size_t n=strlen(text);
    if (n>=cap) {errno=ENAMETOOLONG;return -1;}
    memcpy(out,text,n+1);return 0;
+}
+/* Directories already found to be plain (not a link, not hidden) and
+ * searchable by the guest. Each file call used to probe every component of
+ * its path again, two or three host queries per component, and a path into a
+ * Windows install folder has fifteen of them: about 6 ms per stat on Aloa's
+ * PC (2pg, 20-11), under the execution lock. Every entry is dropped when this
+ * layer creates, removes, renames or chmods anything, or the mapping changes.
+ * A directory changed behind the layer's back can only have been removed or
+ * replaced by a plain file, and the host call on the full path then fails the
+ * same way the walk would have. Guarded by sym_lock like everything here. */
+#define SYM_DIRS 2048u
+static char *sym_dirs[SYM_DIRS];
+static unsigned sym_dir_count;
+static void sym_changed(void)
+{
+   for (unsigned i=0;i<SYM_DIRS;++i) {free(sym_dirs[i]);sym_dirs[i]=NULL;}
+   sym_dir_count=0;
+}
+static unsigned sym_dir_slot(const char *path)
+{
+   unsigned h=2166136261u;
+   for (const unsigned char *s=(const unsigned char *)path;*s;++s) h=(h^*s)*16777619u;
+   return h&(SYM_DIRS-1u);
+}
+static int sym_dir_known(const char *path)
+{
+   for (unsigned i=sym_dir_slot(path),n=0;n<8u;++n,i=(i+1u)&(SYM_DIRS-1u)) {
+      if (!sym_dirs[i]) return 0;
+      if (!strcmp(sym_dirs[i],path)) return 1;
+   }
+   return 0;
+}
+static void sym_dir_remember(const char *path)
+{
+   if (!inode_mapper) return;   /* without it nothing proved the directory exists */
+   if (sym_dir_count>=SYM_DIRS/2u) sym_changed();
+   for (unsigned i=sym_dir_slot(path),n=0;n<8u;++n,i=(i+1u)&(SYM_DIRS-1u)) {
+      if (sym_dirs[i]) {if (!strcmp(sym_dirs[i],path)) return;continue;}
+      size_t len=strlen(path);char *copy=(char *)malloc(len+1);if (!copy) return;
+      memcpy(copy,path,len+1);sym_dirs[i]=copy;++sym_dir_count;return;
+   }
 }
 static int sym_name(const char *path,char *out,size_t cap)
 {
@@ -345,7 +388,16 @@ static int sym_resolve(const char *path,char *out,size_t cap,int follow)
       if (inode_mapper) {
          char prefix[SYM_PATH];if (sym_copy(prefix,sizeof prefix,path)) return -1;
          for (size_t i=1;prefix[i];++i) if (prefix[i]=='/' && prefix[i-1]!='/') {
-            prefix[i]=0;int r=sym_permission(prefix,1,1);prefix[i]='/';if (r) return -1;
+            prefix[i]=0;
+            int r=0;
+            if (!sym_dir_known(prefix)) {
+               r=sym_permission(prefix,1,1);
+               if (!r && !strstr(prefix,".sym.") && !strstr(prefix,".sym-stage-") &&
+                   !luna_file_infoat(LUNA_AT_FDCWD,prefix,&existing,LUNA_AT_NOFOLLOW) &&
+                   (existing.mode&0170000)==0040000)
+                  sym_dir_remember(prefix);
+            }
+            prefix[i]='/';if (r) return -1;
          }
       }
       return sym_copy(out,cap,path);
@@ -358,12 +410,16 @@ restart:
       if (!i || (i && work[i-1]=='/')) {if (!work[i]) break;continue;}
       char prefix[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];
       memcpy(prefix,work,i);prefix[i]=0;
+      if (work[i] && sym_dir_known(prefix)) continue;
       int hidden=sym_hidden(prefix);
       if (hidden<0) return -1;
       if (hidden) {errno=ENOENT;return -1;}
       int link=sym_probe(prefix,metadata,target);
       if (link<0) return -1;
-      if (!link && work[i] && sym_permission(prefix,1,1)) return -1;
+      if (!link && work[i]) {
+         if (sym_permission(prefix,1,1)) return -1;
+         if (!hidden) sym_dir_remember(prefix);
+      }
       if (link && (follow || work[i])) {
          if (++hops>40) {errno=ELOOP;return -1;}
          char next[SYM_PATH],mapped[SYM_PATH];const char *dest=target;
@@ -449,7 +505,7 @@ int luna_symlink_create(const char *target,const char *path)
    if (!target || !path) {errno=EFAULT;return -1;}
    if (!*target) {errno=ENOENT;return -1;}
    if (strlen(target)>=SYM_PATH) {errno=ENAMETOOLONG;return -1;}
-   sym_enter();char actual[SYM_PATH],metadata[SYM_PATH],stage[SYM_PATH];int r=-1;
+   sym_enter();sym_changed();char actual[SYM_PATH],metadata[SYM_PATH],stage[SYM_PATH];int r=-1;
    if (sym_resolve(path,actual,sizeof actual,0) || sym_name(actual,metadata,sizeof metadata)) goto done;
    if (sym_parent_permission(actual,3)) goto done;
    luna_file_info info;
@@ -526,7 +582,7 @@ int luna_symlink_fd_info(int fd,luna_file_info *info)
 }
 int luna_symlink_fd_chmod(int fd,unsigned mode)
 {
-   sym_enter();luna_file_info info;int r=luna_symlink_fd_info(fd,&info);
+   sym_enter();sym_changed();luna_file_info info;int r=luna_symlink_fd_info(fd,&info);
    if (!r) {
       char path[SYM_PATH];
       if (inode_mapper && !sym_fd_path(fd,path,sizeof path) && sym_inode(path,&info) && info.uid!=file_uid) {
@@ -553,7 +609,8 @@ int luna_symlink_infoat(int fd,const char *path,luna_file_info *info,int flags)
 int luna_symlink_unlinkat(int fd,const char *path,int flags)
 {
    if (flags&~LUNA_AT_REMOVEDIR) {errno=EINVAL;return -1;}
-   sym_enter();char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();if (flags&LUNA_AT_REMOVEDIR) sym_changed();
+   char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
    if (!sym_at(fd,path,absolute) && !sym_resolve(absolute,actual,sizeof actual,0)) {
       int link=sym_probe(actual,metadata,target);
       if (sym_parent_permission(actual,3)) link=-1;
@@ -595,7 +652,7 @@ done:
 }
 int luna_symlink_chmodat(int fd,const char *path,unsigned mode,int flags)
 {
-   sym_enter();char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();sym_changed();char absolute[SYM_PATH],actual[SYM_PATH],metadata[SYM_PATH],target[SYM_PATH];int r=-1;
    if (!sym_at(fd,path,absolute) && !sym_resolve(absolute,actual,sizeof actual,!(flags&LUNA_AT_NOFOLLOW))) {
       int link=flags&LUNA_AT_NOFOLLOW ? sym_probe(actual,metadata,target) : 0;
       if (link==1) errno=EOPNOTSUPP;else if (!link && !sym_owner_permission(actual)) r=luna_file_chmodat(LUNA_AT_FDCWD,actual,mode,flags);
@@ -620,7 +677,7 @@ int luna_symlink_set_modified(const char *path,int64_t ms)
 }
 int luna_symlink_link(const char *from,const char *to)
 {
-   sym_enter();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();sym_changed();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
    if (!sym_resolve(from,a,sizeof a,0) && !sym_resolve(to,b,sizeof b,0) && !sym_parent_permission(b,3)) {
       int sa=sym_probe(a,ma,target),sb=sym_probe(b,mb,target);
       if (sb==1) errno=EEXIST;
@@ -699,7 +756,7 @@ char *luna_file_canonical_namespace(const char *path,char *out,size_t capacity,
 }
 int luna_symlink_rename(const char *from,const char *to)
 {
-   sym_enter();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
+   sym_enter();sym_changed();char a[SYM_PATH],b[SYM_PATH],ma[SYM_PATH],mb[SYM_PATH],target[SYM_PATH];int r=-1;
    if (sym_resolve(from,a,sizeof a,0) || sym_resolve(to,b,sizeof b,0)) goto done;
    if (sym_parent_permission(a,3) || sym_parent_permission(b,3)) goto done;
    int sa=sym_probe(a,ma,target),sb=sym_probe(b,mb,target);
