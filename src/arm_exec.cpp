@@ -10402,6 +10402,12 @@ static void sem_wake_parked(GuestVA sva, uint32_t max_wake)
  * only the second one is a real wait; without the clock the dump cannot tell
  * a starved scheduler from a refused answer. */
 struct SvcTraceEnt { uint32_t svc, lr, r0, tid, raw; uint64_t ns; };
+/* Armed by each stall dump: the next strlcpy calls print what they copy, and
+ * the first few print where they were called from. LDoE's 40 s freeze (r54)
+ * is UnityMain turning at ~420 Mips through il2cpp's StringDuplicate (from
+ * mono_type_full_name / mono_method_full_name), so the copied names say which
+ * walk it is in. */
+static std::atomic<int> g_strlcpy_sample{0};
 static SvcTraceEnt g_svc_ring[1024];
 static uint32_t    g_svc_ring_pos = 0;
 // Dedicated main-thread (tid=0) ring so worker SVC calls don't overwrite it
@@ -51598,6 +51604,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         
         const char *src = ctx.mem.cstr(r1);
         if (!src) { ret32(0); break; }
+        if (g_strlcpy_sample.load(std::memory_order_relaxed) > 0) {
+            const int left = g_strlcpy_sample.fetch_sub(1, std::memory_order_relaxed);
+            if (left > 0) {
+                fprintf(stderr, "[strlcpy] tid=%u lr=0x%08x \"%.160s\"\n",
+                        g_current_tid, lr, src);
+                if (left > 296 && ctx.is_arm64 && g_svc_jit64)
+                    a64_dump_guest_backtrace("strlcpy during stall", g_current_tid,
+                                             g_svc_jit64->GetRegister(29));
+            }
+        }
         size_t slen = strlen(src);
         if (r0 && r2) {
             size_t n = slen < r2 - 1 ? slen : r2 - 1;
@@ -71476,6 +71492,7 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
      * and guest state are untouched. */
     if (!lunaria_env("LUNARIA_DUMP_THREADS_ONLY"))
         svc_ring_dump();
+    g_strlcpy_sample.store(300, std::memory_order_relaxed);
     /* Host threads that run guest code (a Java thread inside a JNI call, such
      * as UnityMain) are not ArmThreads, so the per-thread dump below never
      * lists them, and in LDoE's 40 s freeze (r52) the collector was exactly
