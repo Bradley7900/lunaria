@@ -14416,8 +14416,10 @@ static bool gl_map_unlocked(void) {
 }
 static bool gl_bufinfo_cache_on(void) {
     static const bool on = [] {
+        /* On by default since 2pg loaded and closed clean with it (20-11);
+         * the unlocked upload was the half that froze the loading. */
         const char *e = lunaria_env("LUNARIA_GL_BUFINFO_CACHE");
-        const bool v = e && e[0] == '1';
+        const bool v = !(e && e[0] == '0');
         fprintf(stderr, "[gl] LUNARIA_GL_BUFINFO_CACHE=%d
 ", v ? 1 : 0);
         return v;
