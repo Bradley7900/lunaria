@@ -14398,19 +14398,23 @@ static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name *
  * stale entry. Our own unmap's glBufferData keeps the size and usage it read
  * here. Under the execution lock like g_gl_mapped. */
 struct GlBufInfo { int32_t size; uint32_t usage; };
-/* LUNARIA_GL_MAP_UNLOCKED=0 keeps deferred-map uploads under the execution
- * lock, LUNARIA_GL_BUFINFO_CACHE=0 asks the driver on every map (to bisect). */
+/* Both OFF by default since ldoe101: with them on (ldoe100) 2pg froze on its
+ * loading screen in 3 of 3 runs on Aloa's PC (every thread parked, UnityMain's
+ * callback wait never signalled), and ldoe99 without them loaded. Which of the
+ * two it is is not known yet. LUNARIA_GL_MAP_UNLOCKED=1 runs deferred-map
+ * uploads without the execution lock, LUNARIA_GL_BUFINFO_CACHE=1 caches
+ * GL_BUFFER_SIZE/USAGE per buffer. */
 static bool gl_map_unlocked(void) {
     static const bool on = [] {
         const char *e = lunaria_env("LUNARIA_GL_MAP_UNLOCKED");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     return on;
 }
 static bool gl_bufinfo_cache_on(void) {
     static const bool on = [] {
         const char *e = lunaria_env("LUNARIA_GL_BUFINFO_CACHE");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     return on;
 }
@@ -46801,7 +46805,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 if (g_gl_bufinfo.size() > 65536u) g_gl_bufinfo.clear();
                 g_gl_bufinfo[buf] = GlBufInfo{ size, (uint32_t)usage };
             }
-            if (size > 0 && (uint64_t)off + len <= (uint64_t)size) {
+            /* ldoe100 skipped this query; until we know what froze 2pg there,
+             * it is asked again unless the cache is switched on. */
+            GLint mapped = 0;
+            if (!gl_bufinfo_cache_on())
+                gbi((GLenum)r0, 0x88BCu /* GL_BUFFER_MAPPED */, &mapped);
+            if (size > 0 && !mapped && (uint64_t)off + len <= (uint64_t)size) {
                 uint32_t gva = arm_malloc(ctx, len);
                 if (gva) {
                     GlMappedBuf m{ nullptr, gva, len, access };
