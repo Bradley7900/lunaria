@@ -3993,7 +3993,10 @@ static int drain_pending(struct dvm *vm, bool nested)
          const int i = 0;
          struct dvm_class *c = dvm_object_class(vm, list[i]);
          struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
-         bool proxy_run = !run && c && c->super && c->super->name &&
+         /* A proxy's run() resolves to Runnable's abstract declaration,
+          * so "found" does not mean "has a body" for one. */
+         bool proxy_run = (!run || (!run->has_code && !run->builtin)) &&
+                          c && c->super && c->super->name &&
                           !strcmp(c->super->name, "java/lang/reflect/Proxy");
          /* How late this looper is.
           *

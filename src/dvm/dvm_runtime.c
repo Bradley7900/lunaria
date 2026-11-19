@@ -5314,8 +5314,15 @@ static bool queue_runnable_for(struct dvm *vm, dvm_ref r, bool as_thread,
        && quitting.i) return false;
    struct dvm_class *c = r ? dvm_object_class(vm, r) : NULL;
    struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
-   if ((!run && !class_extends_proxy(c)) ||
-       (run && !run->has_code && !run->builtin))
+   /* A generated proxy resolves run() to Runnable's abstract declaration
+    * (dvm_find_method returns it so invocation can reach the
+    * InvocationHandler), so "no code" is not "nothing to run" for one.
+    * Dropping it here lost every proxy posted from a background thread:
+    * Unity's AndroidJavaRunnable, and with it 2PG's UMP consent form, which
+    * the game then waited on forever (20-11, r52). */
+   const bool proxy = class_extends_proxy(c);
+   if ((!run && !proxy) ||
+       (run && !run->has_code && !run->builtin && !proxy))
       return true;   /* nothing to run: done */
    if (!pending_reserve(vm)) {
       /* Only actual allocation failure can reject a post. */
@@ -31964,7 +31971,8 @@ static bool looper_loop(struct dvm *vm, dvm_ref self,
          union dvm_value ret;
          bool ok = true;
          dvm_runtime_looper_log(vm, me, true, r);
-         if (run) ok = dvm_call(vm, run, r, NULL, 0, &ret);
+         if (run && (run->has_code || run->builtin))
+            ok = dvm_call(vm, run, r, NULL, 0, &ret);
          else if (class_extends_proxy(c)) {
             struct dvm_class *iface =
                dvm__class_by_desc(vm, "Ljava/lang/Runnable;");

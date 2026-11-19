@@ -8098,7 +8098,7 @@ static bool act_runOnUiThread(struct dvm *vm, dvm_ref self,
    struct dvm_class *c = dvm_object_class(vm, runnable);
    struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
    union dvm_value ignored = { 0 };
-   if (run) {
+   if (run && (run->has_code || run->builtin)) {
       if (!dvm_call(vm, run, runnable, NULL, 0, &ignored)) return false;
    } else {
       struct dvm_class *iface = dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
