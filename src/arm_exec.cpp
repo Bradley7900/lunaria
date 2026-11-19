@@ -43196,7 +43196,20 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         path = stable_path;
         stat_slow.path = stable_path;
         int rc = host_file_infoat_unlocked(LUNA_AT_FDCWD, path, &st, nofollow ? LUNA_AT_NOFOLLOW : 0);
+        /* The package does not change while it runs, so a path the APK
+         * fallback could not find stays not found. Unity probes every asset
+         * for .split0-N/.res/.resS/.resG companions at boot, and each miss
+         * cost ~16 ms under the execution lock (LDoE r54: 96 of them). The
+         * host stat above still runs every time, so a real file created
+         * later at such a path is still seen. */
+        static std::mutex apk_missing_mu;
+        static std::unordered_set<std::string> apk_missing;
+        bool apk_known_missing = false;
         if (rc != 0 && path) {
+            std::lock_guard<std::mutex> g(apk_missing_mu);
+            apk_known_missing = apk_missing.count(path) != 0;
+        }
+        if (rc != 0 && path && !apk_known_missing) {
             stat_slow.fallback = true;
             /* The cache copy of an APK member is a plain file either way:
              * nothing inside a zip is a symlink, so follow/no-follow is the
@@ -43211,11 +43224,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     rc, rc == 0 ? (long long)st.size : -1,
                     rc == 0 ? st.mode : 0, lr);
         // Path is a directory *inside* the APK (App Bundle base/ prefix): the zip has no explicit dir entry, so synthesize one.
-        if (rc != 0 && path && apk_path_is_dir(path)) {
+        if (rc != 0 && path && !apk_known_missing && apk_path_is_dir(path)) {
             memset(&st, 0, sizeof st);
             st.mode = S_IFDIR | 0755;
             st.links = 2;
             rc = 0;
+        }
+        if (rc != 0 && path && stat_slow.fallback) {
+            std::lock_guard<std::mutex> g(apk_missing_mu);
+            if (apk_missing.size() < 65536u) apk_missing.insert(path);
         }
         /* A failing stat has to leave the reason behind: `if (luna_file_stat_follow(p, &st) <
          * 0 && errno == ENOENT)` is how a guest tells "no such file" from
