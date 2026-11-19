@@ -2006,6 +2006,25 @@ JNIEnv_CallStaticVoidMethodA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
       (void)JVM_CALL_A(fp, jobject, jclass, p0, p1, p3);
 }
 
+/* A void call that neither a host stub nor the DVM took returns as if it ran.
+ * Say so: Google's UMP plugin shows its consent form through
+ * Activity.runOnUiThread, and a silently dropped call there left 2PG waiting
+ * on a form nobody asked for (20-11). */
+static void
+jvm_void_call_dropped(JNIEnv *env, jmethodID method_id)
+{
+   static unsigned n;
+   if (n++ >= 32u) return;
+   struct jvm *jvm = jnienv_get_jvm(env);
+   struct jvm_object *mo = jvm_get_object(jvm, method_id);
+   if (!mo || mo->type != JVM_OBJECT_METHOD) return;
+   struct jvm_object *ko = jvm_get_object_of_type(jvm, mo->method.klass, JVM_OBJECT_CLASS);
+   fprintf(stderr, "[jvm] void call DROPPED (no host stub, the DVM did not take it): "
+           "%s.%s%s\n", ko ? ko->klass.name.data : "?",
+           mo->method.name.data ? mo->method.name.data : "?",
+           mo->method.signature.data ? mo->method.signature.data : "");
+}
+
 static void
 JNIEnv_CallVoidMethodV(JNIEnv* p0, jobject p1, jmethodID p2, va_list p3)
 {
@@ -2023,6 +2042,8 @@ JNIEnv_CallVoidMethodV(JNIEnv* p0, jobject p1, jmethodID p2, va_list p3)
    }
    if (f.ptr)
       f.fun(p0, p1, p3);
+   else
+      jvm_void_call_dropped(p0, p2);
 }
 
 static void
@@ -2046,6 +2067,8 @@ JNIEnv_CallVoidMethodA(JNIEnv* p0, jobject p1, jmethodID p2, jvalue* p3)
    }
    if (fp)
       (void)JVM_CALL_A(fp, jobject, jobject, p0, p1, p3);
+   else
+      jvm_void_call_dropped(p0, p2);
 }
 
 static void
