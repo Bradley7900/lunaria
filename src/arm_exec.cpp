@@ -62397,7 +62397,11 @@ static const uint32_t kStrEqualsPat[64][2] = {
     {0x54000880u,0xffffffffu}, {0x710012bfu,0xffffffffu}, {0x54000480u,0xffffffffu}, {0x710016bfu,0xffffffffu},
     {0x54000ae1u,0xffffffffu}, {0xb9400295u,0xffc003ffu}, {0xb9400268u,0xffc003ffu}, {0x6b0802bfu,0xffffffffu},
 };
-struct Il2cppStrKeySite { GuestVA wb_flag; };
+/* The write barrier il2cpp runs on the out-parameter store, as this build
+ * implements it when its enable flag is set (Unity's incremental GC, on in
+ * LDoE): one bit per 4 KiB page in a dirty bitmap, set with an atomic OR,
+ *     word = dirty_base + ((addr >> 18) & 0x7fff) * 8, bit = (addr >> 12) & 63. */
+struct Il2cppStrKeySite { GuestVA wb_flag; GuestVA dirty_base; };
 static std::map<uint32_t, Il2cppStrKeySite> g_il2cpp_strkey_sites;
 static std::atomic<uint64_t> g_il2cpp_strkey_calls{0}, g_il2cpp_strkey_back{0},
                              g_il2cpp_strkey_keys{0};
@@ -62481,6 +62485,39 @@ static void a64_install_il2cpp_hooks(ArmExecCtx &ctx) {
                 int64_t page = (int64_t)((((a >> 5) & 0x7ffffu) << 2) | ((a >> 29) & 3u));
                 if (page & (1ll << 20)) page -= 1ll << 21;
                 const uint64_t wb64 = a64_guest_va(wb);
+                /* The enabled path, word for word apart from the two
+                 * immediates that place the bitmap:
+                 *   str x30,[sp,#-16]!; ubfx x9,x0,#18,#15; adrp x10; add x10,x10,#lo
+                 *   lsr x8,x0,#12; mov w11,#1; add x9,x10,x9,lsl #3; lsl x0,x11,x8
+                 *   add x8,x9,#hi,lsl #12; add x1,x8,#lo2; bl atomic_or */
+                uint32_t bw[14];
+                for (int i = 0; i < 14; ++i) bw[i] = ctx.mem.read32(wb + 4u * (uint32_t)i);
+                const uint32_t ta = bw[5], tb = bw[6], th = bw[11], tl = bw[12];
+                const bool bshape =
+                    bw[3] == 0xf81f0ffeu && bw[4] == 0xd3528009u &&
+                    (ta & 0x9f00001fu) == 0x9000000au &&
+                    (tb & 0xffc003ffu) == 0x9100014au &&
+                    bw[7] == 0xd34cfc08u && bw[8] == 0x5280002bu &&
+                    bw[9] == 0x8b090d49u && bw[10] == 0x9ac82160u &&
+                    (th & 0xffc003ffu) == 0x91400128u &&
+                    (tl & 0xffc003ffu) == 0x91000101u &&
+                    (bw[13] & 0xfc000000u) == 0x94000000u;
+                uint32_t orfn = bshape ? il2cpp_branch_target(wb + 52u, bw[13]) : 0u;
+                const bool orshape = orfn &&
+                    ctx.mem.read32(orfn + 16u) == 0xf8203020u &&  /* ldset x0,x0,[x1] */
+                    ctx.mem.read32(orfn + 28u) == 0xc85f7c20u;    /* ldxr x0,[x1] */
+                if (!bshape || !orshape) {
+                    fprintf(stderr, "[hook] il2cpp string-key lookup @0x%08x: write "
+                            "barrier body unknown; left alone
+", canon);
+                    continue;
+                }
+                int64_t tpage = (int64_t)((((ta >> 5) & 0x7ffffu) << 2) | ((ta >> 29) & 3u));
+                if (tpage & (1ll << 20)) tpage -= 1ll << 21;
+                const uint64_t tadrp = a64_guest_va(wb + 20u);
+                const GuestVA dirty_base = (GuestVA)((tadrp & ~0xfffull) +
+                    (uint64_t)(tpage * 4096ll) + (uint64_t)((tb >> 10) & 0xfffu) +
+                    ((uint64_t)((th >> 10) & 0xfffu) << 12) + (uint64_t)((tl >> 10) & 0xfffu));
                 const GuestVA flag = (GuestVA)((wb64 & ~0xfffull) + (uint64_t)(page * 4096ll) +
                                                (uint64_t)((l >> 10) & 0xfffu) * 4u);
                 const uint32_t o0 = ctx.mem.read32(canon), o1 = ctx.mem.read32(canon + 4u);
@@ -62502,7 +62539,7 @@ static void a64_install_il2cpp_hooks(ArmExecCtx &ctx) {
                 const GuestVA resume = a64_guest_va(canon + 8u);
                 std::memcpy(ctx.mem.ptr(stub + 16u), &resume, sizeof resume);
                 g_ue_replace_resume[canon] = stub;
-                g_il2cpp_strkey_sites[canon] = Il2cppStrKeySite{ flag };
+                g_il2cpp_strkey_sites[canon] = Il2cppStrKeySite{ flag, dirty_base };
                 g_code_hook_va[g_code_hook_n] = canon;
                 g_code_hook_handler[g_code_hook_n] = SVC_IL2CPP_STRKEY_FIND;
                 ++g_code_hook_n;
@@ -64130,7 +64167,7 @@ public:
             uint64_t keys = 0;
             uint32_t nkeys = 0, flag = 1;
             if (st == g_il2cpp_strkey_sites.end() || !rd32(st->second.wb_flag, flag) ||
-                flag != 0 || !self || !rd64(self + 0x10u, keys) || !keys ||
+                !self || !rd64(self + 0x10u, keys) || !keys ||
                 !rd32(keys + 0x18u, nkeys) || !out || !mem.try_ptr(out, 8)) {
                 back();
                 return;
@@ -64185,7 +64222,15 @@ public:
                     return;
                 }
             }
+            uint64_t *dirty = nullptr;
+            if (flag) {
+                dirty = (uint64_t *)mem.try_ptr(
+                    st->second.dirty_base + (GuestVA)(((out >> 18) & 0x7fffu) * 8u), 8);
+                if (!dirty) { back(); return; }
+            }
             std::memcpy(mem.try_ptr(out, 8), &value, 8);
+            if (dirty)
+                __atomic_fetch_or(dirty, 1ull << ((out >> 12) & 63u), __ATOMIC_SEQ_CST);
             jit64->SetRegister(0, hit >= 0 ? 1u : 0u);
             return;
         }
