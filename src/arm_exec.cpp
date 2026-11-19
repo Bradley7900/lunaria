@@ -14398,6 +14398,22 @@ static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name *
  * stale entry. Our own unmap's glBufferData keeps the size and usage it read
  * here. Under the execution lock like g_gl_mapped. */
 struct GlBufInfo { int32_t size; uint32_t usage; };
+/* LUNARIA_GL_MAP_UNLOCKED=0 keeps deferred-map uploads under the execution
+ * lock, LUNARIA_GL_BUFINFO_CACHE=0 asks the driver on every map (to bisect). */
+static bool gl_map_unlocked(void) {
+    static const bool on = [] {
+        const char *e = lunaria_env("LUNARIA_GL_MAP_UNLOCKED");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+static bool gl_bufinfo_cache_on(void) {
+    static const bool on = [] {
+        const char *e = lunaria_env("LUNARIA_GL_BUFINFO_CACHE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 static std::unordered_map<uint32_t, GlBufInfo> g_gl_bufinfo;
 static uint64_t g_gl_bufinfo_gen = 0;      /* bumped by the guest calls above */
 static uint64_t g_gl_bufinfo_seen = ~0ull; /* what the table was built under */
@@ -46772,7 +46788,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             const uint64_t want = g_gl_bufinfo_gen ^
                 ((uint64_t)g_gl_state_gen.load(std::memory_order_acquire) << 32);
             if (g_gl_bufinfo_seen != want) { g_gl_bufinfo.clear(); g_gl_bufinfo_seen = want; }
-            auto known = g_gl_bufinfo.find(buf);
+            auto known = gl_bufinfo_cache_on() ? g_gl_bufinfo.find(buf)
+                                               : g_gl_bufinfo.end();
             if (known != g_gl_bufinfo.end()) {
                 size = known->second.size;
                 usage = (GLint)known->second.usage;
@@ -46903,7 +46920,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 const void *src = ctx.mem.ptr(m.gva);
                 /* m is a copy and the shadow is freed only below, so the
                  * upload can run without the lock. */
-                ArmLockDropped gl_unlocked;
+                std::optional<ArmLockDropped> gl_unlocked;
+                if (gl_map_unlocked()) gl_unlocked.emplace();
                 /* Replacing the whole buffer as INVALIDATE_BUFFER asked: one
                  * glBufferData, which lets the driver orphan instead of wait. */
                 if ((m.access & 0x0008u) && m.off == 0 && m.len == m.size)
@@ -46948,8 +46966,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                  * the upload is the one part of the call that can wait. */
                 const GLintptr at = (GLintptr)(m.off + off);
                 const void *src = ctx.mem.ptr(m.gva + off);
-                ArmLockDropped gl_unlocked;
-                pfn_glBufferSubData((GLenum)r0, at, (GLsizeiptr)len, src);
+                if (!gl_map_unlocked()) {
+                    pfn_glBufferSubData((GLenum)r0, at, (GLsizeiptr)len, src);
+                } else {
+                    ArmLockDropped gl_unlocked;
+                    pfn_glBufferSubData((GLenum)r0, at, (GLsizeiptr)len, src);
+                }
             } else if (!(m.access & 0x0010u) || (uint64_t)off + len > m.len)
                 guest_gl_set_error(0x0502u /* GL_INVALID_OPERATION / VALUE, as the host would */);
             break;
@@ -67276,7 +67298,12 @@ static void a64_dispatch(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, uint32_t
              * strands it until something happens to signal it (that is how UE's RHI
              * thread, which owns the context, ends up parked for a minute while the
              * render thread waits on it). */
-            g_requeue_no_poke = true;
+            /* LUNARIA_GL_REQUEUE_POKE=1 restores the poke (to bisect). */
+            static const bool poke = [] {
+                const char *e = lunaria_env("LUNARIA_GL_REQUEUE_POKE");
+                return e && e[0] == '1';
+            }();
+            g_requeue_no_poke = !poke;
             thread_sched_update(t);
             g_requeue_no_poke = false;
         }
