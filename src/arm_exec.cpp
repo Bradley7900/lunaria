@@ -21646,6 +21646,15 @@ static bool apk_entry_stored_span(const std::string &name, std::string &path,
     return true;
 }
 
+/* The inflated size of a zip member, from the index alone. */
+static bool apk_entry_size(const std::string &name, uint64_t &size) {
+    if (!apk_open()) return false;
+    auto it = g_dir.find(name);
+    if (it == g_dir.end()) return false;
+    size = it->second.uncomp;
+    return true;
+}
+
 static bool apk_read(const std::string &name, std::vector<uint8_t> &out) {
     if (!apk_open()) return false;
     /* Zip index first: O(log n) miss.  Disk is only needed for split overlays
@@ -22270,6 +22279,21 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
         }
         // Exact name missing — try disk .splitN pieces, then the indexed APK.
         if (apk_concat_splits_to_cache(inner, out, outsz)) return true;
+    }
+    /* An entry already extracted is answered from the index: stat() of an APK
+     * member used to inflate the whole member on every call just to compare
+     * its size with the cache copy, under the execution lock (Exploration
+     * Craft, 20-11: "stat" held the lock 34-74% of the time). */
+    for (int pi = 0; cache_prefixes[pi]; pi++) {
+        uint64_t want = 0;
+        const std::string name = std::string(cache_prefixes[pi]) + inner;
+        if (!asset_bridge::apk_entry_size(name, want)) continue;
+        if ((size_t)snprintf(out, outsz, "/tmp/lunaria-apk-cache/%s", name.c_str()) >= outsz)
+            break;
+        struct stat cst;
+        if (luna_file_stat_follow(out, &cst) == 0 && (uint64_t)cst.st_size == want)
+            return true;
+        break;   /* the index has it but the cache does not: extract below */
     }
     std::vector<uint8_t> data;
     std::string inner_str;
