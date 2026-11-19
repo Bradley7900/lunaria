@@ -133,6 +133,7 @@ static const uint32_t cxa_guard_abort_code64[] = {
 #include <locale.h>
 #include <fenv.h>
 #include <map>
+#include <type_traits>
 #include <set>
 #include <memory>
 #include <deque>
@@ -25783,6 +25784,25 @@ static void guest_env_init_once(void) {
     g_guest_env["ANDROID_DATA"] = "/data";
     if (const char *pkg = lunaria_env("ANDROID_PACKAGE_NAME"))
         if (*pkg) g_guest_env["ANDROID_PACKAGE_NAME"] = pkg;
+    /* LUNARIA_GUEST_ENV="K=V;K2=V2": extra variables the game itself sees
+     * through getenv/environ. Made for the runtime's own tuning knobs, e.g.
+     * Boehm GC's GC_DISABLE_INCREMENTAL / GC_FREE_SPACE_DIVISOR /
+     * GC_INITIAL_HEAP_SIZE, read once at GC_init inside libil2cpp. */
+    if (const char *ex = lunaria_env("LUNARIA_GUEST_ENV")) {
+        std::string all(ex);
+        size_t at = 0;
+        while (at <= all.size()) {
+            size_t end = all.find(';', at);
+            if (end == std::string::npos) end = all.size();
+            std::string kv = all.substr(at, end - at);
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos && eq > 0) {
+                g_guest_env[kv.substr(0, eq)] = kv.substr(eq + 1);
+                fprintf(stderr, "[env] guest %s\n", kv.c_str());
+            }
+            at = end + 1;
+        }
+    }
 }
 
 extern "C" const char *arm_exec_guest_getenv(const char *name) {
@@ -62188,7 +62208,7 @@ static const CodeHookDef kCodeHookSyms[] = {
       SVC_STB_VORBIS_READ, 0, 0, true },
 };
 
-enum { CODE_HOOK_MAX = sizeof kCodeHookSyms / sizeof kCodeHookSyms[0] + 8 /* il2cpp */ };
+enum { CODE_HOOK_MAX = sizeof kCodeHookSyms / sizeof kCodeHookSyms[0] + 8 /* il2cpp */ + 128 /* outline atomics */ };
 
 /* `brk #0x4855`.  Any immediate does; this one is distinct from the RET probe
  * LUNARIA_TRACE_A64_RET uses so a stray report cannot be mistaken for it. */
@@ -62240,6 +62260,81 @@ static bool a64_host_hooks_on(void) {
  * the per-site tables, which are written once at hook installation and only
  * read here.  That is the same rule svc_lockfree() applies to these handlers
  * already; what is new is that there is no SVC to account for. */
+/* Outline atomic helpers run by the host (see a64_install_il2cpp_hooks).
+ * site -> the helper's own LSE instruction, which says the operation, the
+ * width and which of x0..x2 are the operands. */
+static std::map<uint32_t, uint32_t> g_lse_helper_sites;
+
+/* LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP and CAS whose
+ * operands are all in x0..x2 and whose result lands in x0: the only shapes
+ * the three-in, one-out host-hook contract can carry. */
+static bool lse_helper_supported(uint32_t op) {
+    const uint32_t rs = (op >> 16) & 31u, rn = (op >> 5) & 31u, rt = op & 31u;
+    if ((op & 0x3f200c00u) == 0x38200000u) {             /* atomic memory op */
+        const uint32_t o3 = (op >> 15) & 1u, opc = (op >> 12) & 7u;
+        if (o3 && opc != 0u) return false;               /* only SWP under o3 */
+        return rs <= 2u && rn <= 2u && rt == 0u && rn != rs;
+    }
+    if ((op & 0x3fa07c00u) == 0x08a07c00u)               /* CAS */
+        return rs == 0u && rt <= 2u && rn <= 2u && rn != rs && rt != rs;
+    return false;
+}
+
+template <typename T>
+static T lse_apply(T *p, uint32_t op, T v, T expect) {
+    if ((op & 0x3fa07c00u) == 0x08a07c00u) {             /* CAS: v = new */
+        T e = expect;
+        __atomic_compare_exchange_n(p, &e, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        return e;                                        /* the old value either way */
+    }
+    const uint32_t o3 = (op >> 15) & 1u, opc = (op >> 12) & 7u;
+    if (o3) return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST);
+    switch (opc) {
+    case 0: return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
+    case 1: return __atomic_fetch_and(p, (T)~v, __ATOMIC_SEQ_CST);
+    case 2: return __atomic_fetch_xor(p, v, __ATOMIC_SEQ_CST);
+    case 3: return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST);
+    default: break;
+    }
+    typedef typename std::make_signed<T>::type S;
+    T old = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+    for (;;) {
+        T next;
+        switch (opc) {
+        case 4: next = (S)old > (S)v ? old : v; break;   /* SMAX */
+        case 5: next = (S)old < (S)v ? old : v; break;   /* SMIN */
+        case 6: next = old > v ? old : v; break;         /* UMAX */
+        default: next = old < v ? old : v; break;        /* UMIN */
+        }
+        if (__atomic_compare_exchange_n(p, &old, next, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return old;
+    }
+}
+
+static uint64_t lse_helper_run(ArmMemory &mem, uint32_t site,
+                               uint64_t a0, uint64_t a1, uint64_t a2) {
+    auto it = g_lse_helper_sites.find(site);
+    if (it == g_lse_helper_sites.end()) return 0;
+    const uint32_t op = it->second;
+    const uint64_t r[3] = { a0, a1, a2 };
+    const uint32_t rs = (op >> 16) & 31u, rn = (op >> 5) & 31u, rt = op & 31u;
+    const bool cas = (op & 0x3fa07c00u) == 0x08a07c00u;
+    const uint64_t addr = r[rn];
+    const uint64_t v = cas ? r[rt] : r[rs];
+    const uint64_t expect = cas ? r[rs] : 0;
+    const unsigned size = 1u << (op >> 30);
+    if (addr & (size - 1u)) return 0;
+    void *p = mem.try_ptr((GuestVA)addr, size);
+    if (!p) return 0;
+    switch (size) {
+    case 1: return lse_apply<uint8_t>((uint8_t *)p, op, (uint8_t)v, (uint8_t)expect);
+    case 2: return lse_apply<uint16_t>((uint16_t *)p, op, (uint16_t)v, (uint16_t)expect);
+    case 4: return lse_apply<uint32_t>((uint32_t *)p, op, (uint32_t)v, (uint32_t)expect);
+    default: return lse_apply<uint64_t>((uint64_t *)p, op, v, expect);
+    }
+}
+
 static uint64_t a64_host_hook_call(uint32_t id, uint64_t a0, uint64_t a1,
                                    uint64_t a2) {
     if (!id || id > g_host_hook_sites.size() || !g_ctx) return 0;
@@ -62254,6 +62349,8 @@ static uint64_t a64_host_hook_call(uint32_t id, uint64_t a0, uint64_t a1,
     }();
     static std::atomic<int> traced{0};
     const bool say = trace && traced.fetch_add(1, std::memory_order_relaxed) < 24;
+    if (hs.handler == SVC_A64_LSE_HELPER)
+        return lse_helper_run(mem, hs.site, a0, a1, a2);
 
     if (hs.handler == SVC_UE_STRICMP || hs.handler == SVC_UE_STRNICMP) {
         auto it = g_stricmp_sites.find(hs.site);
@@ -62560,6 +62657,50 @@ static void a64_install_il2cpp_hooks(ArmExecCtx &ctx) {
                         "(LUNARIA_IL2CPP_HOOKS=0 to disable)\n", canon,
                         (unsigned long long)(a64_guest_va(canon) - m.load_bias),
                         (unsigned long long)flag);
+            }
+            /* Outline atomics (libgcc/compiler-rt __aarch64_ldset8_relax and
+             * friends): `[bti c;] adrp x16; ldrb w16,[x16,#lse]; cbz w16,+12;
+             * <LSE op>; ret; <ldxr/stxr loop>`. dynarmic has no LSE, so the
+             * guest always takes the exclusive loop. Il2cpp's GC write barrier
+             * calls one per reference store (LDoE's post-connect freeze: 12%
+             * of guest samples). They fit the in-block host-hook contract
+             * exactly, so the host does the operation as one locked
+             * instruction. Host and guest atomics agree because dynarmic's
+             * inline exclusive store is itself a compare-exchange. */
+            if (a64_host_hooks_on()) {
+                unsigned lse_found = 0;
+                for (size_t k = 0; k + 6 <= words; ++k) {
+                    uint32_t w[6];
+                    std::memcpy(w, code + k * 4u, sizeof w);
+                    size_t at = 0;
+                    if (w[0] == 0xd503245fu) at = 1;             /* bti c */
+                    if (at + 5 > 6) continue;
+                    if ((w[at] & 0x9f00001fu) != 0x90000010u) continue;      /* adrp x16 */
+                    if ((w[at + 1] & 0xffc003ffu) != 0x39400210u) continue;  /* ldrb w16,[x16] */
+                    if (w[at + 2] != 0x34000070u) continue;                  /* cbz w16,+12 */
+                    if (w[at + 4] != 0xd65f03c0u) continue;                  /* ret */
+                    const uint32_t op = w[at + 3];
+                    if (!lse_helper_supported(op)) continue;
+                    const uint32_t canon = lo + (uint32_t)(k * 4u);
+                    if (g_code_hook_n >= CODE_HOOK_MAX || a64_code_hook_for(canon)) continue;
+                    if (g_host_hook_sites.size() >= 0xfffeu) break;
+                    g_lse_helper_sites[canon] = op;
+                    g_host_hook_sites.push_back({ SVC_A64_LSE_HELPER, canon });
+                    g_host_hook_id_by_va[canon] = (uint32_t)g_host_hook_sites.size();
+                    g_code_hook_va[g_code_hook_n] = canon;
+                    g_code_hook_handler[g_code_hook_n] = SVC_A64_LSE_HELPER;
+                    ++g_code_hook_n;
+                    if (canon < g_code_hook_lo) g_code_hook_lo = canon;
+                    if (canon > g_code_hook_hi) g_code_hook_hi = canon;
+                    const GuestVA hook_va = a64_guest_va(canon);
+                    a64_invalidate_main_jit(ctx, hook_va, 4u);
+                    a64_invalidate_engines(hook_va, 4u);
+                    cb_invalidate_all(hook_va, 4u);
+                    ++lse_found;
+                }
+                if (lse_found)
+                    fprintf(stderr, "[hook] libil2cpp.so: %u outline atomic helper(s) -> "
+                            "host atomics (LUNARIA_HOST_HOOKS=0 to disable)\n", lse_found);
             }
         }
         if (!found)

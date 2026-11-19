@@ -1999,6 +1999,7 @@ enum SvcId : uint32_t {
     /* Host il2cpp string-keyed TryGetValue (a64_install_il2cpp_hooks): a
      * code hook, never bound to a symbol. */
     SVC_IL2CPP_STRKEY_FIND,
+    SVC_A64_LSE_HELPER,
     SVC_TRAMP_TOTAL,
 };
 
