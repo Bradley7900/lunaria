@@ -28901,7 +28901,8 @@ static bool svc_lockfree_compute(uint32_t no) {
          * nothing to serialise against. */
         for (uint32_t n : {SVC_FAES_DECRYPT, SVC_FSHA1_HASHBUFFER,
                            SVC_CITYHASH64, SVC_CITYHASH32,
-                           SVC_DES_NCBC, SVC_DES_EDE3_CBC})
+                           SVC_DES_NCBC, SVC_DES_EDE3_CBC,
+                           SVC_IL2CPP_STRKEY_FIND})
             set(n);
 
         /* the host clock, written into a guest timespec */
@@ -29086,7 +29087,8 @@ static void svc_info_build(void)
                         SVC_UE_UTF8_TO_TCHAR, SVC_UE_REPLACE_INLINE,
                         SVC_UE_FINDCHAR, SVC_DES_NCBC, SVC_DES_EDE3_CBC,
                         SVC_CITYHASH64, SVC_CITYHASH32, SVC_UE_PLATE_LFO,
-                        SVC_STB_VORBIS_INFO, SVC_STB_VORBIS_READ})
+                        SVC_STB_VORBIS_INFO, SVC_STB_VORBIS_READ,
+                        SVC_IL2CPP_STRKEY_FIND})
         g_svc_info[no].flags |= SVCF_A64_HOOK;
 
     auto fp = [](uint32_t no, uint8_t pos, uint8_t n, uint8_t mode) {
@@ -62171,7 +62173,7 @@ static const CodeHookDef kCodeHookSyms[] = {
       SVC_STB_VORBIS_READ, 0, 0, true },
 };
 
-enum { CODE_HOOK_MAX = sizeof kCodeHookSyms / sizeof kCodeHookSyms[0] };
+enum { CODE_HOOK_MAX = sizeof kCodeHookSyms / sizeof kCodeHookSyms[0] + 8 /* il2cpp */ };
 
 /* `brk #0x4855`.  Any immediate does; this one is distinct from the RET probe
  * LUNARIA_TRACE_A64_RET uses so a stray report cannot be mistaken for it. */
@@ -62330,6 +62332,160 @@ static inline uint32_t a64_code_hook_for(uint32_t canon) {
     return 0;
 }
 
+/* il2cpp: a string-keyed lookup that walks its key array with
+ * String.Equals(key[i], name, StringComparison.OrdinalIgnoreCase).
+ *
+ *     bool TryGetValue(this, string name, out T value)
+ *       keys = this->[0x10] (string[]), values = this->[0x18] (T[])
+ *       for i in 0..keys.Length: if Equals(keys[i], name, 5) { value = values[i]; return true; }
+ *       value = null; return false;
+ *
+ * Last Day on Earth calls it so often while it loads that this loop and the
+ * Equals it calls were 72% of every guest instruction in the 35-second freeze
+ * after the game connects (Aloa, ldoe97b: Equals 50%, the loop 22%). Almost
+ * every compare ends at the length test, so what costs is the walk itself,
+ * about thirty guest instructions and a call per key.
+ *
+ * Found by its instructions (B/BL targets aside), not by address: libil2cpp
+ * is stripped. The callee must be String.Equals by its own instructions, and
+ * the out-parameter store must go through il2cpp's write barrier whose
+ * enable flag we can read; otherwise the hook is not installed.
+ *
+ * The host answers only what it can answer exactly. A null key array, a
+ * missing or short value array (the guest throws there), two different
+ * non-ASCII characters (case folding outside ASCII is the class library's
+ * table, not ours) or an enabled write barrier all hand the call back to the
+ * guest's own code, from the start. LUNARIA_IL2CPP_HOOKS=0 turns it off. */
+KEYPAT
+EQPAT
+struct Il2cppStrKeySite { GuestVA wb_flag; };
+static std::map<uint32_t, Il2cppStrKeySite> g_il2cpp_strkey_sites;
+static std::atomic<uint64_t> g_il2cpp_strkey_calls{0}, g_il2cpp_strkey_back{0},
+                             g_il2cpp_strkey_keys{0};
+
+static bool il2cpp_words_match(ArmExecCtx &ctx, uint32_t canon,
+                               const uint32_t (*pat)[2], size_t n) {
+    const uint8_t *p = ctx.mem.try_ptr((GuestVA)canon, n * 4u);
+    if (!p) return false;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t w;
+        std::memcpy(&w, p + i * 4u, 4);
+        if ((w & pat[i][1]) != pat[i][0]) return false;
+    }
+    return true;
+}
+
+static uint32_t il2cpp_branch_target(uint32_t at, uint32_t insn) {
+    int32_t imm = (int32_t)(insn & 0x03ffffffu);
+    if (imm & 0x02000000) imm -= 0x04000000;
+    return at + (uint32_t)(imm * 4);
+}
+
+static void a64_install_il2cpp_hooks(ArmExecCtx &ctx) {
+    static const bool off = [] {
+        const char *e = lunaria_env("LUNARIA_IL2CPP_HOOKS");
+        return e && e[0] == '0';
+    }();
+    if (off) return;
+    static std::set<GuestVA> scanned;
+    for (const auto &m : g_module_phdrs) {
+        if (!m.is_64) continue;
+        const char *name = (const char *)ctx.mem.ptr(m.name_va);
+        if (!name) continue;
+        const char *leaf = strrchr(name, '/');
+        leaf = leaf ? leaf + 1 : name;
+        if (strcmp(leaf, "libil2cpp.so") != 0) continue;
+        if (!scanned.insert(m.load_bias).second) continue;
+        const uint8_t *ph = ctx.mem.ptr(m.phdr_va);
+        if (!ph) continue;
+        unsigned found = 0;
+        for (uint16_t pi = 0; pi < m.phnum; ++pi) {
+            const Elf64_Phdr *p = (const Elf64_Phdr *)ph + pi;
+            if (p->p_type != PT_LOAD || !(p->p_flags & 0x1u /* PF_X */)) continue;
+            const uint32_t lo = a64_canon_va(m.load_bias + (GuestVA)p->p_vaddr);
+            const size_t words = (size_t)(p->p_memsz / 4u);
+            const size_t n = sizeof kStrKeyFindPat / sizeof kStrKeyFindPat[0];
+            if (!lo || words < n) continue;
+            const uint8_t *code = ctx.mem.try_ptr((GuestVA)lo, words * 4u);
+            if (!code) continue;
+            for (size_t k = 0; k + n <= words; ++k) {
+                uint32_t w0;
+                std::memcpy(&w0, code + k * 4u, 4);
+                if (w0 != kStrKeyFindPat[0][0]) continue;
+                const uint32_t canon = lo + (uint32_t)(k * 4u);
+                if (!il2cpp_words_match(ctx, canon, kStrKeyFindPat, n)) continue;
+                /* index 20: bl String.Equals */
+                const uint32_t eq = il2cpp_branch_target(canon + 80u,
+                                                         ctx.mem.read32(canon + 80u));
+                if (!il2cpp_words_match(ctx, eq, kStrEqualsPat,
+                                        sizeof kStrEqualsPat / sizeof kStrEqualsPat[0])) {
+                    fprintf(stderr, "[hook] il2cpp string-key lookup @0x%08x: callee is "
+                            "not String.Equals as known; left alone\n", canon);
+                    continue;
+                }
+                /* index 40: bl to the write barrier; follow its tail branches
+                 * to `adrp x8; ldr w8,[x8,#imm]; cbz w8`, the enable flag. */
+                uint32_t wb = il2cpp_branch_target(canon + 160u, ctx.mem.read32(canon + 160u));
+                for (int hop = 0; hop < 4; ++hop) {
+                    const uint32_t w = ctx.mem.read32(wb);
+                    if ((w & 0xfc000000u) != 0x14000000u) break;
+                    wb = il2cpp_branch_target(wb, w);
+                }
+                const uint32_t a = ctx.mem.read32(wb), l = ctx.mem.read32(wb + 4u),
+                               c = ctx.mem.read32(wb + 8u);
+                if ((a & 0x9f00001fu) != 0x90000008u || (l & 0xffc003ffu) != 0xb9400108u ||
+                    (c & 0xff00001fu) != 0x34000008u) {
+                    fprintf(stderr, "[hook] il2cpp string-key lookup @0x%08x: write "
+                            "barrier shape unknown; left alone\n", canon);
+                    continue;
+                }
+                int64_t page = (int64_t)((((a >> 5) & 0x7ffffu) << 2) | ((a >> 29) & 3u));
+                if (page & (1ll << 20)) page -= 1ll << 21;
+                const uint64_t wb64 = a64_guest_va(wb);
+                const GuestVA flag = (GuestVA)((wb64 & ~0xfffull) + (uint64_t)(page * 4096ll) +
+                                               (uint64_t)((l >> 10) & 0xfffu) * 4u);
+                const uint32_t o0 = ctx.mem.read32(canon), o1 = ctx.mem.read32(canon + 4u);
+                if (g_code_hook_n >= CODE_HOOK_MAX || a64_insn_is_pc_relative(o0) ||
+                    a64_insn_is_pc_relative(o1) ||
+                    g_ue_stub_next + 0x20u > UE_STUB_BASE + 0x1000u)
+                    continue;
+                bool have = false;
+                for (unsigned i = 0; i < g_code_hook_n; ++i)
+                    if (g_code_hook_va[i] == canon) { have = true; break; }
+                if (have) continue;
+                const uint32_t stub = g_ue_stub_next;
+                g_ue_stub_next += 0x20u;
+                ctx.mem.map(stub, 0x20u);
+                ctx.mem.write32(stub, o0);
+                ctx.mem.write32(stub + 4u, o1);
+                ctx.mem.write32(stub + 8u, 0x58000050u);  /* ldr x16,#8 */
+                ctx.mem.write32(stub + 12u, 0xd61f0200u); /* br x16 */
+                const GuestVA resume = a64_guest_va(canon + 8u);
+                std::memcpy(ctx.mem.ptr(stub + 16u), &resume, sizeof resume);
+                g_ue_replace_resume[canon] = stub;
+                g_il2cpp_strkey_sites[canon] = Il2cppStrKeySite{ flag };
+                g_code_hook_va[g_code_hook_n] = canon;
+                g_code_hook_handler[g_code_hook_n] = SVC_IL2CPP_STRKEY_FIND;
+                ++g_code_hook_n;
+                if (canon < g_code_hook_lo) g_code_hook_lo = canon;
+                if (canon > g_code_hook_hi) g_code_hook_hi = canon;
+                const GuestVA hook_va = a64_guest_va(canon);
+                a64_invalidate_main_jit(ctx, hook_va, 4u);
+                a64_invalidate_engines(hook_va, 4u);
+                cb_invalidate_all(hook_va, 4u);
+                ++found;
+                fprintf(stderr, "[hook] il2cpp string-key lookup @0x%08x (libil2cpp.so+0x%llx) "
+                        "-> host implementation, write-barrier flag at 0x%llx "
+                        "(LUNARIA_IL2CPP_HOOKS=0 to disable)\n", canon,
+                        (unsigned long long)(a64_guest_va(canon) - m.load_bias),
+                        (unsigned long long)flag);
+            }
+        }
+        if (!found)
+            fprintf(stderr, "[hook] libil2cpp.so: no string-key lookup of the known shape\n");
+    }
+}
+
 /* Resolve the table against everything mapped so far.  Called after each
  * module publishes its exports, and idempotent: a symbol already installed is
  * not installed twice, and the first module to define one wins, which is the
@@ -62359,6 +62515,7 @@ static void a64_install_code_hooks(ArmExecCtx &ctx) {
     /* LUNARIA_CODE_HOOKS_SKIP=name,name: leave these symbols (substring match)
      * on the guest's own implementation, to measure one hook at a time. */
     const char *skip = lunaria_env("LUNARIA_CODE_HOOKS_SKIP");
+    a64_install_il2cpp_hooks(ctx);
     for (const CodeHookDef &d : kCodeHookSyms) {
         if (!d.long_work && !short_hooks) continue;
         auto it = g_exported_syms64.find(d.sym);
@@ -63888,6 +64045,111 @@ public:
          * the alternate layout: short size*2 in byte0, long cap|1,size,data.
          * Long buffers are FMemory (_Znwm/_ZdlPv), so grow/shrink through
          * those guest entry points — never arm_malloc. */
+        /* il2cpp string-keyed TryGetValue (see a64_install_il2cpp_hooks).
+         * Runs without the execution lock: it only reads guest objects the
+         * guest's own loop would read, and writes the caller's out slot. */
+        if (svc_no == SVC_IL2CPP_STRKEY_FIND) {
+            const uint32_t site = g_code_hook_site
+                                      ? g_code_hook_site
+                                      : a64_canon_va(jit64->GetPC() - 4u);
+            ArmMemory &mem = ctx->mem;
+            const uint64_t calls =
+                g_il2cpp_strkey_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (calls == 1 || (calls & ((1u << 20) - 1u)) == 0)
+                fprintf(stderr, "[il2cpp-hook] string-key lookup: %llu calls, %llu handed "
+                        "back to the guest, %llu keys compared\n",
+                        (unsigned long long)calls,
+                        (unsigned long long)g_il2cpp_strkey_back.load(std::memory_order_relaxed),
+                        (unsigned long long)g_il2cpp_strkey_keys.load(std::memory_order_relaxed));
+            auto back = [&]() {
+                g_il2cpp_strkey_back.fetch_add(1, std::memory_order_relaxed);
+                auto rs = g_ue_replace_resume.find(site);
+                if (rs != g_ue_replace_resume.end()) {
+                    jit64->SetPC(a64_guest_va(rs->second));
+                    g_code_hook_guest_resume = true;
+                    return;
+                }
+                fprintf(stderr, "[il2cpp-hook] missing guest resume veneer @0x%08x\n", site);
+                jit64->SetRegister(0, 0);
+            };
+            auto rd64 = [&](GuestVA va, uint64_t &v) -> bool {
+                const uint8_t *p = va ? mem.try_ptr(va, 8) : nullptr;
+                if (!p) return false;
+                std::memcpy(&v, p, 8);
+                return true;
+            };
+            auto rd32 = [&](GuestVA va, uint32_t &v) -> bool {
+                const uint8_t *p = va ? mem.try_ptr(va, 4) : nullptr;
+                if (!p) return false;
+                std::memcpy(&v, p, 4);
+                return true;
+            };
+            const auto st = g_il2cpp_strkey_sites.find(site);
+            const GuestVA self = jit64->GetRegister(0);
+            const GuestVA name = jit64->GetRegister(1);
+            const GuestVA out = jit64->GetRegister(2);
+            uint64_t keys = 0;
+            uint32_t nkeys = 0, flag = 1;
+            if (st == g_il2cpp_strkey_sites.end() || !rd32(st->second.wb_flag, flag) ||
+                flag != 0 || !self || !rd64(self + 0x10u, keys) || !keys ||
+                !rd32(keys + 0x18u, nkeys) || !out || !mem.try_ptr(out, 8)) {
+                back();
+                return;
+            }
+            /* The name's characters, once. */
+            int32_t nlen = -1;
+            const uint16_t *nch = nullptr;
+            if (name) {
+                uint32_t l;
+                if (!rd32(name + 0x10u, l) || (int32_t)l < 0) { back(); return; }
+                nlen = (int32_t)l;
+                nch = (const uint16_t *)mem.try_ptr(name + 0x14u, (size_t)nlen * 2u + 2u);
+                if (!nch) { back(); return; }
+            }
+            const int32_t count = (int32_t)nkeys;
+            const uint8_t *karr = count > 0
+                ? mem.try_ptr(keys + 0x20u, (size_t)count * 8u) : nullptr;
+            if (count > 0 && !karr) { back(); return; }
+            int32_t hit = -1;
+            bool unsure = false;
+            for (int32_t i = 0; i < count && hit < 0 && !unsure; ++i) {
+                uint64_t e;
+                std::memcpy(&e, karr + (size_t)i * 8u, 8);
+                if (e == name) { hit = i; break; }   /* the same object, or both null */
+                if (!e || !name) continue;
+                uint32_t el;
+                if (!rd32(e + 0x10u, el)) { unsure = true; break; }
+                if ((int32_t)el != nlen) continue;
+                const uint16_t *ech = (const uint16_t *)mem.try_ptr(e + 0x14u, (size_t)nlen * 2u + 2u);
+                if (!ech) { unsure = true; break; }
+                bool same = true;
+                for (int32_t j = 0; j < nlen; ++j) {
+                    uint32_t a = ech[j], b = nch[j];
+                    if (a == b) continue;
+                    if ((a | b) >= 0x80u) { unsure = true; same = false; break; }
+                    if (a - 'a' < 26u) a -= 0x20u;
+                    if (b - 'a' < 26u) b -= 0x20u;
+                    if (a != b) { same = false; break; }
+                }
+                if (same && !unsure) hit = i;
+            }
+            g_il2cpp_strkey_keys.fetch_add((uint64_t)(hit >= 0 ? hit + 1 : count),
+                                           std::memory_order_relaxed);
+            if (unsure) { back(); return; }
+            uint64_t value = 0;
+            if (hit >= 0) {
+                uint64_t vals = 0;
+                uint32_t nvals = 0;
+                if (!rd64(self + 0x18u, vals) || !vals || !rd32(vals + 0x18u, nvals) ||
+                    (uint32_t)hit >= nvals || !rd64(vals + 0x20u + (GuestVA)hit * 8u, value)) {
+                    back();
+                    return;
+                }
+            }
+            std::memcpy(mem.try_ptr(out, 8), &value, 8);
+            jit64->SetRegister(0, hit >= 0 ? 1u : 0u);
+            return;
+        }
         if (svc_no == SVC_UXCSV_FETCHROW) {
             const uint32_t site = g_code_hook_site
                                       ? g_code_hook_site
