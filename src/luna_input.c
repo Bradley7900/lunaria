@@ -29,7 +29,16 @@ int luna_touch_update(luna_touch_state *s, int id, int action, float x, float y,
     } else if (action == 0) {
         if (index >= 0 || s->count >= LUNA_TOUCH_MAX) return 0;
         if (!s->count) s->down_ms = now;
-        index = s->count++;
+        /* Android keeps a MotionEvent's pointers in ascending id order
+         * (TouchInputMapper walks its id bits from the lowest), so a finger
+         * that comes down with a lower id than one already held goes in
+         * front of it, and the action index says so. */
+        index = 0;
+        while (index < s->count && s->points[index].id < id) ++index;
+        memmove(&s->points[index + 1], &s->points[index],
+                (size_t)(s->count - index) * sizeof s->points[0]);
+        ++s->count;
+        memset(&s->points[index], 0, sizeof s->points[0]);
         s->points[index].id = id;
     } else if (index < 0) return 0;
     if (action != 3) {
