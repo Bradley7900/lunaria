@@ -12675,9 +12675,15 @@ enum { EGL_MC_RING = 512 };
 static EglMcRec g_egl_mc_ring[EGL_MC_RING];
 static std::atomic<uint32_t> g_egl_mc_pos{0};
 
+/* Bumped whenever any thread changes which context is current, and when a
+ * guest context is created or destroyed: the per-thread GL state filters
+ * below are only trusted while it holds still. */
+static std::atomic<uint32_t> g_gl_state_gen{1};
+
 extern "C" EGLBoolean luna_egl_make_current_rec(EGLDisplay dpy, EGLSurface draw,
                                                 EGLSurface read, EGLContext ctx,
                                                 const char *file, int line) {
+    g_gl_state_gen.fetch_add(1, std::memory_order_acq_rel);
     const EGLBoolean ok = (eglMakeCurrent)(dpy, draw, read, ctx);
     const uint32_t i = g_egl_mc_pos.fetch_add(1, std::memory_order_relaxed);
     EglMcRec &r = g_egl_mc_ring[i % EGL_MC_RING];
@@ -38172,6 +38178,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_EGL_CREATECTX: {
         // eglCreateContext(dpy, cfg, share, attribs).
+        g_gl_state_gen.fetch_add(1, std::memory_order_acq_rel);
         auto attrs = read_egl_attribs(ctx, argp(3));
         ret32(egl_host_create_context((uint32_t)r1, (uint32_t)r2,
                                       attrs.data()));
@@ -38288,6 +38295,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_EGL_DESTROYCTX:
+        g_gl_state_gen.fetch_add(1, std::memory_order_acq_rel);
         ret32((uint32_t)egl_host_destroy_context(r1));
         break;
     case SVC_EGL_TERMINATE:   ret32(EGL_TRUE); break;
@@ -40339,16 +40347,67 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
 
     
-    case SVC_GL_StencilFunc:
-        if (pfn_glStencilFunc) pfn_glStencilFunc((GLenum)r0,(GLint)r1,(GLuint)r2); break;
-    case SVC_GL_StencilFuncSeparate:
-        if (pfn_glStencilFuncSeparate) pfn_glStencilFuncSeparate((GLenum)r0,(GLenum)r1,(GLint)r2,(GLuint)r3); break;
+    /* Stencil func/op calls that repeat what the current context already holds
+     * are dropped. A split-screen 2pg race issues glStencilFuncSeparate and
+     * glStencilOpSeparate once per draw each, 20% of ~180,000 GL calls a second,
+     * and every one is a driver call under the execution lock (Aloa, 20-11, 20
+     * fps). Only the guest sets stencil func/op on its contexts (the emulator's
+     * own drawing only enables and disables the test), the state is per
+     * context, and a context's state only changes on the thread it is current
+     * on, so a per-thread copy is exact until that thread changes context;
+     * g_gl_state_gen moves on every bind anywhere and on create/destroy.
+     * LUNARIA_GL_STENCIL_FILTER=0 sends every call through. */
+    case SVC_GL_StencilFunc: case SVC_GL_StencilFuncSeparate:
+    case SVC_GL_StencilOp:   case SVC_GL_StencilOpSeparate: {
+        struct StencilCache { uint32_t gen; bool fv[2], ov[2]; uint32_t f[2][3], o[2][3]; };
+        static thread_local StencilCache c{};
+        static const bool filter_on = [] {
+            const char *e = lunaria_env("LUNARIA_GL_STENCIL_FILTER");
+            return !(e && e[0] == '0');
+        }();
+        static std::atomic<uint64_t> calls{0}, skipped{0};
+        const bool func = svc_no == SVC_GL_StencilFunc || svc_no == SVC_GL_StencilFuncSeparate;
+        const bool sep = svc_no == SVC_GL_StencilFuncSeparate || svc_no == SVC_GL_StencilOpSeparate;
+        const uint32_t face = sep ? (uint32_t)r0 : 0x0408u /* FRONT_AND_BACK */;
+        const uint32_t v[3] = { (uint32_t)(sep ? r1 : r0), (uint32_t)(sep ? r2 : r1),
+                                (uint32_t)(sep ? r3 : r2) };
+        const bool front = face == 0x0404u || face == 0x0408u;
+        const bool back  = face == 0x0405u || face == 0x0408u;
+        bool skip = false;
+        if (filter_on && (front || back)) {
+            const uint32_t g = g_gl_state_gen.load(std::memory_order_acquire);
+            if (c.gen != g) { c = StencilCache{}; c.gen = g; }
+            bool (&valid)[2] = func ? c.fv : c.ov;
+            uint32_t (&have)[2][3] = func ? c.f : c.o;
+            auto same = [&](int i) {
+                return valid[i] && have[i][0] == v[0] && have[i][1] == v[1] && have[i][2] == v[2];
+            };
+            skip = (!front || same(0)) && (!back || same(1));
+            if (!skip) {
+                if (front) { valid[0] = true; memcpy(have[0], v, sizeof v); }
+                if (back)  { valid[1] = true; memcpy(have[1], v, sizeof v); }
+            }
+        }
+        const uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (skip) skipped.fetch_add(1, std::memory_order_relaxed);
+        if ((n & ((1u << 18) - 1u)) == 0)
+            fprintf(stderr, "[gl] stencil func/op: %llu calls, %llu repeats dropped\n",
+                    (unsigned long long)n,
+                    (unsigned long long)skipped.load(std::memory_order_relaxed));
+        if (skip) break;
+        if (svc_no == SVC_GL_StencilFunc) {
+            if (pfn_glStencilFunc) pfn_glStencilFunc((GLenum)r0,(GLint)r1,(GLuint)r2);
+        } else if (svc_no == SVC_GL_StencilFuncSeparate) {
+            if (pfn_glStencilFuncSeparate) pfn_glStencilFuncSeparate((GLenum)r0,(GLenum)r1,(GLint)r2,(GLuint)r3);
+        } else if (svc_no == SVC_GL_StencilOp) {
+            if (pfn_glStencilOp) pfn_glStencilOp((GLenum)r0,(GLenum)r1,(GLenum)r2);
+        } else {
+            if (pfn_glStencilOpSeparate) pfn_glStencilOpSeparate((GLenum)r0,(GLenum)r1,(GLenum)r2,(GLenum)r3);
+        }
+        break;
+    }
     case SVC_GL_StencilMask:
         if (pfn_glStencilMask) pfn_glStencilMask((GLuint)r0); break;
-    case SVC_GL_StencilOp:
-        if (pfn_glStencilOp) pfn_glStencilOp((GLenum)r0,(GLenum)r1,(GLenum)r2); break;
-    case SVC_GL_StencilOpSeparate:
-        if (pfn_glStencilOpSeparate) pfn_glStencilOpSeparate((GLenum)r0,(GLenum)r1,(GLenum)r2,(GLenum)r3); break;
 
     
     case SVC_GL_BlendFunc:
