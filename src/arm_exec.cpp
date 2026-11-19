@@ -13755,6 +13755,36 @@ static void guest_thread_atexit_run(ArmExecCtx &ctx, uint32_t tid)
     * alone does not identify a caller stack. Use the exiting thread's saved
     * SP while its stack is still mapped, rather than dropping its dtors. */
    ArmThread *exiting = thread_slot_by_tid(tid);
+   /* A fork() child's TLS page is a byte copy of its parent's, so its
+    * pthread key slots hold the PARENT thread's values (19-11, LDoE r48/r49).
+    * On Linux the child's exec or _exit runs no key or thread_local dtors at
+    * all, and even a child pthread_exit only touches its own copy of the
+    * address space. Here the address space is shared, so running them would
+    * hand the parent thread's live objects to their destructors: Unity's Ping
+    * child (fork + exec ping, once per battle server) tore down the forking
+    * thread's il2cpp/Boehm per-thread state that way, and the first
+    * stop-the-world collection after it never completed. Drop the copied
+    * values instead. LUNARIA_FORK_CHILD_DTORS=1 restores the old behaviour. */
+   if (fork_child_by_tid(tid) && !lunaria_env("LUNARIA_FORK_CHILD_DTORS")) {
+      static unsigned said;
+      if (said++ < 4u)
+         fprintf(stderr, "[fork] child tid=%u ends: its copied thread keys "
+                 "belong to the parent, no destructors run\n", tid);
+      if (ctx.is_arm64 && exiting && exiting->tls64 &&
+          a64_has_private_tls(exiting->tls64))
+         for (uint32_t key = 0; key < TLS64_MAX_KEYS; ++key)
+            ctx.mem.write64(exiting->tls64 + TLS64_KEYS_OFF + key * 8u, 0);
+      for (uint32_t key = 0; key < GUEST_KEYS_MAX; ++key)
+         g_tls.erase({tid ? tid : 1u, key});
+      for (auto &slot : g_guest_thread_atexit)
+         if (slot.state.load(std::memory_order_acquire) == 2 && slot.tid == tid)
+            slot.state.store(0, std::memory_order_release);
+      if (exiting && ctx.is_arm64) {
+         if (exiting->tls64) arm_heap_thread_exit_key(ctx, exiting->tls64);
+         arm_heap_thread_exit_key(ctx, tid);
+      }
+      return;
+   }
    const GuestVA cleanup_sp = g_svc_caller_sp ? g_svc_caller_sp
        : exiting ? (ctx.is_arm64 ? exiting->sp64 : exiting->regs[13]) : 0;
    SvcCallerStackGuard cleanup_stack(cleanup_sp, ctx.is_arm64);
