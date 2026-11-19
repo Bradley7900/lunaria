@@ -14408,8 +14408,7 @@ static bool gl_map_unlocked(void) {
     static const bool on = [] {
         const char *e = lunaria_env("LUNARIA_GL_MAP_UNLOCKED");
         const bool v = e && e[0] == '1';
-        fprintf(stderr, "[gl] LUNARIA_GL_MAP_UNLOCKED=%d
-", v ? 1 : 0);
+        fprintf(stderr, "[gl] LUNARIA_GL_MAP_UNLOCKED=%d\n", v ? 1 : 0);
         return v;
     }();
     return on;
@@ -14420,8 +14419,7 @@ static bool gl_bufinfo_cache_on(void) {
          * the unlocked upload was the half that froze the loading. */
         const char *e = lunaria_env("LUNARIA_GL_BUFINFO_CACHE");
         const bool v = !(e && e[0] == '0');
-        fprintf(stderr, "[gl] LUNARIA_GL_BUFINFO_CACHE=%d
-", v ? 1 : 0);
+        fprintf(stderr, "[gl] LUNARIA_GL_BUFINFO_CACHE=%d\n", v ? 1 : 0);
         return v;
     }();
     return on;
