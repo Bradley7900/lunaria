@@ -14388,6 +14388,19 @@ static void compat_report_failure(const char *what, unsigned id, const char *log
 struct GlMappedBuf { void *host; uint32_t gva, len, access, off = 0, size = 0;
                      GLenum usage = 0; bool deferred = false; };
 static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name */
+/* GL_BUFFER_SIZE and GL_BUFFER_USAGE per buffer name, for the deferred map.
+ * Unity maps every dynamic buffer several times a frame and each map asked the
+ * driver three questions; on 2pg's split-screen race map, flush and unmap were
+ * 27% of all the time the execution lock was held (Aloa, ldoe97). Only the
+ * guest's own glBufferData/glBufferStorage/glDeleteBuffers change these, and
+ * each of them drops the whole table (g_gl_bufinfo_gen), as does any context
+ * bind, create or destroy, so names from another share group never meet a
+ * stale entry. Our own unmap's glBufferData keeps the size and usage it read
+ * here. Under the execution lock like g_gl_mapped. */
+struct GlBufInfo { int32_t size; uint32_t usage; };
+static std::unordered_map<uint32_t, GlBufInfo> g_gl_bufinfo;
+static uint64_t g_gl_bufinfo_gen = 0;      /* bumped by the guest calls above */
+static uint64_t g_gl_bufinfo_seen = ~0ull; /* what the table was built under */
 static thread_local std::map<uint32_t, uint32_t> g_gl_bound_bufs;   /* target -> buffer name */
 /* With a pixel-unpack buffer bound, GL interprets the pointer argument as a
  * byte offset into that buffer.  Translating it as guest memory corrupts or
@@ -39030,6 +39043,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         g_gl_bound_bufs[r0] = r1;   /* all targets, for MapBufferRange keys */
         if (pfn_glBindBuffer) pfn_glBindBuffer((GLenum)r0,(GLuint)r1); break;
     case SVC_GL_BufferData:
+        ++g_gl_bufinfo_gen;   /* size or usage may change (deferred map cache) */
         if (pfn_glBufferData) {
             const void *data = ARM_CPTR(r2);
             ArmLockDropped gl_unlocked;
@@ -39047,6 +39061,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         break;
     case SVC_GL_DeleteBuffers:
+        ++g_gl_bufinfo_gen;   /* names may be reused (deferred map cache) */
         if (r1) {
             // GL semantics: deleting the currently bound buffer unbinds it
             for (uint32_t i = 0; i < r0; ++i) {
@@ -46750,11 +46765,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (defer_on && buf && len && gbi && pfn_glBufferSubData && pfn_glBufferData &&
             !(access & 0x0001u) /* READ */ && (access & 0x0002u) /* WRITE */ &&
             !g_gl_mapped.count(buf)) {
-            GLint size = 0, usage = 0, mapped = 0;
-            gbi((GLenum)r0, 0x8764u /* GL_BUFFER_SIZE */, &size);
-            gbi((GLenum)r0, 0x8765u /* GL_BUFFER_USAGE */, &usage);
-            gbi((GLenum)r0, 0x88BCu /* GL_BUFFER_MAPPED */, &mapped);
-            if (size > 0 && !mapped && (uint64_t)off + len <= (uint64_t)size) {
+            /* GL_BUFFER_MAPPED is not asked: every map of a guest buffer goes
+             * through this SVC or MapBufferOES, both record it in g_gl_mapped,
+             * and the test above already refused a buffer in there. */
+            GLint size = 0, usage = 0;
+            const uint64_t want = g_gl_bufinfo_gen ^
+                ((uint64_t)g_gl_state_gen.load(std::memory_order_acquire) << 32);
+            if (g_gl_bufinfo_seen != want) { g_gl_bufinfo.clear(); g_gl_bufinfo_seen = want; }
+            auto known = g_gl_bufinfo.find(buf);
+            if (known != g_gl_bufinfo.end()) {
+                size = known->second.size;
+                usage = (GLint)known->second.usage;
+            } else {
+                gbi((GLenum)r0, 0x8764u /* GL_BUFFER_SIZE */, &size);
+                gbi((GLenum)r0, 0x8765u /* GL_BUFFER_USAGE */, &usage);
+                if (g_gl_bufinfo.size() > 65536u) g_gl_bufinfo.clear();
+                g_gl_bufinfo[buf] = GlBufInfo{ size, (uint32_t)usage };
+            }
+            if (size > 0 && (uint64_t)off + len <= (uint64_t)size) {
                 uint32_t gva = arm_malloc(ctx, len);
                 if (gva) {
                     GlMappedBuf m{ nullptr, gva, len, access };
@@ -46873,6 +46901,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             g_gl_mapped.erase(it);
             if (!(m.access & 0x0010u) /* FLUSH_EXPLICIT: the flushes already uploaded */) {
                 const void *src = ctx.mem.ptr(m.gva);
+                /* m is a copy and the shadow is freed only below, so the
+                 * upload can run without the lock. */
+                ArmLockDropped gl_unlocked;
                 /* Replacing the whole buffer as INVALIDATE_BUFFER asked: one
                  * glBufferData, which lets the driver orphan instead of wait. */
                 if ((m.access & 0x0008u) && m.off == 0 && m.len == m.size)
@@ -46911,10 +46942,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (it != g_gl_mapped.end() && it->second.deferred) {
             const GlMappedBuf &m = it->second;
             const uint32_t off = r1, len = r2;
-            if ((m.access & 0x0010u) && len && (uint64_t)off + len <= m.len)
-                pfn_glBufferSubData((GLenum)r0, (GLintptr)(m.off + off), (GLsizeiptr)len,
-                                    ctx.mem.ptr(m.gva + off));
-            else if (!(m.access & 0x0010u) || (uint64_t)off + len > m.len)
+            if ((m.access & 0x0010u) && len && (uint64_t)off + len <= m.len) {
+                /* The shadow belongs to this mapping, which only this thread's
+                 * context can unmap, so the bytes stay put without the lock;
+                 * the upload is the one part of the call that can wait. */
+                const GLintptr at = (GLintptr)(m.off + off);
+                const void *src = ctx.mem.ptr(m.gva + off);
+                ArmLockDropped gl_unlocked;
+                pfn_glBufferSubData((GLenum)r0, at, (GLsizeiptr)len, src);
+            } else if (!(m.access & 0x0010u) || (uint64_t)off + len > m.len)
                 guest_gl_set_error(0x0502u /* GL_INVALID_OPERATION / VALUE, as the host would */);
             break;
         }
@@ -47251,6 +47287,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_GLX_BufferStorage: {
         // (target, size, data, flags) -> host glBufferStorageEXT, else.
+        ++g_gl_bufinfo_gen;   /* deferred map cache */
         typedef void (*pfn_bufstor_t)(GLenum, GLsizeiptr, const void*, GLbitfield);
         static pfn_bufstor_t host_bufstor =
             (pfn_bufstor_t)eglGetProcAddress("glBufferStorageEXT");
