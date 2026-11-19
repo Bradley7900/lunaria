@@ -1267,6 +1267,13 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
     * so call_out does not log it as unresolved. */
    if (!strcmp(method, "runOnUiThread")) {
       memset(out, 0, sizeof *out);
+      {
+         static unsigned n;
+         if (n++ < 64u)
+            fprintf(stderr, "[ui] runOnUiThread (external %s) #%u runnable=@%x main=%d\n",
+                    class_name ? class_name : "?", n,
+                    nargs > 0 ? (unsigned)args[0].l : 0u, (int)dvm_on_main_thread());
+      }
       if (nargs > 0 && args[0].l) {
          /* From a thread of its own, this has to become a post: the whole
           * point of the call is "not on my thread, on the UI one", and an SDK

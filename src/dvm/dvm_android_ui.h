@@ -8075,6 +8075,18 @@ static bool act_runOnUiThread(struct dvm *vm, dvm_ref self,
                               union dvm_value *out)
 {
    dvm_ref runnable = nargs ? ARG(0).l : 0;
+   {
+      /* Every call, capped: a UI-thread post that never runs is how 2PG's
+       * UMP consent form went missing (20-11, r50: Google's Unity plugin
+       * shows the form from runOnUiThread and the game then waits on it). */
+      static unsigned n;
+      if (n++ < 64u) {
+         struct dvm_class *rc = runnable ? dvm_object_class(vm, runnable) : NULL;
+         fprintf(stderr, "[ui] runOnUiThread #%u runnable=@%x class=%s main=%d\n",
+                 n, (unsigned)runnable, rc && rc->name ? rc->name : "?",
+                 (int)dvm_on_main_thread());
+      }
+   }
    if (!runnable) RETV();
    if (!dvm_on_main_thread()) {
       if (!queue_runnable_for(vm, runnable, false, 0, 0, self, 0)) {

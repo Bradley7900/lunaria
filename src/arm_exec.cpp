@@ -34583,6 +34583,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * PROGRESS.md's "Settings failed to load" investigation). Count this one
              * method's calls separately and print every one, capped, so a repeat is
              * visible. */
+            if (mname && !strcmp(mname, "runOnUiThread")) {
+                static int n = 0;
+                if (n++ < 64)
+                    fprintf(stderr, "[arm_jni] runOnUiThread call #%d obj=0x%" PRIx64
+                            " runnable=0x%x tid=%u\n", n, r1,
+                            jni_arg_word(ctx, regs, (int)svc_no - 61, 0), g_current_tid);
+            }
             if (mname && !strcmp(mname, "AndroidThunkJava_ShowHiddenAlertDialog")) {
                 static int n = 0;
                 if (n++ < 20)
