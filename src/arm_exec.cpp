@@ -71566,6 +71566,15 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
                     (unsigned)t.engine_aff,
                     (unsigned long long)t.slices,
                     (unsigned long long)t.total_ticks);
+            /* Signal state: a stop-the-world collector that never gets its
+             * acks needs to know whether the bit is pending, masked, or the
+             * thread is already nested in handlers (r49, 19-11). */
+            if (t.pending_signals || t.signal_depth)
+                fprintf(stderr, "[arm64]   signals: pending=0x%llx mask=0x%llx "
+                        "depth=%u waiting_signal=%d\n",
+                        (unsigned long long)t.pending_signals,
+                        (unsigned long long)signal_mask_load(t.id),
+                        (unsigned)t.signal_depth, (int)t.waiting_signal);
             fprintf(stderr, "[arm64]   picked out of the ready queue %llu "
                     "times\n", (unsigned long long)g_ready_pops[t.id]);
         }
