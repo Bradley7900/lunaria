@@ -43111,6 +43111,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * the link) would make a file manager, an APK unpacker or a tamper check
          * read "there are no symlinks here". */
         const bool nofollow = svc_no == SVC_LIBC_LSTAT;
+        /* Exploration Craft (20-11, r53): "stat" held the execution lock 34-74%
+         * of five-second windows, and the frame hitches that made the camera
+         * snap sit in the same windows. The host stat itself runs unlocked; the
+         * APK fallback below does not (up to three more stats, split lookups,
+         * and apk_read, which inflates the whole member just to compare its
+         * size). Name the slow ones before changing who holds what. */
+        struct StatSlowNote {
+            uint64_t t0 = host_mono_ns();
+            const char *path = nullptr;
+            bool fallback = false;
+            ~StatSlowNote() {
+                const double ms = (host_mono_ns() - t0) / 1e6;
+                static unsigned said;
+                if (ms < 4.0 || said >= 96u) return;
+                ++said;
+                fprintf(stderr, "[stat] slow %.1f ms%s: %s\n", ms,
+                        fallback ? " (APK fallback ran, under the execution lock)" : "",
+                        path ? path : "?");
+            }
+        } stat_slow;
         luna_file_info st;
         const char *path = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[0])
                                         : ctx.mem.cstr(r0);
@@ -43144,8 +43164,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         memcpy(stable_path, path, path_len + 1);
         path = stable_path;
+        stat_slow.path = stable_path;
         int rc = host_file_infoat_unlocked(LUNA_AT_FDCWD, path, &st, nofollow ? LUNA_AT_NOFOLLOW : 0);
         if (rc != 0 && path) {
+            stat_slow.fallback = true;
             /* The cache copy of an APK member is a plain file either way:
              * nothing inside a zip is a symlink, so follow/no-follow is the
              * same question there. */
