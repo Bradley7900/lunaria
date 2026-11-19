@@ -22242,7 +22242,12 @@ static bool apk_concat_splits_to_cache(const std::string &base_inner,
         for (char *p = out + sizeof(cache_root); *p; ++p)
             if (*p == '/') { *p = '\0'; luna_file_mkdir(out, 0755); *p = '/'; }
 
-        FILE *wf = luna_file_fopen(out, "wb");
+        /* Written beside the final name and renamed over it, so a stat or open
+         * on another thread never sees a half-written file at the real path
+         * (this runs outside the execution lock now; see apk_extract_to_cache). */
+        char part[PATH_MAX];
+        if ((size_t)snprintf(part, sizeof part, "%s.part", out) >= sizeof part) return false;
+        FILE *wf = luna_file_fopen(part, "wb");
         if (!wf) return false;
         bool ok = true;
         if (!asset_bridge::g_apk_dir.empty()) {
@@ -22266,8 +22271,9 @@ static bool apk_concat_splits_to_cache(const std::string &base_inner,
                 }
             }
         }
-        fclose(wf);
-        if (!ok) { luna_file_unlink(out); return false; }
+        if (fclose(wf) != 0) ok = false;
+        if (ok && luna_file_rename(part, out) != 0) ok = false;
+        if (!ok) { luna_file_unlink(part); return false; }
         if (lunaria_env("LUNARIA_TRACE_ASSET"))
             fprintf(stderr, "[asset] concatenated %zu splits -> %s (%llu bytes)\n",
                 parts.size(), out, (unsigned long long)total);
@@ -22281,6 +22287,15 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
     if (!path) return false;
     const char *inner = nullptr;
     if (!apk_path_inner(path, &inner)) return false;
+    /* One extraction at a time. fopen already calls this outside the execution
+     * lock, and stat/access now do too: joining a Unity .splitN set or
+     * inflating a large member onto an HDD held that lock for over a second
+     * (2pg settings screen, Aloa 20-11: a 1.3 s frame, "raw syscall 48").
+     * Nothing in here needs the execution lock: the zip index is read-only
+     * once open, members are read with pread, and files are written under a
+     * temporary name and renamed into place. */
+    static std::mutex extract_mu;
+    std::lock_guard<std::mutex> extract_hold(extract_mu);
     // Standard APK path first, then App Bundle split prefixes
     static const char *cache_prefixes[] = {
         "", "base/", "UnityDataAssetPack/", nullptr
@@ -22334,11 +22349,16 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
     luna_file_mkdir(cache_root, 0755);
     for (char *p = out + sizeof(cache_root); *p; ++p)
         if (*p == '/') { *p = '\0'; luna_file_mkdir(out, 0755); *p = '/'; }
-    FILE *f = luna_file_fopen(out, "wb");
+    char part[PATH_MAX];
+    if ((size_t)snprintf(part, sizeof part, "%s.part", out) >= sizeof part) return false;
+    FILE *f = luna_file_fopen(part, "wb");
     if (!f) return false;
     size_t n = fwrite(data.data(), 1, data.size(), f);
-    fclose(f);
-    if (n != data.size()) { luna_file_unlink(out); return false; }
+    const bool closed = fclose(f) == 0;
+    if (n != data.size() || !closed || luna_file_rename(part, out) != 0) {
+        luna_file_unlink(part);
+        return false;
+    }
     if (lunaria_env("LUNARIA_TRACE_ASSET"))
         fprintf(stderr, "[asset] extracted %s (%zu bytes) -> %s\n", inner, data.size(), out);
     return true;
@@ -24113,7 +24133,10 @@ static int guest_faccessat_path(int dirfd, const char *path, int mode, int flags
     int rc = luna_file_accessat(dirfd, path, mode, flags);
     if (rc < 0 && (dirfd == LUNA_AT_FDCWD || path[0] == '/')) {
         char cache[PATH_MAX];
-        if (apk_extract_to_cache(path, cache, sizeof cache))
+        (void)asset_bridge::apk_open();
+        bool extracted;
+        { ArmLockDropped unlocked; extracted = apk_extract_to_cache(path, cache, sizeof cache); }
+        if (extracted)
             rc = luna_file_accessat(LUNA_AT_FDCWD, cache, mode, flags);
     }
     return rc;
@@ -43292,7 +43315,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
              * nothing inside a zip is a symlink, so follow/no-follow is the
              * same question there. */
             char cache[PATH_MAX];
-            if (apk_extract_to_cache(path, cache, sizeof cache))
+            (void)asset_bridge::apk_open();   /* first open stays under the lock */
+            bool extracted;
+            { ArmLockDropped unlocked; extracted = apk_extract_to_cache(path, cache, sizeof cache); }
+            if (extracted)
                 rc = host_file_infoat_unlocked(LUNA_AT_FDCWD, cache, &st, 0);
         }
         if (trace_stat)
@@ -50051,7 +50077,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (path && luna_file_access(path, (int)r1) == 0) { ret32(0); break; }
         int access_error = path ? errno : EFAULT;
         char cache[PATH_MAX];
-        if (path && apk_extract_to_cache(path, cache, sizeof cache)) {
+        bool extracted = false;
+        if (path) {
+            (void)asset_bridge::apk_open();
+            ArmLockDropped unlocked;
+            extracted = apk_extract_to_cache(path, cache, sizeof cache);
+        }
+        if (extracted) {
             if (luna_file_access(cache, (int)r1) == 0) { ret32(0); break; }
             access_error = errno;
         }
