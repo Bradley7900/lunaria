@@ -28774,8 +28774,11 @@ static bool svc_lockfree_compute(uint32_t no) {
             "LUNARIA_SVC_HISTO", "LUNARIA_WATCH64",
             /* The allocator diagnostics keep their own call-site tables. */
             "LUNARIA_TRACE_ALLOC_VA", "LUNARIA_TRACE_HEAP",
-            /* The socket trace keeps per-call static counters. */
-            "LUNARIA_TRACE_NET",
+            /* LUNARIA_TRACE_NET used to be here too. Its counters live in the
+             * socket handlers, and poll is the only one of those below; locking
+             * every SVC for it made every traced run (malloc included) slower
+             * than the game really is, which hid tonight's lock-free fixes
+             * from Aloa's own logs (20-11). Only poll goes back under the lock. */
         };
         for (const char *e : diag)
             if (lunaria_env(e)) {
@@ -28943,7 +28946,7 @@ static bool svc_lockfree_compute(uint32_t no) {
          * itself, at the point where it starts touching the fd-wait table. Under
          * Cross Worlds' post-title load this was half of the execution lock's hold
          * time, for 38,000 calls a second that almost always had nothing to report. */
-        set(SVC_NET_POLL);
+        if (!lunaria_env("LUNARIA_TRACE_NET")) set(SVC_NET_POLL);
 
         /* Sleeping and yielding. What the handler does with the lock held is park
          * the calling thread, and guest_sleep_ns() takes the lock for exactly that
