@@ -67790,10 +67790,15 @@ static void a64_dispatch(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, uint32_t
              * strands it until something happens to signal it (that is how UE's RHI
              * thread, which owns the context, ends up parked for a minute while the
              * render thread waits on it). */
-            /* LUNARIA_GL_REQUEUE_POKE=1 restores the poke (to bisect). */
+            /* The poke stays ON: skipping it (f03ff42) lost a wakeup. 2pg froze
+             * loading with UnityMain parked on a libunity mutex the vsync
+             * thread never got scheduled to release (ldoe100/103/104, 6 of 8
+             * runs); with the poke, 3 of 3 clean (Aloa, 20-11). The hand-back
+             * ping-pong it was meant to stop costs time, the lost wakeup costs
+             * the game. LUNARIA_GL_REQUEUE_POKE=0 is the old no-poke path. */
             static const bool poke = [] {
                 const char *e = lunaria_env("LUNARIA_GL_REQUEUE_POKE");
-                return e && e[0] == '1';
+                return !(e && e[0] == '0');
             }();
             g_requeue_no_poke = !poke;
             thread_sched_update(t);
