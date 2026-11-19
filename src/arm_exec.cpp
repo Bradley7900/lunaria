@@ -9114,6 +9114,16 @@ static void thread_mark_blocked(uint32_t tid)
  * of milliseconds after the deadline; a device wakes such a thread onto a
  * core almost immediately, and code that expects to tick on a period (an
  * anti-tamper heartbeat is exactly that) measures the difference. */
+/* Set while a host thread that cannot run a GL owner hands it back to the
+ * queue (a64_dispatch). Waking the worker engines for it is pointless (none
+ * of them may run it), and on 2pg's split-screen race it was a loop: a
+ * callback lock wait on UnityMain's host thread popped the render thread,
+ * re-queued it, which poked the workers, whose passes ended in a notify that
+ * woke the wait for another pass. 133,000 of those in a few seconds (Aloa,
+ * ldoe97), each one taking the execution lock the render thread needs for
+ * every GL call. The pump is still notified. */
+static thread_local bool g_requeue_no_poke = false;
+
 static void thread_mark_ready_ex(uint32_t tid, bool urgent)
 {
     if (!tid) return;
@@ -9128,7 +9138,7 @@ static void thread_mark_ready_ex(uint32_t tid, bool urgent)
         start_queue_publish();
     }
     luna_run_queue_push(&g_ready_queue, (uint8_t)tid, urgent);
-    a64par::sched_poke();
+    if (!g_requeue_no_poke) a64par::sched_poke();
     sched_pass_notify();
 }
 
@@ -58174,6 +58184,9 @@ static void schedule_threads(uint64_t slice) {
             if (tp->slices != last_slices[tid]) {
                 last_slices[tid] = tp->slices;
                 stuck_for[tid] = 0;
+            } else if (!g_a64_is_pump && tp->is_arm64 && gl_tid_marked(tid)) {
+                /* Another host thread's pass: it hands a GL owner straight back
+                 * (a64_dispatch). Not a missed turn, so not counted. */
             } else if (++stuck_for[tid] % 1000u == 0u) {
                 fprintf(stderr, "[sched64] tid=%u runnable but not running for "
                         "%u passes (gl=%d aff=%u slices=%llu pc=0x%llx)\n",
@@ -67226,7 +67239,9 @@ static void a64_dispatch(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, uint32_t
              * strands it until something happens to signal it (that is how UE's RHI
              * thread, which owns the context, ends up parked for a minute while the
              * render thread waits on it). */
+            g_requeue_no_poke = true;
             thread_sched_update(t);
+            g_requeue_no_poke = false;
         }
         return;
     }
