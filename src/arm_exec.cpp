@@ -17895,6 +17895,13 @@ static void glfw_focus_cb(GLFWwindow *, int focused) {
 static void glfw_key_cb(GLFWwindow *, int key, int scancode, int action, int mods) {
     if (luna_overlay_host_key(key, action, mods)) { keymap_release(); return; }
     if (luna_overlay_web_key(key, action, mods)) { keymap_release(); return; }
+    /* F11 toggles full screen, as in a browser (Aloa, 20-11); the menu has the same switch. */
+    if (key == GLFW_KEY_F11 && action == GLFW_PRESS && !luna_ime_active()) {
+        keymap_release();
+        arm_exec_toggle_fullscreen();
+        return;
+    }
+    if (key == GLFW_KEY_F11) return;
     if (luna_ime_active()) {
         keymap_release();
         luna_ime_key(key, scancode, action, mods);
