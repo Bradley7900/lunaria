@@ -23634,7 +23634,12 @@ static int device_cmd_ping(int argc, char *const argv[], std::string &out) {
     for (int seq = 1; seq <= count; ++seq) {
         double rtt = 0;
         int t = 64;
-        const int rc = luna_icmp_ping(host, per_ms, ip, sizeof ip, &t, &rtt);
+        /* The echo waits on the network (up to per_ms). It touches no guest
+         * state, so it must not hold the execution lock: r51 (20-11) showed
+         * LDoE's ten battle-server pings holding it up to 373 ms at a time,
+         * which stalls every other guest thread for that long. */
+        int rc;
+        { ArmLockDropped unlocked; rc = luna_icmp_ping(host, per_ms, ip, sizeof ip, &t, &rtt); }
         if (rc == -2) {
             snprintf(line, sizeof line, "ping: unknown host %s\n", host);
             out += line;
