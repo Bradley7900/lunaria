@@ -93,10 +93,18 @@ jobs:
 
       - name: Install cross-build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential nasm cmake ninja-build \
-            python3 curl zip bzip2 zstd unzip xz-utils
+          # Ubuntu's mirrors 503 now and then (20-11: two builds lost to it).
+          # Retry, and after a failure move to the Azure mirror the runners sit next to.
+          pkgs="build-essential nasm cmake ninja-build python3 curl zip bzip2 zstd unzip xz-utils"
+          ok=0
+          for try in 1 2 3 4; do
+            sudo apt-get -o Acquire::Retries=5 update || true
+            if sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends $pkgs; then ok=1; break; fi
+            sudo sed -i -E 's#https?://(security|archive)\.ubuntu\.com#http://azure.archive.ubuntu.com#g' \
+              /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+            sleep $((try * 15))
+          done
+          [ "$ok" = 1 ] || { echo "apt install failed after 4 tries"; exit 1; }
           ver=20261006
           archive="llvm-mingw-${ver}-ucrt-ubuntu-22.04-x86_64.tar.xz"
           curl -fsSL -o "/tmp/${archive}" \
