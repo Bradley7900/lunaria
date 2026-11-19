@@ -62514,8 +62514,7 @@ static void a64_install_il2cpp_hooks(ArmExecCtx &ctx) {
                     ctx.mem.read32(orfn + 28u) == 0xc85f7c20u;    /* ldxr x0,[x1] */
                 if (!bshape || !orshape) {
                     fprintf(stderr, "[hook] il2cpp string-key lookup @0x%08x: write "
-                            "barrier body unknown; left alone
-", canon);
+                            "barrier body unknown; left alone\n", canon);
                     continue;
                 }
                 int64_t tpage = (int64_t)((((ta >> 5) & 0x7ffffu) << 2) | ((ta >> 29) & 3u));
