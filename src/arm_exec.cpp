@@ -61713,8 +61713,29 @@ static void jit_progress_hook(uint64_t compiles, uint64_t compile_ns)
  * dispatch_svc keeps even the check off the hot path. */
 static bool boot_card_pump(void)
 {
+    if (!g_glfw) return true;
+    /* The window's own messages too. While the card is up the dex pump loop
+     * polls once per frame, and a boot frame can last seconds (one long
+     * Activity.onCreate, a cold libil2cpp compile), so the window could not be
+     * moved or resized until the game drew (Aloa, 20-11). This is the one path
+     * that runs during those stretches on the thread that owns the window; the
+     * swap SVC already polls from the same SVC context. Rate-limited to one
+     * poll per 16 ms, and never re-entered from a callback the poll delivers. */
+    if (on_glfw_thread()) {
+        static thread_local bool polling;
+        static double poll_next;
+        struct timespec pts;
+        clock_gettime(CLOCK_MONOTONIC, &pts);
+        const double pnow = (double)pts.tv_sec + (double)pts.tv_nsec / 1e9;
+        if (!polling && pnow >= poll_next) {
+            polling = true;
+            poll_glfw_events();
+            polling = false;
+            poll_next = pnow + 0.016;
+        }
+    }
     /* Nothing to pump: the compositor animates the card by itself. */
-    if (luna_comp_active() || !g_glfw) return true;
+    if (luna_comp_active()) return true;
     static std::mutex mu;
     static double next_at;
     if (!mu.try_lock()) return true;
@@ -61756,6 +61777,7 @@ extern "C" int arm_exec_boot_present(void)
    }
    int drew = 0;
    for (int i = 0; i < 3; ++i) {
+      poll_glfw_events();   /* keep the window movable while dex loads */
       if (jit_ui_present_frame()) ++drew;
       struct timespec ts = { 0, 16 * 1000 * 1000 };
       nanosleep(&ts, NULL);
