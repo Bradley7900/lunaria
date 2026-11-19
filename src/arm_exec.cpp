@@ -48494,6 +48494,22 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 /* A terminated but unjoined pthread still has a handle;
                  * it receives no signal.  Never invoke at the sender. */
                 if (sig && !target->finished) {
+                    /* The same signal still pending from an earlier send means
+                     * the target never ran its handler for it: the shape of
+                     * a stop-the-world that waits forever on an ack (r49/r51).
+                     * Says why delivery cannot happen yet. */
+                    if (target->pending_signals & (1ull << (unsigned)(sig - 1))) {
+                        static unsigned again_log;
+                        if (again_log++ < 64u)
+                            fprintf(stderr, "[pthread_kill] t=%.3fs target=%u sig=%d "
+                                    "STILL PENDING from an earlier send: running=%d "
+                                    "mask=0x%llx depth=%u finished=%d sender=%u\n",
+                                    (double)host_mono_ns() / 1e9, target_tid, sig,
+                                    (int)target->running,
+                                    (unsigned long long)signal_mask_load(target->id),
+                                    (unsigned)target->signal_depth,
+                                    (int)target->finished, g_current_tid);
+                    }
                     target->pending_signals |= 1ull << (unsigned)(sig - 1);
                     if (!target->running && a64_deliver_pending_signal(ctx, *target))
                         thread_mark_ready(target->id);
