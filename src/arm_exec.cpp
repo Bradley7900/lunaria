@@ -62335,6 +62335,43 @@ static uint64_t lse_helper_run(ArmMemory &mem, uint32_t site,
     }
 }
 
+/* utfcpp utf8::find_invalid as il2cpp compiles it: the offset of the first
+ * byte that does not start a valid sequence, or n. Strict UTF-8: overlong
+ * forms, surrogates and code points past 0x10FFFF are all invalid, and an
+ * error always points at the lead byte, which is where validate_next puts
+ * the iterator back. */
+static size_t lunaria_utf8_find_invalid(const uint8_t *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        while (i + 8u <= n) {
+            uint64_t v;
+            std::memcpy(&v, s + i, 8);
+            if (v & 0x8080808080808080ull) break;
+            i += 8u;
+        }
+        if (i >= n) break;
+        const uint32_t c = s[i];
+        if (c < 0x80u) { ++i; continue; }
+        size_t len;
+        uint32_t cp;
+        if ((c & 0xe0u) == 0xc0u)      { len = 2; cp = c & 0x1fu; }
+        else if ((c & 0xf0u) == 0xe0u) { len = 3; cp = c & 0x0fu; }
+        else if ((c & 0xf8u) == 0xf0u) { len = 4; cp = c & 0x07u; }
+        else return i;
+        if (len > n - i) return i;
+        for (size_t k = 1; k < len; ++k) {
+            const uint32_t t = s[i + k];
+            if ((t & 0xc0u) != 0x80u) return i;
+            cp = (cp << 6) | (t & 0x3fu);
+        }
+        if (cp > 0x10ffffu || (cp & 0xfffff800u) == 0xd800u) return i;
+        if ((len == 2 && cp < 0x80u) || (len == 3 && cp < 0x800u) ||
+            (len == 4 && cp < 0x10000u)) return i;
+        i += len;
+    }
+    return n;
+}
+
 static uint64_t a64_host_hook_call(uint32_t id, uint64_t a0, uint64_t a1,
                                    uint64_t a2) {
     if (!id || id > g_host_hook_sites.size() || !g_ctx) return 0;
@@ -62369,10 +62406,45 @@ static uint64_t a64_host_hook_call(uint32_t id, uint64_t a0, uint64_t a1,
         for (; i < full; ++i) n += (uint32_t)__builtin_popcount(bm[i]);
         if (pos & 7u) n += (uint32_t)__builtin_popcount(bm[full] & ((1u << (pos & 7u)) - 1u));
         if (say)
-            fprintf(stderr, "[hosthook] pos_to_offset(0x%llx, %u) = %u
-",
+            fprintf(stderr, "[hosthook] pos_to_offset(0x%llx, %u) = %u\n",
                     (unsigned long long)a0, pos, n);
         return n;
+    }
+
+    if (hs.handler == SVC_IL2CPP_UTF8_FIND_INVALID) {
+        /* utf8::find_invalid(start, end): the first byte that does not start
+         * a valid sequence, or end. The guest calls validate_next once per
+         * code point; il2cpp runs it over every UTF-8 string it turns into a
+         * managed one. */
+        const uint64_t start = a0, end = a1;
+        if (start >= end) return start;
+        uint64_t va = start;
+        if (const uint8_t *p = (const uint8_t *)mem.try_ptr((GuestVA)start, (size_t)(end - start))) {
+            va = start + lunaria_utf8_find_invalid(p, (size_t)(end - start));
+        } else {
+            /* Not one mapped span (never seen): a sequence at a time, each
+             * byte read on its own; an unreadable byte counts as invalid. */
+            while (va < end) {
+                uint8_t seq[4];
+                size_t got = 0;
+                for (; got < 4 && va + got < end; ++got) {
+                    const uint8_t *q = (const uint8_t *)mem.try_ptr((GuestVA)(va + got), 1u);
+                    if (!q) break;
+                    seq[got] = *q;
+                }
+                if (!got) break;
+                const uint32_t c = seq[0];
+                const size_t len = c < 0x80u ? 1u : (c & 0xe0u) == 0xc0u ? 2u :
+                                   (c & 0xf0u) == 0xe0u ? 3u : (c & 0xf8u) == 0xf0u ? 4u : 0u;
+                if (!len || len > got || lunaria_utf8_find_invalid(seq, len) != len) break;
+                va += len;
+            }
+        }
+        if (say)
+            fprintf(stderr, "[hosthook] utf8 find_invalid(0x%llx, +%llu) = +%llu\n",
+                    (unsigned long long)start, (unsigned long long)(end - start),
+                    (unsigned long long)(va - start));
+        return va;
     }
 
     if (hs.handler == SVC_UE_STRICMP || hs.handler == SVC_UE_STRNICMP) {
@@ -62785,6 +62857,68 @@ static void a64_install_il2cpp_hooks(ArmExecCtx &ctx) {
                             (unsigned long long)(a64_guest_va(canon) - m.load_bias));
                 }
                 (void)p2o_found;
+
+                /* utfcpp's utf8::find_invalid with validate_next and the 3-
+                 * and 4-byte readers it calls, as LDoE's build lays them out
+                 * (0x2e4 bytes, no adrp, so all of it is matched exactly).
+                 * 6-8% of the post-connect freeze samples (ldoe105). The
+                 * host version was run against these very bytes in unicorn
+                 * on 40,000 inputs with no difference. */
+                static const uint32_t kUtf8FindInvalid[185] = {
+    0xd10083ffu, 0xa9014ffeu, 0xaa0103f3u, 0xf90003e0u, 0xf94003e8u, 0xeb13011fu,
+    0x540000e0u, 0x910003e0u, 0x910033e2u, 0xaa1303e1u, 0x94000007u, 0x34ffff20u,
+    0xf94003f3u, 0xaa1303e0u, 0xa9414ffeu, 0x910083ffu, 0xd65f03c0u, 0xd100c3ffu,
+    0xa90157feu, 0xa9024ff4u, 0xf9400015u, 0xeb0102bfu, 0x540002c0u, 0xb9000fffu,
+    0xaa0003f3u, 0xaa0203f4u, 0x39c002a9u, 0x12001d28u, 0x37f80249u, 0xb9000fe8u,
+    0x52800029u, 0x53107d0au, 0x528000a0u, 0x7100415fu, 0x54000868u, 0x1215510bu,
+    0x529b000cu, 0x6b0c017fu, 0x540007e0u, 0x7101fd1fu, 0x54000428u, 0xf100053fu,
+    0x54000621u, 0x14000032u, 0x52800020u, 0x14000039u, 0x121b0909u, 0x7103013fu,
+    0x54000201u, 0x910006a9u, 0xb9000fe8u, 0xeb01013fu, 0xf9000269u, 0x540005a0u,
+    0x39400129u, 0x121a052au, 0x7102015fu, 0x54000561u, 0x1200152au, 0x52800049u,
+    0x331a110au, 0xb9000feau, 0x2a0a03e8u, 0x17ffffe0u, 0x121c0d09u, 0x7103813fu,
+    0x54000181u, 0x910033e2u, 0xaa1303e0u, 0x94000027u, 0x52800069u, 0x350003c0u,
+    0x1400000eu, 0x711ffd1fu, 0x540001c8u, 0xf100093fu, 0x540001e1u, 0x14000010u,
+    0x121d1108u, 0x7103c11fu, 0x54000341u, 0x910033e2u, 0xaa1303e0u, 0x9400003au,
+    0x52800089u, 0x35000200u, 0xb9400fe8u, 0x17ffffc8u, 0x350000aau, 0xf1000d3fu,
+    0x54000060u, 0x52800080u, 0x14000009u, 0xf9400269u, 0x2a1f03e0u, 0xb9000288u,
+    0x91000535u, 0x14000004u, 0x52800020u, 0x14000002u, 0x52800060u, 0xf9000275u,
+    0xa9424ff4u, 0xa94157feu, 0x9100c3ffu, 0xd65f03c0u, 0x52800040u, 0x17fffffbu,
+    0xf9400008u, 0xeb01011fu, 0x54000360u, 0xaa0803eau, 0x38401549u, 0xeb01015fu,
+    0xf900000au, 0xb9000049u, 0x540002a0u, 0x3940014au, 0x121a054bu, 0x7102017fu,
+    0x54000261u, 0x53140d29u, 0x91000908u, 0xeb01011fu, 0xf9000008u, 0x331a1549u,
+    0xb9000049u, 0x54000140u, 0x39400108u, 0x121a050au, 0x7102015fu, 0x54000101u,
+    0x12001508u, 0x2a1f03e0u, 0x2a080128u, 0xb9000048u, 0xd65f03c0u, 0x52800020u,
+    0xd65f03c0u, 0x52800060u, 0xd65f03c0u, 0xf9400008u, 0xeb01011fu, 0x540004c0u,
+    0xaa0803eau, 0x38401549u, 0xeb01015fu, 0xf900000au, 0xb9000049u, 0x54000400u,
+    0x3940014au, 0x121a054bu, 0x7102017fu, 0x540003c1u, 0x530e0929u, 0x33141549u,
+    0x9100090au, 0xeb01015fu, 0xf900000au, 0xb9000049u, 0x540002a0u, 0x3940014au,
+    0x121a054bu, 0x7102017fu, 0x54000261u, 0x531a154bu, 0x91000d0au, 0xeb01015fu,
+    0xf900000au, 0x2a090168u, 0xb9000048u, 0x54000140u, 0x39400149u, 0x121a052au,
+    0x7102015fu, 0x54000101u, 0x12001529u, 0x2a1f03e0u, 0x2a090108u, 0xb9000048u,
+    0xd65f03c0u, 0x52800020u, 0xd65f03c0u, 0x52800060u, 0xd65f03c0u,
+                };
+                for (size_t k = 0; k + 185 <= words; ++k) {
+                    if (std::memcmp(code + k * 4u, kUtf8FindInvalid, sizeof kUtf8FindInvalid) != 0)
+                        continue;
+                    const uint32_t canon = lo + (uint32_t)(k * 4u);
+                    if (g_code_hook_n >= CODE_HOOK_MAX || a64_code_hook_for(canon)) continue;
+                    if (g_host_hook_sites.size() >= 0xfffeu) break;
+                    g_host_hook_sites.push_back({ SVC_IL2CPP_UTF8_FIND_INVALID, canon });
+                    g_host_hook_id_by_va[canon] = (uint32_t)g_host_hook_sites.size();
+                    g_code_hook_va[g_code_hook_n] = canon;
+                    g_code_hook_handler[g_code_hook_n] = SVC_IL2CPP_UTF8_FIND_INVALID;
+                    ++g_code_hook_n;
+                    if (canon < g_code_hook_lo) g_code_hook_lo = canon;
+                    if (canon > g_code_hook_hi) g_code_hook_hi = canon;
+                    const GuestVA hook_va = a64_guest_va(canon);
+                    a64_invalidate_main_jit(ctx, hook_va, 4u);
+                    a64_invalidate_engines(hook_va, 4u);
+                    cb_invalidate_all(hook_va, 4u);
+                    fprintf(stderr, "[hook] il2cpp utf8::find_invalid @libil2cpp.so+0x%llx "
+                            "-> host UTF-8 check (LUNARIA_HOST_HOOKS=0 to disable)\n",
+                            (unsigned long long)(a64_guest_va(canon) - m.load_bias));
+                    break;
+                }
             }
         }
         if (!found)

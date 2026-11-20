@@ -2002,6 +2002,8 @@ enum SvcId : uint32_t {
     SVC_A64_LSE_HELPER,
     /* il2cpp sparsehash pos_to_offset (a64_install_il2cpp_hooks): host popcount. */
     SVC_IL2CPP_POS_TO_OFFSET,
+    /* il2cpp utfcpp utf8::find_invalid: host strict UTF-8 scan. */
+    SVC_IL2CPP_UTF8_FIND_INVALID,
     SVC_TRAMP_TOTAL,
 };
 
