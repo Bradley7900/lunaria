@@ -62351,6 +62351,29 @@ static uint64_t a64_host_hook_call(uint32_t id, uint64_t a0, uint64_t a1,
     const bool say = trace && traced.fetch_add(1, std::memory_order_relaxed) < 24;
     if (hs.handler == SVC_A64_LSE_HELPER)
         return lse_helper_run(mem, hs.site, a0, a1, a2);
+    if (hs.handler == SVC_IL2CPP_POS_TO_OFFSET) {
+        /* sparsegroup::pos_to_offset(bitmap, pos): how many of the first
+         * `pos` bits of a byte bitmap are set (bit i of byte i/8, LSB
+         * first). The guest walks it a byte at a time through a 256-entry
+         * table; the install verified that table is the popcount table. */
+        const uint32_t pos = (uint32_t)a1 & 0xffffu;
+        if (!pos) return 0;
+        const uint32_t nbytes = (pos + 7u) >> 3;
+        const uint8_t *bm = (const uint8_t *)mem.try_ptr((GuestVA)a0, nbytes);
+        if (!bm) return 0;
+        uint32_t n = 0, full = pos >> 3, i = 0;
+        for (; i + 8u <= full; i += 8u) {
+            uint64_t v; std::memcpy(&v, bm + i, 8);
+            n += (uint32_t)__builtin_popcountll(v);
+        }
+        for (; i < full; ++i) n += (uint32_t)__builtin_popcount(bm[i]);
+        if (pos & 7u) n += (uint32_t)__builtin_popcount(bm[full] & ((1u << (pos & 7u)) - 1u));
+        if (say)
+            fprintf(stderr, "[hosthook] pos_to_offset(0x%llx, %u) = %u
+",
+                    (unsigned long long)a0, pos, n);
+        return n;
+    }
 
     if (hs.handler == SVC_UE_STRICMP || hs.handler == SVC_UE_STRNICMP) {
         auto it = g_stricmp_sites.find(hs.site);
@@ -62701,6 +62724,67 @@ static void a64_install_il2cpp_hooks(ArmExecCtx &ctx) {
                 if (lse_found)
                     fprintf(stderr, "[hook] libil2cpp.so: %u outline atomic helper(s) -> "
                             "host atomics (LUNARIA_HOST_HOOKS=0 to disable)\n", lse_found);
+
+                /* sparsehash's sparsegroup::pos_to_offset, as il2cpp's
+                 * Unity 6000.3 build compiles it: a byte-at-a-time popcount
+                 * through a 256-byte table. LDoE's post-connect freeze spends
+                 * 18% of its samples in it (ldoe105). Matched word for word,
+                 * the adrp/add pair only by its register shape, and the table
+                 * it names must be the popcount table, or nothing is hooked. */
+                static const uint32_t kP2O[26] = {
+                    0x12003c28u, 0x2a1f03e9u, 0x7100251fu, 0x90000008u, 0x91000108u,
+                    0x540001a3u, 0x5100242au, 0xaa0003ebu, 0x53033d4au, 0x3840156cu,
+                    0x51002021u, 0x12003c2du, 0x386c690cu, 0x710021bfu, 0x0b0c0129u,
+                    0x54ffff48u, 0x8b2a400au, 0x91000540u, 0x1280000au, 0x3940000bu,
+                    0x1ac1214au, 0x2a2a03eau, 0x8a0b014au, 0x386a6908u, 0x0b080120u,
+                    0xd65f03c0u };
+                unsigned p2o_found = 0;
+                for (size_t k = 0; k + 26 <= words; ++k) {
+                    uint32_t w[26];
+                    std::memcpy(w, code + k * 4u, sizeof w);
+                    bool same = true;
+                    for (unsigned j = 0; j < 26 && same; ++j) {
+                        if (j == 3) same = (w[j] & 0x9f00001fu) == 0x90000008u;      /* adrp x8 */
+                        else if (j == 4) same = (w[j] & 0xffc003ffu) == 0x91000108u; /* add x8,x8,#imm */
+                        else same = w[j] == kP2O[j];
+                    }
+                    if (!same) continue;
+                    const uint32_t canon = lo + (uint32_t)(k * 4u);
+                    const uint64_t pc_adrp = (uint64_t)a64_guest_va(canon + 12u);
+                    const int64_t immhi = (int64_t)((w[3] >> 5) & 0x7ffffu);
+                    const int64_t imm = ((immhi << 2) | ((w[3] >> 29) & 3u)) << 43 >> 31; /* sign-extended, *4096 */
+                    const uint64_t table = ((pc_adrp & ~0xfffull) + (uint64_t)imm) +
+                                           ((w[4] >> 10) & 0xfffu);
+                    const uint8_t *tb = (const uint8_t *)ctx.mem.try_ptr((GuestVA)table, 256u);
+                    bool is_popcnt = tb != nullptr;
+                    for (unsigned v = 0; is_popcnt && v < 256u; ++v)
+                        is_popcnt = tb[v] == (uint8_t)__builtin_popcount(v);
+                    if (!is_popcnt) {
+                        fprintf(stderr, "[hook] libil2cpp.so+0x%llx looks like pos_to_offset "
+                                "but its table at 0x%llx is not a popcount table - not hooked\n",
+                                (unsigned long long)(a64_guest_va(canon) - m.load_bias),
+                                (unsigned long long)table);
+                        continue;
+                    }
+                    if (g_code_hook_n >= CODE_HOOK_MAX || a64_code_hook_for(canon)) continue;
+                    if (g_host_hook_sites.size() >= 0xfffeu) break;
+                    g_host_hook_sites.push_back({ SVC_IL2CPP_POS_TO_OFFSET, canon });
+                    g_host_hook_id_by_va[canon] = (uint32_t)g_host_hook_sites.size();
+                    g_code_hook_va[g_code_hook_n] = canon;
+                    g_code_hook_handler[g_code_hook_n] = SVC_IL2CPP_POS_TO_OFFSET;
+                    ++g_code_hook_n;
+                    if (canon < g_code_hook_lo) g_code_hook_lo = canon;
+                    if (canon > g_code_hook_hi) g_code_hook_hi = canon;
+                    const GuestVA hook_va = a64_guest_va(canon);
+                    a64_invalidate_main_jit(ctx, hook_va, 4u);
+                    a64_invalidate_engines(hook_va, 4u);
+                    cb_invalidate_all(hook_va, 4u);
+                    ++p2o_found;
+                    fprintf(stderr, "[hook] il2cpp sparsehash pos_to_offset @libil2cpp.so+0x%llx "
+                            "-> host popcount (LUNARIA_HOST_HOOKS=0 to disable)\n",
+                            (unsigned long long)(a64_guest_va(canon) - m.load_bias));
+                }
+                (void)p2o_found;
             }
         }
         if (!found)
